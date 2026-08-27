@@ -11,6 +11,7 @@ import {
   type PromotionReconcile,
   type Session,
 } from '../api'
+import { localizedText } from '../i18n'
 
 export const useWorkspaceStore = defineStore('workspace', () => {
   const projects = ref<Project[]>([])
@@ -43,7 +44,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     try {
       projects.value = await api.projects()
     } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : 'Unable to load projects'
+      error.value = cause instanceof Error ? cause.message : localizedText('无法加载项目。', 'Unable to load projects')
     } finally {
       loading.value = false
     }
@@ -78,7 +79,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         await loadExperimentDetails(selectedExperimentId.value)
       }
     } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : 'Unable to load experiments'
+      error.value = cause instanceof Error ? cause.message : localizedText('无法加载实验。', 'Unable to load experiments')
     }
   }
 
@@ -95,7 +96,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     try {
       await loadExperimentDetails(experimentId)
     } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : 'Unable to load experiment details'
+      error.value = cause instanceof Error ? cause.message : localizedText('无法加载实验详情。', 'Unable to load experiment details')
     }
   }
 
@@ -127,7 +128,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         : diffResult.status === 'rejected' ? diffResult.reason
         : previewResult.status === 'rejected' ? previewResult.reason : null
     detailLoading.value = false
-    if (failure) throw (failure instanceof Error ? failure : new Error('Unable to load experiment details'))
+    if (failure) throw (failure instanceof Error ? failure : new Error(localizedText('无法加载实验详情。', 'Unable to load experiment details')))
   }
 
   async function createProject(body: { name: string; canonicalPath: string; verificationCommands: string[] }) {

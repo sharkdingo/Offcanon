@@ -1,3 +1,5 @@
+import { getAuthToken } from './authToken'
+
 export type Project = {
   id: string
   name: string
@@ -94,6 +96,31 @@ export type RunEvent = {
   payload: Record<string, unknown>
 }
 
+export type AuthUser = {
+  id: string
+  username: string
+  createdAt: string
+}
+
+export type AuthResponse = {
+  token: string
+  expiresAt: string
+  user: AuthUser
+}
+
+export type UserSettings = {
+  userId: string
+  theme: 'system' | 'light' | 'dark'
+  locale: 'zh-CN' | 'en-US'
+  modelEndpoint: string
+  modelName: string
+  agentMaxSteps: number
+  agentRunTimeoutSeconds: number
+  contextLimitChars: number
+  updatedAt: string
+  version: number
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -108,10 +135,11 @@ export class ApiError extends Error {
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
-    headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
-    ...init,
-  })
+  const token = getAuthToken()
+  const headers = new Headers(init?.headers)
+  if (!headers.has('Content-Type') && init?.body) headers.set('Content-Type', 'application/json')
+  if (token) headers.set('Authorization', `Bearer ${token}`)
+  const response = await fetch(url, { ...init, headers })
   if (!response.ok) {
     const detail = await response.json().catch(() => ({ detail: response.statusText })) as {
       detail?: string
@@ -128,10 +156,20 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
       response.status,
     )
   }
+  if (response.status === 204) return undefined as T
   return response.json() as Promise<T>
 }
 
 export const api = {
+  register: (body: { username: string; password: string }) =>
+    request<AuthResponse>('/api/auth/register', { method: 'POST', body: JSON.stringify(body) }),
+  login: (body: { username: string; password: string }) =>
+    request<AuthResponse>('/api/auth/login', { method: 'POST', body: JSON.stringify(body) }),
+  me: () => request<AuthUser>('/api/auth/me'),
+  logout: () => request<void>('/api/auth/logout', { method: 'POST' }),
+  settings: () => request<UserSettings>('/api/settings'),
+  updateSettings: (body: Omit<UserSettings, 'userId' | 'updatedAt' | 'version'>) =>
+    request<UserSettings>('/api/settings', { method: 'PUT', body: JSON.stringify(body) }),
   projects: () => request<Project[]>('/api/projects'),
   createProject: (body: { name: string; canonicalPath: string; verificationCommands: string[] }) =>
     request<Project>('/api/projects', { method: 'POST', body: JSON.stringify(body) }),

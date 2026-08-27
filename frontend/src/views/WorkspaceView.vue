@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { CircleDot, RefreshCw, ShieldCheck, X } from 'lucide-vue-next'
+import { CircleDot, RefreshCw, Settings, ShieldCheck, X } from 'lucide-vue-next'
 import { useRoute, useRouter } from 'vue-router'
 import type { RunEvent } from '../api'
 import ExperimentDialog from '../components/ExperimentDialog.vue'
@@ -9,12 +9,14 @@ import ExperimentReview from '../components/ExperimentReview.vue'
 import ProjectDialog from '../components/ProjectDialog.vue'
 import ProjectRail from '../components/ProjectRail.vue'
 import PromotionDialog from '../components/PromotionDialog.vue'
+import { useLocale } from '../i18n'
 import { useWorkspaceStore } from '../stores/workspace'
 
 type StreamState = 'idle' | 'connecting' | 'live' | 'reconnecting' | 'offline'
 
 const route = useRoute()
 const router = useRouter()
+const { auth, text } = useLocale()
 const store = useWorkspaceStore()
 const showProjectDialog = ref(false)
 const showExperimentDialog = ref(false)
@@ -36,7 +38,25 @@ const viewClass = computed(() => experimentParam.value ? 'view-review' : project
 const selectedSessionTitle = computed(() => store.selectedSessionId
   ? store.sessions.find((session) => session.id === store.selectedSessionId)?.title ?? null
   : null)
-const connectionLabel = computed(() => store.selectedExperimentId ? streamState.value : 'no stream')
+function streamLabel(value: StreamState) {
+  const labels: Record<StreamState, [string, string]> = {
+    idle: ['空闲', 'idle'],
+    connecting: ['连接中', 'connecting'],
+    live: ['已连接', 'live'],
+    reconnecting: ['重连中', 'reconnecting'],
+    offline: ['离线', 'offline'],
+  }
+  const [zh, en] = labels[value]
+  return text(zh, en)
+}
+
+const connectionLabel = computed(() => store.selectedExperimentId ? streamLabel(streamState.value) : text('无事件流', 'no stream'))
+const accountInitials = computed(() => auth.session?.displayName
+  .split(/\s+/)
+  .map((part) => part[0])
+  .join('')
+  .slice(0, 2)
+  .toUpperCase() ?? 'O')
 
 const refreshEvents = new Set([
   'AGENT_COMPLETED',
@@ -69,7 +89,7 @@ function scheduleProjectRefresh(experimentId: string) {
     try {
       await store.reloadSelectedProject()
     } catch (cause) {
-      store.error = cause instanceof Error ? cause.message : 'Unable to refresh experiment state'
+      store.error = cause instanceof Error ? cause.message : text('无法刷新实验状态。', 'Unable to refresh experiment state')
     }
   }, 350)
 }
@@ -100,11 +120,11 @@ function connectEvents(experimentId: string | null) {
     try {
       parsed = JSON.parse(message.data)
     } catch {
-      eventWarning.value = 'An event payload could not be parsed; the stream remains connected.'
+      eventWarning.value = text('事件内容无法解析，但事件流仍保持连接。', 'An event payload could not be parsed; the stream remains connected.')
       return
     }
     if (!validRunEvent(parsed)) {
-      eventWarning.value = 'An event with an invalid shape was ignored.'
+      eventWarning.value = text('已忽略一个格式无效的事件。', 'An event with an invalid shape was ignored.')
       return
     }
     if (seenSequences.has(parsed.sequence)) return
@@ -130,7 +150,7 @@ async function syncRoute() {
   }
   if (store.projects.length === 0 && store.error) return
   if (!store.projects.some((project) => project.id === desiredProject)) {
-    store.error = 'The linked project is not available in this workspace.'
+    store.error = text('链接的项目不属于当前工作区。', 'The linked project is not available in this workspace.')
     await router.replace({ name: 'home' })
     return
   }
@@ -141,7 +161,7 @@ async function syncRoute() {
     if (store.experiments.some((experiment) => experiment.id === desiredExperiment)) {
       await store.selectExperiment(desiredExperiment)
     } else {
-      store.error = 'The linked experiment does not belong to this project.'
+      store.error = text('链接的实验不属于当前项目。', 'The linked experiment does not belong to this project.')
       await router.replace({ name: 'project', params: { projectId: desiredProject } })
       return
     }
@@ -151,7 +171,7 @@ async function syncRoute() {
 
   if (syncId !== routeSyncVersion) return
   if (desiredExperiment && !store.experiments.some((experiment) => experiment.id === desiredExperiment)) {
-    store.error = 'The linked experiment is no longer available.'
+    store.error = text('链接的实验已不可用。', 'The linked experiment is no longer available.')
     await router.replace({ name: 'project', params: { projectId: desiredProject } })
   }
 }
@@ -180,7 +200,7 @@ async function submitProject(value: { name: string; canonicalPath: string; verif
     showProjectDialog.value = false
     await router.push({ name: 'project', params: { projectId: project.id } })
   } catch (cause) {
-    store.error = cause instanceof Error ? cause.message : 'Unable to register project'
+    store.error = cause instanceof Error ? cause.message : text('无法登记项目。', 'Unable to register project')
   } finally {
     submitting.value = false
   }
@@ -195,7 +215,7 @@ async function submitExperiment(value: { sessionTitle: string; task: string; new
     showExperimentDialog.value = false
     await openExperiment(experiment.id)
   } catch (cause) {
-    store.error = cause instanceof Error ? cause.message : 'Unable to create experiment'
+    store.error = cause instanceof Error ? cause.message : text('无法创建实验。', 'Unable to create experiment')
   } finally {
     submitting.value = false
   }
@@ -209,7 +229,7 @@ async function runAction(action: () => Promise<void>, closePromotion = false) {
     await action()
     if (closePromotion) showPromotionDialog.value = false
   } catch (cause) {
-    store.error = cause instanceof Error ? cause.message : 'Experiment action failed'
+    store.error = cause instanceof Error ? cause.message : text('实验操作失败。', 'Experiment action failed')
   } finally {
     actionBusy.value = false
   }
@@ -224,7 +244,7 @@ async function refresh() {
     try {
       await store.reloadSelectedProject()
     } catch (cause) {
-      store.error = cause instanceof Error ? cause.message : 'Unable to refresh workspace'
+      store.error = cause instanceof Error ? cause.message : text('无法刷新工作区。', 'Unable to refresh workspace')
     }
   }
 }
@@ -247,19 +267,20 @@ onUnmounted(() => {
 <template>
   <div class="app-shell" :class="viewClass">
     <header class="topbar">
-      <button class="brand-lockup" aria-label="Open projects" @click="router.push({ name: 'home' })">
-        <span class="brand-mark">P</span>
-        <span><strong>PICO</strong><small>experiment console</small></span>
+      <button class="brand-lockup" :aria-label="text('打开项目', 'Open projects')" @click="router.push({ name: 'home' })">
+        <span class="brand-mark">O</span>
+        <span><strong>Offcanon</strong><small>{{ text('切换工作区', 'change workspace') }}</small></span>
       </button>
       <div class="topbar-context">
-        <span class="canonical-indicator"><ShieldCheck :size="14" /> canonical guarded</span>
+        <span class="canonical-indicator"><ShieldCheck :size="14" /> {{ text('主线已保护', 'canonical guarded') }}</span>
         <span class="connection-state" :class="streamState"><span class="stream-dot" :class="streamState" />{{ connectionLabel }}</span>
-        <button class="icon-button" aria-label="Refresh workspace" title="Refresh" :disabled="store.loading" @click="refresh"><RefreshCw :class="{ spin: store.loading }" :size="17" /></button>
+        <button class="icon-button" :aria-label="text('刷新工作区', 'Refresh workspace')" :title="text('刷新', 'Refresh')" :disabled="store.loading" @click="refresh"><RefreshCw :class="{ spin: store.loading }" :size="17" /></button>
+        <button class="account-button" :aria-label="`${text('打开设置', 'Open settings for')} ${auth.session?.displayName ?? text('账户', 'account')}`" :title="text('设置', 'Settings')" @click="router.push({ name: 'settings' })"><span>{{ accountInitials }}</span><Settings :size="15" /></button>
       </div>
     </header>
 
     <div v-if="store.error" class="global-alert" role="alert">
-      <CircleDot :size="16" /><span>{{ store.error }}</span><button class="icon-button small" aria-label="Dismiss error" title="Dismiss" @click="store.error = null"><X :size="15" /></button>
+      <CircleDot :size="16" /><span>{{ store.error }}</span><button class="icon-button small" :aria-label="text('关闭错误', 'Dismiss error')" :title="text('关闭', 'Dismiss')" @click="store.error = null"><X :size="15" /></button>
     </div>
 
     <div class="workspace-frame">

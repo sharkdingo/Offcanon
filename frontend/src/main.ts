@@ -3,6 +3,7 @@ import { createPinia } from 'pinia'
 import { createRouter, createWebHistory } from 'vue-router'
 import App from './App.vue'
 import WorkspaceView from './views/WorkspaceView.vue'
+import SettingsView from './views/SettingsView.vue'
 import './styles.css'
 
 const router = createRouter({
@@ -11,6 +12,7 @@ const router = createRouter({
     { path: '/', name: 'home', component: WorkspaceView },
     { path: '/projects/:projectId', name: 'project', component: WorkspaceView },
     { path: '/projects/:projectId/experiments/:experimentId', name: 'experiment', component: WorkspaceView },
+    { path: '/settings', name: 'settings', component: SettingsView },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
   scrollBehavior: () => ({ top: 0 }),

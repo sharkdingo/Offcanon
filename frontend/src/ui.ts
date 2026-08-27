@@ -1,7 +1,25 @@
 export type StatusTone = 'neutral' | 'experiment' | 'active' | 'success' | 'warning' | 'danger'
 
-export function statusLabel(status: string) {
-  return status.replaceAll('_', ' ')
+const ZH_STATUS_LABELS: Record<string, string> = {
+  READY_TO_RUN: '待运行',
+  RUNNING: '运行中',
+  AGENT_COMPLETED: '代理完成',
+  VERIFYING: '验证中',
+  VERIFIED: '已验证',
+  PREPARING_PROMOTION: '准备提升',
+  PROMOTION_VERIFICATION_STARTED: '提升验证中',
+  PROMOTING: '提升中',
+  PROMOTED: '已提升',
+  FAILED: '失败',
+  REJECTED: '已拒绝',
+  CANCELLED: '已取消',
+  STALE: '已过期',
+  RECOVERY_REQUIRED: '需要恢复',
+}
+
+export function statusLabel(status: string, locale?: string) {
+  const resolvedLocale = locale ?? (typeof document === 'undefined' ? 'en-US' : document.documentElement.lang)
+  return resolvedLocale === 'zh-CN' ? ZH_STATUS_LABELS[status] ?? status.replaceAll('_', ' ') : status.replaceAll('_', ' ')
 }
 
 export function statusTone(status: string): StatusTone {
