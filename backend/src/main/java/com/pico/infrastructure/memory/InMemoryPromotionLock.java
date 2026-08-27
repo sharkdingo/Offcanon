@@ -1,6 +1,7 @@
 package com.pico.infrastructure.memory;
 
 import com.pico.port.PromotionLockPort;
+import com.pico.shared.domain.DomainException;
 import org.springframework.stereotype.Component;
 import org.springframework.context.annotation.Profile;
 
@@ -17,7 +18,12 @@ public class InMemoryPromotionLock implements PromotionLockPort {
     @Override
     public <T> T withProjectLock(UUID projectId, Supplier<T> action) {
         ReentrantLock lock = locks.computeIfAbsent(projectId, ignored -> new ReentrantLock());
-        lock.lock();
+        try {
+            lock.lockInterruptibly();
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw new DomainException("PROMOTION_LOCK_INTERRUPTED", "Promotion lock acquisition was interrupted");
+        }
         try {
             return action.get();
         } finally {

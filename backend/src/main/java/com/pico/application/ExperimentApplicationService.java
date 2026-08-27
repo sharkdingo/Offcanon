@@ -91,6 +91,22 @@ public class ExperimentApplicationService {
         return experimentRepository.findByProjectId(projectId);
     }
 
+    public List<Session> listSessions(UUID projectId) {
+        if (projectRepository.findById(projectId).isEmpty()) {
+            throw new NotFoundException("Project not found: " + projectId);
+        }
+        return sessionRepository.findByProjectId(projectId);
+    }
+
+    public Session createSession(UUID projectId, String title) {
+        Project project = projectRepository.findById(projectId)
+                .orElseThrow(() -> new NotFoundException("Project not found: " + projectId));
+        String normalizedTitle = title == null || title.isBlank()
+                ? "Session " + (sessionRepository.findByProjectId(project.id()).size() + 1)
+                : title;
+        return sessionRepository.save(Session.create(project.id(), normalizedTitle, clock.now()));
+    }
+
     public Experiment cancel(UUID experimentId) {
         Experiment experiment = get(experimentId);
         experiment.cancel();

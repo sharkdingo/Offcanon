@@ -2,6 +2,7 @@ package com.pico.infrastructure.memory;
 
 import com.pico.port.SnapshotRepository;
 import com.pico.workspace.domain.Snapshot;
+import com.pico.shared.domain.DomainException;
 import org.springframework.stereotype.Repository;
 import org.springframework.context.annotation.Profile;
 
@@ -16,8 +17,12 @@ public class InMemorySnapshotRepository implements SnapshotRepository {
 
     @Override
     public Snapshot save(Snapshot snapshot) {
-        snapshots.put(snapshot.id(), snapshot);
-        return snapshot;
+        Snapshot existing = snapshots.putIfAbsent(snapshot.id(), snapshot);
+        if (existing != null && !existing.equals(snapshot)) {
+            throw new DomainException("SNAPSHOT_IDENTITY_CONFLICT",
+                    "Snapshot identity is already bound to different content: " + snapshot.id());
+        }
+        return existing == null ? snapshot : existing;
     }
 
     @Override

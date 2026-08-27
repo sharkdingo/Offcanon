@@ -20,9 +20,12 @@ public class RedisSessionRunLease implements SessionRunLeasePort {
     private final Duration lease;
 
     public RedisSessionRunLease(StringRedisTemplate redis,
-                                @Value("${pico.redis.session-lease-seconds:${PICO_REDIS_SESSION_LEASE_SECONDS:1800}}") long leaseSeconds) {
+                                @Value("${pico.redis.session-lease-seconds:${PICO_REDIS_SESSION_LEASE_SECONDS:1800}}") long leaseSeconds,
+                                @Value("${pico.agent.run-timeout-seconds:600}") long runTimeoutSeconds) {
         this.redis = redis;
-        this.lease = Duration.ofSeconds(Math.max(60, leaseSeconds));
+        // A run cannot legitimately outlive this lease; the default keeps a wide
+        // margin while configuration cannot accidentally make the lease shorter.
+        this.lease = Duration.ofSeconds(Math.max(Math.max(60, leaseSeconds), runTimeoutSeconds + 60));
     }
 
     @Override

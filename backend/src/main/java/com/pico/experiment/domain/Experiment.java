@@ -16,6 +16,7 @@ public final class Experiment {
     private final Instant createdAt;
     private ExperimentStatus status;
     private UUID baseSnapshotId;
+    private UUID resultSnapshotId;
     private Path workspacePath;
     private String agentSummary;
     private VerificationResult verificationResult;
@@ -46,6 +47,7 @@ public final class Experiment {
                                      Instant createdAt,
                                      ExperimentStatus status,
                                      UUID baseSnapshotId,
+                                     UUID resultSnapshotId,
                                      Path workspacePath,
                                      String agentSummary,
                                      VerificationResult verificationResult,
@@ -54,6 +56,7 @@ public final class Experiment {
         Experiment experiment = new Experiment(id, projectId, sessionId, task, createdAt);
         experiment.status = Objects.requireNonNull(status, "status");
         experiment.baseSnapshotId = baseSnapshotId;
+        experiment.resultSnapshotId = resultSnapshotId;
         experiment.workspacePath = workspacePath == null ? null : workspacePath.toAbsolutePath().normalize();
         experiment.agentSummary = agentSummary;
         experiment.verificationResult = verificationResult;
@@ -88,7 +91,19 @@ public final class Experiment {
         version++;
     }
 
+    public void sealResult(UUID snapshotId) {
+        requireStatus(ExperimentStatus.AGENT_COMPLETED);
+        if (resultSnapshotId != null) {
+            throw new DomainException("RESULT_ALREADY_SEALED", "Experiment result snapshot is immutable");
+        }
+        resultSnapshotId = Objects.requireNonNull(snapshotId, "snapshotId");
+        version++;
+    }
+
     public void beginVerification() {
+        if (resultSnapshotId == null) {
+            throw new DomainException("RESULT_SNAPSHOT_MISSING", "Seal the experiment result before verification");
+        }
         transition(ExperimentStatus.AGENT_COMPLETED, ExperimentStatus.VERIFYING);
     }
 
@@ -99,6 +114,14 @@ public final class Experiment {
         if (!result.passed()) {
             failureReason = result.failureReason();
         }
+        version++;
+    }
+
+    public void rejectVerifiedPromotion(VerificationResult result) {
+        requireStatus(ExperimentStatus.VERIFIED);
+        verificationResult = Objects.requireNonNull(result, "result");
+        failureReason = result.failureReason();
+        status = ExperimentStatus.REJECTED;
         version++;
     }
 
@@ -125,7 +148,63 @@ public final class Experiment {
     }
 
     public void beginPromotion() {
+        if (resultSnapshotId == null) {
+            throw new DomainException("RESULT_SNAPSHOT_MISSING", "Verified experiment has no immutable result");
+        }
         transition(ExperimentStatus.VERIFIED, ExperimentStatus.PREPARING_PROMOTION);
+    }
+
+    public void rejectPromotion(VerificationResult result) {
+        requireStatus(ExperimentStatus.PREPARING_PROMOTION);
+        if (result.passed()) {
+            throw new DomainException("INVALID_PROMOTION_REJECTION", "Passing verification cannot reject promotion");
+        }
+        verificationResult = Objects.requireNonNull(result, "result");
+        failureReason = result.failureReason();
+        status = ExperimentStatus.REJECTED;
+        version++;
+    }
+
+    public void abortPromotion(String reason) {
+        requireStatus(ExperimentStatus.PREPARING_PROMOTION);
+        failureReason = Objects.requireNonNull(reason, "reason");
+        status = ExperimentStatus.VERIFIED;
+        version++;
+    }
+
+    /** Restore a promotion that was interrupted before any canonical change was observed. */
+    public void recoverPromotion() {
+        if (status != ExperimentStatus.PROMOTING && status != ExperimentStatus.RECOVERY_REQUIRED) {
+            throw new DomainException("INVALID_RECOVERY_TRANSITION", "Promotion cannot be restored from " + status);
+        }
+        failureReason = null;
+        status = ExperimentStatus.VERIFIED;
+        version++;
+    }
+
+    public void recoverPromotionCommitted() {
+        if (status == ExperimentStatus.PROMOTED) return;
+        if (status != ExperimentStatus.PROMOTING && status != ExperimentStatus.RECOVERY_REQUIRED) {
+            throw new DomainException("INVALID_RECOVERY_TRANSITION", "Promotion cannot be committed from " + status);
+        }
+        failureReason = null;
+        status = ExperimentStatus.PROMOTED;
+        version++;
+    }
+
+    public void requirePromotionRecovery(String reason) {
+        if (status != ExperimentStatus.VERIFIED
+                && status != ExperimentStatus.PREPARING_PROMOTION
+                && status != ExperimentStatus.PROMOTING
+                && status != ExperimentStatus.PROMOTED
+                && status != ExperimentStatus.RECOVERY_REQUIRED) {
+            throw new DomainException("INVALID_RECOVERY_TRANSITION", "Promotion recovery is not applicable from " + status);
+        }
+        failureReason = Objects.requireNonNull(reason, "reason");
+        if (status != ExperimentStatus.RECOVERY_REQUIRED) {
+            status = ExperimentStatus.RECOVERY_REQUIRED;
+            version++;
+        }
     }
 
     public void markPromoting() {
@@ -186,6 +265,7 @@ public final class Experiment {
     public Instant createdAt() { return createdAt; }
     public ExperimentStatus status() { return status; }
     public UUID baseSnapshotId() { return baseSnapshotId; }
+    public UUID resultSnapshotId() { return resultSnapshotId; }
     public Path workspacePath() { return workspacePath; }
     public String agentSummary() { return agentSummary; }
     public VerificationResult verificationResult() { return verificationResult; }

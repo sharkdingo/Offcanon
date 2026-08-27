@@ -8,6 +8,8 @@ import com.pico.workspace.domain.Snapshot;
 import org.springframework.context.annotation.Profile;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
+import org.springframework.dao.DuplicateKeyException;
+import com.pico.shared.domain.DomainException;
 
 import java.nio.file.Path;
 import java.sql.ResultSet;
@@ -20,8 +22,7 @@ import java.util.UUID;
 @Repository
 @Profile("mysql")
 public class JdbcSnapshotRepository implements SnapshotRepository {
-    private static final String UPSERT = "INSERT INTO snapshots (id,project_id,fingerprint,materialized_path,captured_at,included_files,excluded_files) VALUES (?,?,?,?,?,?,?) "
-            + "ON DUPLICATE KEY UPDATE fingerprint=VALUES(fingerprint), materialized_path=VALUES(materialized_path), included_files=VALUES(included_files), excluded_files=VALUES(excluded_files)";
+    private static final String INSERT = "INSERT INTO snapshots (id,project_id,fingerprint,materialized_path,captured_at,included_files,excluded_files) VALUES (?,?,?,?,?,?,?)";
     private final JdbcTemplate jdbc;
     private final ObjectMapper mapper;
 
@@ -32,10 +33,31 @@ public class JdbcSnapshotRepository implements SnapshotRepository {
 
     @Override
     public Snapshot save(Snapshot snapshot) {
-        jdbc.update(UPSERT, snapshot.id().toString(), snapshot.projectId().toString(), snapshot.fingerprint(),
-                snapshot.materializedPath().toString(), Timestamp.from(snapshot.capturedAt()),
-                json(snapshot.includedFiles()), json(snapshot.excludedFiles()));
-        return snapshot;
+        try {
+            jdbc.update(INSERT, snapshot.id().toString(), snapshot.projectId().toString(), snapshot.fingerprint(),
+                    snapshot.materializedPath().toString(), Timestamp.from(snapshot.capturedAt()),
+                    json(snapshot.includedFiles()), json(snapshot.excludedFiles()));
+            return snapshot;
+        } catch (DuplicateKeyException error) {
+            Snapshot existing = findById(snapshot.id()).orElseThrow(() -> error);
+            if (!sameSnapshot(existing, snapshot)) {
+                throw new DomainException("SNAPSHOT_IDENTITY_CONFLICT",
+                        "Snapshot identity is already bound to different content: " + snapshot.id());
+            }
+            return existing;
+        }
+    }
+
+    private boolean sameSnapshot(Snapshot left, Snapshot right) {
+        return left.id().equals(right.id())
+                && left.projectId().equals(right.projectId())
+                && left.fingerprint().equals(right.fingerprint())
+                && left.materializedPath().toAbsolutePath().normalize()
+                .equals(right.materializedPath().toAbsolutePath().normalize())
+                && left.capturedAt().truncatedTo(java.time.temporal.ChronoUnit.MICROS)
+                .equals(right.capturedAt().truncatedTo(java.time.temporal.ChronoUnit.MICROS))
+                && left.includedFiles().equals(right.includedFiles())
+                && left.excludedFiles().equals(right.excludedFiles());
     }
 
     @Override

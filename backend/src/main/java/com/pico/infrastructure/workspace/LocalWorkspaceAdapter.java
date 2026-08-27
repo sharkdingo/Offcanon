@@ -32,10 +32,20 @@ public class LocalWorkspaceAdapter implements WorkspacePort {
     }
 
     @Override
-    public Path createPromotionCandidate(Snapshot base, Experiment experiment) {
-        Path destination = dataRoot.resolve("promotion-candidates").resolve(experiment.id().toString())
+    public Path createVerificationWorkspace(Snapshot result, Experiment experiment) {
+        Path destination = dataRoot.resolve("verification-workspaces").resolve(experiment.id().toString())
+                .resolve("attempt-" + UUID.randomUUID())
                 .toAbsolutePath().normalize();
-        copyTree(experiment.workspacePath(), destination);
+        copyTree(result.materializedPath(), destination);
+        return destination;
+    }
+
+    @Override
+    public Path createPromotionCandidate(Snapshot result, Experiment experiment) {
+        Path destination = dataRoot.resolve("promotion-candidates").resolve(experiment.id().toString())
+                .resolve("attempt-" + UUID.randomUUID())
+                .toAbsolutePath().normalize();
+        copyTree(result.materializedPath(), destination);
         return destination;
     }
 

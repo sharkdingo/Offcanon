@@ -4,14 +4,21 @@ import com.pico.agent.domain.ToolDefinition;
 import com.pico.agent.domain.ToolResult;
 import com.pico.experiment.domain.Experiment;
 import com.pico.infrastructure.process.ProcessRunner;
+import com.pico.infrastructure.process.LocalCommandExecutor;
+import com.pico.port.CommandExecutor;
+import com.pico.port.EvidenceRepository;
 import com.pico.port.Tool;
 import com.pico.port.ProjectRepository;
+import com.pico.port.SnapshotPort;
+import com.pico.port.SnapshotRepository;
+import com.pico.project.domain.Project;
 import com.pico.shared.domain.DomainException;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -20,25 +27,58 @@ import java.util.regex.Pattern;
 @Component
 public class ShellTool implements Tool {
     private static final int MAX_OUTPUT_CHARS = 12_000;
-    private static final Pattern PARENT_SEGMENT = Pattern.compile("(^|[\\\\/\\s])\\.\\.([\\\\/\\s]|$)");
+    private static final Pattern PARENT_SEGMENT = Pattern.compile("(^|[\\\\/\\s\"'])\\.\\.([\\\\/\\s\"']|$)");
     private static final Pattern WINDOWS_ABSOLUTE = Pattern.compile("[a-z]:[\\\\/]");
     private static final Pattern UNC_ABSOLUTE = Pattern.compile("^\\\\\\\\");
     private static final Pattern POSIX_ABSOLUTE = Pattern.compile("(^|[\\s\"'])/");
-    private final ProcessRunner processRunner;
+    private static final Pattern SHELL_METACHARACTER = Pattern.compile(
+            "[;&|<>`]|\\$\\(|%[a-z0-9_]+%|\\$env:|\\$\\{?[a-z_][a-z0-9_]*}?|(^|[\\s\"'])~(?=[\\\\/]|$)",
+            Pattern.CASE_INSENSITIVE);
+    private static final Pattern DANGEROUS_GIT = Pattern.compile(
+            "(?i)(^|[\\s\\\"'])git(?:\\.exe)?[\\s\\\"']+(reset|clean|restore|checkout|switch|branch|update-ref|config|worktree|gc|submodule|commit|push|fetch|merge|rebase)(?:[\\s\\\"']|$)");
+    private static final Pattern NESTED_INTERPRETER = Pattern.compile(
+            "(?i)(^|[\\s\\\"'])(?:powershell|pwsh|bash|zsh|sh|cmd(?:\\.exe)?|wsl|python(?:3)?|node|perl|ruby)(?:[\\s\\\"']|$)");
+    private static final Pattern DESTRUCTIVE_COMMAND = Pattern.compile(
+            "(?i)(^|[\\s\\\"'])(?:rm|rmdir|del|erase|format|shutdown|stop-computer|remove-item)(?:[\\s\\\"']|$)");
+    private static final Pattern NETWORK_COMMAND = Pattern.compile(
+            "(?i)(^|[\\s\\\"'])(?:curl|wget|certutil|bitsadmin|invoke-webrequest)(?:[\\s\\\"']|$)");
+    private final CommandExecutor commandExecutor;
     private final ProjectRepository projects;
+    private final EvidenceRepository evidence;
+    private final SnapshotPort snapshots;
+    private final SnapshotRepository snapshotRepository;
     private final Duration timeout;
 
     @org.springframework.beans.factory.annotation.Autowired
-    public ShellTool(ProcessRunner processRunner,
+    public ShellTool(CommandExecutor commandExecutor,
                      ProjectRepository projects,
+                     EvidenceRepository evidence,
+                     SnapshotPort snapshots,
+                     SnapshotRepository snapshotRepository,
                      @Value("${pico.agent.command-timeout-seconds:30}") long timeoutSeconds) {
-        this.processRunner = processRunner;
+        this.commandExecutor = commandExecutor;
         this.projects = projects;
+        this.evidence = evidence;
+        this.snapshots = snapshots;
+        this.snapshotRepository = snapshotRepository;
         this.timeout = Duration.ofSeconds(Math.max(1, timeoutSeconds));
     }
 
     public ShellTool(ProcessRunner processRunner, long timeoutSeconds) {
-        this(processRunner, null, timeoutSeconds);
+        this(new LocalCommandExecutor(processRunner), null, null, null, null, timeoutSeconds);
+    }
+
+    public ShellTool(ProcessRunner processRunner, ProjectRepository projects, long timeoutSeconds) {
+        this(new LocalCommandExecutor(processRunner), projects, null, null, null, timeoutSeconds);
+    }
+
+    public ShellTool(ProcessRunner processRunner,
+                     ProjectRepository projects,
+                     EvidenceRepository evidence,
+                     SnapshotPort snapshots,
+                     SnapshotRepository snapshotRepository,
+                     long timeoutSeconds) {
+        this(new LocalCommandExecutor(processRunner), projects, evidence, snapshots, snapshotRepository, timeoutSeconds);
     }
 
     @Override
@@ -53,17 +93,26 @@ public class ShellTool implements Tool {
     public ToolResult execute(Experiment experiment, String callId, Map<String, Object> arguments) {
         String command = ToolArguments.requiredString(arguments, "command");
         try {
-            Path canonical = projects == null ? null : projects.findById(experiment.projectId())
-                    .map(project -> project.canonicalPath().toAbsolutePath().normalize())
+            Project project = projects == null ? null : projects.findById(experiment.projectId())
                     .orElseThrow(() -> new DomainException("PROJECT_NOT_FOUND", "Project is no longer available"));
+            Path canonical = project == null ? null : project.canonicalPath().toAbsolutePath().normalize();
             validateCommand(command, experiment.workspacePath(), canonical);
-            List<String> processCommand = isWindows()
-                    ? List.of("cmd.exe", "/d", "/s", "/c", command)
-                    : List.of("sh", "-lc", command);
-            ProcessRunner.ProcessResult result = processRunner.run(processCommand, experiment.workspacePath(),
-                    Map.of("PICO_EXPERIMENT_ID", experiment.id().toString()), timeout);
+            Instant started = Instant.now();
+            CommandExecutor.CommandExecution result = commandExecutor.execute(command, experiment.workspacePath(),
+                    timeout, Map.of("PICO_EXPERIMENT_ID", experiment.id().toString()), "agent-shell");
+            Instant completed = Instant.now();
+            boolean interrupted = Thread.interrupted();
+            try {
+                recordEvidence(project, experiment, command, result, started, completed);
+            } finally {
+                if (interrupted) Thread.currentThread().interrupt();
+            }
             String output = "exit=" + result.exitCode() + (result.timedOut() ? " timeout=true" : " timeout=false")
+                    + (result.cancelled() ? " cancelled=true" : " cancelled=false")
                     + "\nstdout:\n" + truncate(result.stdout()) + "\nstderr:\n" + truncate(result.stderr());
+            if (result.cancelled()) {
+                return ToolResult.failure(callId, definition().name(), "Command cancelled\n" + output);
+            }
             if (result.timedOut()) {
                 return ToolResult.failure(callId, definition().name(), "Command timed out after " + timeout.toSeconds() + "s\n" + output);
             }
@@ -76,16 +125,37 @@ public class ShellTool implements Tool {
         }
     }
 
+    private void recordEvidence(Project project,
+                                Experiment experiment,
+                                String command,
+                                CommandExecutor.CommandExecution execution,
+                                java.time.Instant started,
+                                java.time.Instant completed) {
+        if (evidence == null || snapshots == null || snapshotRepository == null
+                || project == null || experiment.baseSnapshotId() == null) return;
+        var base = snapshotRepository.findById(experiment.baseSnapshotId())
+                .orElseThrow(() -> new DomainException("BASE_SNAPSHOT_MISSING", "Base snapshot is unavailable for command evidence"));
+        var observed = snapshots.captureWorkspace(project, experiment.workspacePath(), base.fingerprint());
+        snapshotRepository.save(observed);
+        evidence.save(com.pico.verification.domain.Evidence.command(experiment.id(), observed.id(),
+                command, experiment.workspacePath().toString(), execution.exitCode(),
+                truncate(execution.stdout()), truncate(execution.stderr()), started, completed,
+                execution.duration(), execution.timedOut(), execution.cancelled(), execution.environmentProfile()));
+    }
+
     private void validateCommand(String command, Path workspace, Path canonical) {
         String normalized = command.replace('\\', '/').toLowerCase(Locale.ROOT);
-        List<String> blocked = List.of(
-                "git reset --hard", "git clean -f", "git restore", "git update-ref", "git worktree",
-                "rm -rf", "rmdir /s", "del /s", "format ", "shutdown ", "stop-computer",
-                "powershell", "pwsh", "bash -c", "cmd /c", "cmd.exe /c", "start-process",
-                "invoke-expression", "iex ", "curl ", "wget ", "certutil", "bitsadmin",
-                "python -c", "python3 -c", "node -e");
-        if (blocked.stream().anyMatch(normalized::contains)) {
+        if (DANGEROUS_GIT.matcher(normalized).find()
+                || NESTED_INTERPRETER.matcher(normalized).find()
+                || DESTRUCTIVE_COMMAND.matcher(normalized).find()
+                || NETWORK_COMMAND.matcher(normalized).find()
+                || normalized.contains("start-process")
+                || normalized.contains("invoke-expression")
+                || normalized.matches(".*(^|[\\s\\\"'])iex(?:[\\s\\\"']|$).*") ) {
             throw new DomainException("DANGEROUS_COMMAND_BLOCKED", "Command is blocked by the experiment policy");
+        }
+        if (SHELL_METACHARACTER.matcher(command).find()) {
+            throw new DomainException("DANGEROUS_COMMAND_BLOCKED", "Shell operators, command substitution and environment expansion are blocked by the experiment policy");
         }
         if (PARENT_SEGMENT.matcher(normalized).find()
                 || WINDOWS_ABSOLUTE.matcher(normalized).find()
@@ -111,7 +181,4 @@ public class ShellTool implements Tool {
         return value.substring(0, head) + "\n...[truncated]...\n" + value.substring(value.length() - tail);
     }
 
-    private boolean isWindows() {
-        return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
-    }
 }

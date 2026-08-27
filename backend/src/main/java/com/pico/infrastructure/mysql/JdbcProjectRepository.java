@@ -4,7 +4,10 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.pico.port.ProjectRepository;
+import com.pico.project.domain.CanonicalPathIdentity;
 import com.pico.project.domain.Project;
+import com.pico.shared.domain.DomainException;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.context.annotation.Profile;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
@@ -22,8 +25,7 @@ import java.util.UUID;
 @Repository
 @Profile("mysql")
 public class JdbcProjectRepository implements ProjectRepository {
-    private static final String UPSERT = "INSERT INTO projects (id,name,canonical_path,verification_commands,created_at,version) VALUES (?,?,?,?,?,?) "
-            + "ON DUPLICATE KEY UPDATE name=VALUES(name), canonical_path=VALUES(canonical_path), verification_commands=VALUES(verification_commands), version=VALUES(version)";
+    private static final String INSERT = "INSERT INTO projects (id,name,canonical_path,canonical_path_key,verification_commands,created_at,version) VALUES (?,?,?,?,?,?,?)";
     private final JdbcTemplate jdbc;
     private final ObjectMapper mapper;
 
@@ -34,14 +36,31 @@ public class JdbcProjectRepository implements ProjectRepository {
 
     @Override
     public Project save(Project project) {
-        jdbc.update(UPSERT, project.id().toString(), project.name(), project.canonicalPath().toString(),
-                json(project.verificationCommands()), Timestamp.from(project.createdAt()), project.version());
-        return project;
+        try {
+            jdbc.update(INSERT, project.id().toString(), project.name(), project.canonicalPath().toString(),
+                    CanonicalPathIdentity.key(project.canonicalPath()), json(project.verificationCommands()),
+                    Timestamp.from(project.createdAt()), project.version());
+            return project;
+        } catch (DuplicateKeyException error) {
+            Optional<Project> existing = findByCanonicalPath(project.canonicalPath());
+            if (existing.isPresent()) {
+                throw new DomainException("PROJECT_ALREADY_REGISTERED",
+                        "Canonical Git repository is already registered as project " + existing.get().id()
+                                + ": " + project.canonicalPath());
+            }
+            throw new DomainException("PROJECT_IDENTITY_CONFLICT", "Project identity is already registered: " + project.id());
+        }
     }
 
     @Override
     public Optional<Project> findById(UUID id) {
         return jdbc.query("SELECT * FROM projects WHERE id=?", this::map, id.toString()).stream().findFirst();
+    }
+
+    @Override
+    public Optional<Project> findByCanonicalPath(Path canonicalPath) {
+        return jdbc.query("SELECT * FROM projects WHERE canonical_path_key=?", this::map,
+                CanonicalPathIdentity.key(canonicalPath)).stream().findFirst();
     }
 
     @Override

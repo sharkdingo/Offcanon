@@ -27,13 +27,24 @@ public record VerificationResult(boolean passed, List<CommandEvidence> commands,
             String stdout,
             String stderr,
             Duration duration,
-            boolean timedOut) {
+            boolean timedOut,
+            boolean cancelled) {
         public CommandEvidence {
             Objects.requireNonNull(command, "command");
             Objects.requireNonNull(cwd, "cwd");
             Objects.requireNonNull(stdout, "stdout");
             Objects.requireNonNull(stderr, "stderr");
             Objects.requireNonNull(duration, "duration");
+        }
+
+        public CommandEvidence(String command,
+                               String cwd,
+                               int exitCode,
+                               String stdout,
+                               String stderr,
+                               Duration duration,
+                               boolean timedOut) {
+            this(command, cwd, exitCode, stdout, stderr, duration, timedOut, false);
         }
     }
 }

@@ -44,9 +44,14 @@ class LocalPromotionAdapterTest {
         experiment.attachBase(UUID.randomUUID(), candidate);
         Snapshot snapshot = new Snapshot(UUID.randomUUID(), project.id(), "base", basePath, Instant.now(), List.of("a.txt", "remove.txt"), List.of());
 
-        var result = new LocalPromotionAdapter().apply(project, snapshot, experiment, candidate);
+        LocalPromotionAdapter adapter = new LocalPromotionAdapter();
+        var plan = adapter.plan(project, snapshot, experiment, candidate);
+        var result = adapter.apply(project, snapshot, experiment, candidate);
 
         assertTrue(result.applied());
+        assertEquals(List.of("a.txt", "add.txt", "remove.txt"), plan.touchedFiles().stream().sorted().toList());
+        assertEquals(plan.touchedFiles().stream().sorted().toList(), plan.preimageHashes().keySet().stream().sorted().toList());
+        assertEquals("ABSENT", plan.preimageHashes().get("add.txt"));
         assertEquals(List.of("a.txt", "add.txt", "remove.txt"), result.changedFiles().stream().sorted().toList());
         assertEquals("new\n", Files.readString(canonical.resolve("a.txt")));
         assertEquals("added\n", Files.readString(canonical.resolve("add.txt")));

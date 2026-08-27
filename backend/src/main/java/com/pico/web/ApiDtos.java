@@ -22,7 +22,13 @@ public final class ApiDtos {
     public record CreateExperimentRequest(UUID sessionId, String sessionTitle, @NotBlank String task) {
     }
 
+    public record CreateSessionRequest(@NotBlank String title) {
+    }
+
     public record ProjectResponse(UUID id, String name, String canonicalPath, List<String> verificationCommands, Instant createdAt) {
+    }
+
+    public record SessionResponse(UUID id, UUID projectId, String title, Instant createdAt) {
     }
 
     public record ExperimentResponse(
@@ -32,6 +38,7 @@ public final class ApiDtos {
             String task,
             String status,
             UUID baseSnapshotId,
+            UUID resultSnapshotId,
             String workspacePath,
             String agentSummary,
             String failureReason,
@@ -53,7 +60,9 @@ public final class ApiDtos {
             Instant completedAt,
             long durationMillis,
             boolean timedOut,
-            boolean trusted) {
+            boolean trusted,
+            String environmentProfile,
+            boolean cancelled) {
     }
 
     public record PromotionResponse(
@@ -64,6 +73,24 @@ public final class ApiDtos {
             String fingerprint) {
     }
 
-    public record DiffEntryResponse(String path, String change, long beforeBytes, long afterBytes, boolean binary) {
+    public record PromotionPreviewResponse(
+            String baseFingerprint,
+            String currentFingerprint,
+            String finalCandidateFingerprint,
+            String verificationStatus,
+            boolean trustedVerification,
+            boolean conflict,
+            String blockingReason,
+            boolean promotable) {
+    }
+
+    public record DiffEntryResponse(String path,
+                                    String change,
+                                    long beforeBytes,
+                                    long afterBytes,
+                                    boolean binary,
+                                    int additions,
+                                    int deletions,
+                                    String patch) {
     }
 }

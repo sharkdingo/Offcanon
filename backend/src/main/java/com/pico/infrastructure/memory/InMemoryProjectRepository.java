@@ -1,10 +1,13 @@
 package com.pico.infrastructure.memory;
 
 import com.pico.port.ProjectRepository;
+import com.pico.project.domain.CanonicalPathIdentity;
 import com.pico.project.domain.Project;
+import com.pico.shared.domain.DomainException;
 import org.springframework.stereotype.Repository;
 import org.springframework.context.annotation.Profile;
 
+import java.nio.file.Path;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
@@ -15,10 +18,22 @@ import java.util.concurrent.ConcurrentHashMap;
 @Profile("!mysql")
 public class InMemoryProjectRepository implements ProjectRepository {
     private final ConcurrentHashMap<UUID, Project> projects = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, UUID> canonicalOwners = new ConcurrentHashMap<>();
 
     @Override
-    public Project save(Project project) {
+    public synchronized Project save(Project project) {
+        String key = CanonicalPathIdentity.value(project.canonicalPath());
+        UUID owner = canonicalOwners.get(key);
+        if (owner != null && !owner.equals(project.id())) {
+            throw duplicate(project, owner);
+        }
+        Project previous = projects.get(project.id());
+        if (previous != null) {
+            String previousKey = CanonicalPathIdentity.value(previous.canonicalPath());
+            if (!previousKey.equals(key)) canonicalOwners.remove(previousKey, project.id());
+        }
         projects.put(project.id(), project);
+        canonicalOwners.put(key, project.id());
         return project;
     }
 
@@ -28,7 +43,18 @@ public class InMemoryProjectRepository implements ProjectRepository {
     }
 
     @Override
+    public Optional<Project> findByCanonicalPath(Path canonicalPath) {
+        UUID id = canonicalOwners.get(CanonicalPathIdentity.value(canonicalPath));
+        return id == null ? Optional.empty() : Optional.ofNullable(projects.get(id));
+    }
+
+    @Override
     public List<Project> findAll() {
         return projects.values().stream().sorted(Comparator.comparing(Project::createdAt)).toList();
+    }
+
+    private DomainException duplicate(Project project, UUID owner) {
+        return new DomainException("PROJECT_ALREADY_REGISTERED",
+                "Canonical Git repository is already registered as project " + owner + ": " + project.canonicalPath());
     }
 }

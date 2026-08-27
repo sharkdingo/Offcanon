@@ -20,6 +20,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Locale;
 import java.util.Set;
+import java.nio.charset.CharacterCodingException;
+import java.nio.ByteBuffer;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
 
 @Component
 public class LocalDiffAdapter implements DiffPort {
@@ -39,8 +43,10 @@ public class LocalDiffAdapter implements DiffPort {
             if (Arrays.equals(oldBytes, newBytes)) continue;
             DiffEntry.Change change = oldBytes == null ? DiffEntry.Change.ADDED
                     : newBytes == null ? DiffEntry.Change.DELETED : DiffEntry.Change.MODIFIED;
-            boolean binary = containsZero(oldBytes) || containsZero(newBytes);
-            result.add(new DiffEntry(path, change, size(oldBytes), size(newBytes), binary));
+            boolean binary = !validText(oldBytes) || !validText(newBytes);
+            TextDiff textDiff = binary ? new TextDiff(0, 0, "Binary files differ") : textDiff(oldBytes, newBytes, change);
+            result.add(new DiffEntry(path, change, size(oldBytes), size(newBytes), binary,
+                    textDiff.additions(), textDiff.deletions(), textDiff.patch()));
             if (result.size() >= MAX_ENTRIES) break;
         }
         return List.copyOf(result);
@@ -96,7 +102,97 @@ public class LocalDiffAdapter implements DiffPort {
         return false;
     }
 
+    private boolean validText(byte[] bytes) {
+        if (bytes == null) return true;
+        if (containsZero(bytes)) return false;
+        try {
+            StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(bytes));
+            return true;
+        } catch (CharacterCodingException error) {
+            return false;
+        }
+    }
+
     private long size(byte[] bytes) {
         return bytes == null ? 0 : bytes.length;
+    }
+
+    private TextDiff textDiff(byte[] oldBytes, byte[] newBytes, DiffEntry.Change change) {
+        try {
+            List<String> oldLines = lines(oldBytes);
+            List<String> newLines = lines(newBytes);
+            if (change == DiffEntry.Change.ADDED) return new TextDiff(newLines.size(), 0, patch(List.of(), newLines));
+            if (change == DiffEntry.Change.DELETED) return new TextDiff(0, oldLines.size(), patch(oldLines, List.of()));
+            return modifiedDiff(oldLines, newLines);
+        } catch (CharacterCodingException error) {
+            return new TextDiff(0, 0, "Binary or invalid UTF-8 files differ");
+        }
+    }
+
+    private TextDiff modifiedDiff(List<String> oldLines, List<String> newLines) {
+        long cells = (long) oldLines.size() * newLines.size();
+        if (cells > 1_000_000L) {
+            return new TextDiff(newLines.size(), oldLines.size(), patch(oldLines, newLines));
+        }
+        int[][] lcs = new int[oldLines.size() + 1][newLines.size() + 1];
+        for (int oldIndex = oldLines.size() - 1; oldIndex >= 0; oldIndex--) {
+            for (int newIndex = newLines.size() - 1; newIndex >= 0; newIndex--) {
+                lcs[oldIndex][newIndex] = oldLines.get(oldIndex).equals(newLines.get(newIndex))
+                        ? lcs[oldIndex + 1][newIndex + 1] + 1
+                        : Math.max(lcs[oldIndex + 1][newIndex], lcs[oldIndex][newIndex + 1]);
+            }
+        }
+        List<String> patchLines = new ArrayList<>();
+        int additions = 0;
+        int deletions = 0;
+        int oldIndex = 0;
+        int newIndex = 0;
+        while (oldIndex < oldLines.size() && newIndex < newLines.size()) {
+            if (oldLines.get(oldIndex).equals(newLines.get(newIndex))) {
+                patchLines.add(" " + oldLines.get(oldIndex++));
+                newIndex++;
+            } else if (lcs[oldIndex + 1][newIndex] >= lcs[oldIndex][newIndex + 1]) {
+                patchLines.add("-" + oldLines.get(oldIndex++));
+                deletions++;
+            } else {
+                patchLines.add("+" + newLines.get(newIndex++));
+                additions++;
+            }
+        }
+        while (oldIndex < oldLines.size()) { patchLines.add("-" + oldLines.get(oldIndex++)); deletions++; }
+        while (newIndex < newLines.size()) { patchLines.add("+" + newLines.get(newIndex++)); additions++; }
+        return new TextDiff(additions, deletions, formatPatch(patchLines));
+    }
+
+    private List<String> lines(byte[] bytes) throws CharacterCodingException {
+        if (bytes == null || bytes.length == 0) return List.of();
+        String value = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(bytes)).toString();
+        String[] split = value.split("\\R", -1);
+        if (split.length > 1 && split[split.length - 1].isEmpty()) split = java.util.Arrays.copyOf(split, split.length - 1);
+        return List.of(split);
+    }
+
+    private String patch(List<String> oldLines, List<String> newLines) {
+        List<String> lines = new ArrayList<>();
+        oldLines.forEach(line -> lines.add("-" + line));
+        newLines.forEach(line -> lines.add("+" + line));
+        return formatPatch(lines);
+    }
+
+    private String formatPatch(List<String> lines) {
+        StringBuilder patch = new StringBuilder("--- base\n+++ result\n@@\n");
+        int limit = Math.min(lines.size(), 2000);
+        for (int index = 0; index < limit; index++) patch.append(lines.get(index)).append('\n');
+        if (limit < lines.size()) patch.append("... [diff truncated]\n");
+        return patch.toString();
+    }
+
+    private record TextDiff(int additions, int deletions, String patch) {
     }
 }

@@ -24,6 +24,7 @@ class ExperimentTest {
 
         assertThrows(DomainException.class, experiment::beginPromotion);
 
+        experiment.sealResult(UUID.randomUUID());
         experiment.beginVerification();
         experiment.markVerified(VerificationResult.passed(List.of()));
 
@@ -49,6 +50,7 @@ class ExperimentTest {
         experiment.attachBase(UUID.randomUUID(), Path.of("C:/pico/experiment"));
         experiment.start();
         experiment.markAgentCompleted("done");
+        experiment.sealResult(UUID.randomUUID());
         experiment.beginVerification();
         experiment.markVerified(VerificationResult.failed(List.of(), "test command failed"));
 

@@ -13,11 +13,19 @@ export type Experiment = {
   task: string
   status: string
   baseSnapshotId: string | null
+  resultSnapshotId: string | null
   workspacePath: string | null
   agentSummary: string | null
   failureReason: string | null
   createdAt: string
   version: number
+}
+
+export type Session = {
+  id: string
+  projectId: string
+  title: string
+  createdAt: string
 }
 
 export type Evidence = {
@@ -35,6 +43,8 @@ export type Evidence = {
   durationMillis: number
   timedOut: boolean
   trusted: boolean
+  environmentProfile: string
+  cancelled: boolean
 }
 
 export type DiffEntry = {
@@ -43,6 +53,41 @@ export type DiffEntry = {
   beforeBytes: number
   afterBytes: number
   binary: boolean
+  additions: number
+  deletions: number
+  patch: string
+}
+
+export type PromotionOutcome = {
+  promoted: boolean
+  status: string
+  detail: string
+  changedFiles: string[]
+  fingerprint: string | null
+}
+
+export type PromotionPreview = {
+  baseFingerprint: string | null
+  currentFingerprint: string | null
+  finalCandidateFingerprint: string | null
+  verificationStatus: 'NOT_RUN' | 'PASSED' | 'FAILED'
+  trustedVerification: boolean
+  conflict: boolean
+  blockingReason: string | null
+  promotable: boolean
+}
+
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly code: string,
+    readonly traceId: string | null,
+    readonly details: Record<string, unknown>,
+    readonly status: number,
+  ) {
+    super(message)
+    this.name = 'ApiError'
+  }
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -51,8 +96,20 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     ...init,
   })
   if (!response.ok) {
-    const detail = await response.json().catch(() => ({ detail: response.statusText }))
-    throw new Error(detail.detail ?? detail.message ?? response.statusText)
+    const detail = await response.json().catch(() => ({ detail: response.statusText })) as {
+      detail?: string
+      message?: string
+      code?: string
+      traceId?: string
+      details?: Record<string, unknown>
+    }
+    throw new ApiError(
+      detail.detail ?? detail.message ?? response.statusText,
+      detail.code ?? 'HTTP_ERROR',
+      detail.traceId ?? null,
+      detail.details ?? {},
+      response.status,
+    )
   }
   return response.json() as Promise<T>
 }
@@ -62,14 +119,19 @@ export const api = {
   createProject: (body: { name: string; canonicalPath: string; verificationCommands: string[] }) =>
     request<Project>('/api/projects', { method: 'POST', body: JSON.stringify(body) }),
   experiments: (projectId: string) => request<Experiment[]>(`/api/projects/${projectId}/experiments`),
-  createExperiment: (projectId: string, body: { sessionTitle: string; task: string }) =>
+  sessions: (projectId: string) => request<Session[]>(`/api/projects/${projectId}/sessions`),
+  createSession: (projectId: string, title: string) =>
+    request<Session>(`/api/projects/${projectId}/sessions`, { method: 'POST', body: JSON.stringify({ title }) }),
+  createExperiment: (projectId: string, body: { sessionId?: string | null; sessionTitle?: string; task: string }) =>
     request<Experiment>(`/api/projects/${projectId}/experiments`, { method: 'POST', body: JSON.stringify(body) }),
   startExperiment: (experimentId: string) =>
     request<Experiment>(`/api/experiments/${experimentId}/start`, { method: 'POST' }),
   cancelExperiment: (experimentId: string) =>
     request<Experiment>(`/api/experiments/${experimentId}/cancel`, { method: 'POST' }),
   promoteExperiment: (experimentId: string) =>
-    request<{ promoted: boolean; status: string; detail: string; changedFiles: string[]; fingerprint: string | null }>(`/api/experiments/${experimentId}/promote`, { method: 'POST' }),
+    request<PromotionOutcome>(`/api/experiments/${experimentId}/promote`, { method: 'POST' }),
+  promotionPreview: (experimentId: string) =>
+    request<PromotionPreview>(`/api/experiments/${experimentId}/promotion-preview`),
   evidence: (experimentId: string) => request<Evidence[]>(`/api/experiments/${experimentId}/evidence`),
   diff: (experimentId: string) => request<DiffEntry[]>(`/api/experiments/${experimentId}/diff`),
 }

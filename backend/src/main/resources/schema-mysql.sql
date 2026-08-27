@@ -2,9 +2,11 @@ CREATE TABLE IF NOT EXISTS projects (
     id CHAR(36) PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
     canonical_path TEXT NOT NULL,
+    canonical_path_key CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
     verification_commands JSON NOT NULL,
     created_at TIMESTAMP(6) NOT NULL,
-    version BIGINT NOT NULL
+    version BIGINT NOT NULL,
+    UNIQUE KEY uk_projects_canonical_path_key (canonical_path_key)
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -35,6 +37,7 @@ CREATE TABLE IF NOT EXISTS experiments (
     created_at TIMESTAMP(6) NOT NULL,
     status VARCHAR(48) NOT NULL,
     base_snapshot_id CHAR(36) NULL,
+    result_snapshot_id CHAR(36) NULL,
     workspace_path TEXT NULL,
     agent_summary TEXT NULL,
     failure_reason TEXT NULL,
@@ -59,5 +62,40 @@ CREATE TABLE IF NOT EXISTS evidence (
     duration_millis BIGINT NOT NULL,
     timed_out BOOLEAN NOT NULL,
     trusted BOOLEAN NOT NULL,
+    environment_profile VARCHAR(64) NOT NULL DEFAULT 'unknown',
+    cancelled BOOLEAN NOT NULL DEFAULT FALSE,
     INDEX idx_evidence_experiment (experiment_id, started_at)
+);
+
+CREATE TABLE IF NOT EXISTS run_events (
+    event_id CHAR(36) NOT NULL UNIQUE,
+    experiment_id CHAR(36) NOT NULL,
+    sequence BIGINT NOT NULL,
+    type VARCHAR(96) NOT NULL,
+    event_timestamp TIMESTAMP(6) NOT NULL,
+    payload JSON NOT NULL,
+    PRIMARY KEY (experiment_id, sequence),
+    INDEX idx_run_events_experiment (experiment_id, sequence)
+);
+
+CREATE TABLE IF NOT EXISTS promotion_journal (
+    promotion_id CHAR(36) PRIMARY KEY,
+    experiment_id CHAR(36) NOT NULL,
+    project_id CHAR(36) NOT NULL,
+    base_fingerprint VARCHAR(255) NOT NULL,
+    candidate_fingerprint VARCHAR(255) NOT NULL,
+    candidate_path TEXT NOT NULL,
+    touched_files JSON NOT NULL,
+    preimage_hashes JSON NOT NULL,
+    postimage_hashes JSON NOT NULL,
+    phase VARCHAR(32) NOT NULL,
+    owner_id VARCHAR(128) NOT NULL,
+    lease_until TIMESTAMP(6) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    resulting_fingerprint VARCHAR(255) NULL,
+    failure_reason TEXT NULL,
+    version BIGINT NOT NULL,
+    INDEX idx_promotion_journal_experiment (experiment_id),
+    INDEX idx_promotion_journal_open (phase, lease_until)
 );

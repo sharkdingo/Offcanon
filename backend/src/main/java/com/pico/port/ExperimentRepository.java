@@ -10,5 +10,6 @@ public interface ExperimentRepository {
     Experiment save(Experiment experiment);
     Optional<Experiment> findById(UUID id);
     List<Experiment> findByProjectId(UUID projectId);
+    List<Experiment> findBySessionId(UUID sessionId);
     boolean hasRunningExperiment(UUID sessionId);
 }

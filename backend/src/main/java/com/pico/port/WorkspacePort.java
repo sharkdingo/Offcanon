@@ -8,5 +8,6 @@ import java.util.UUID;
 
 public interface WorkspacePort {
     Path materialize(Snapshot snapshot, UUID experimentId);
-    Path createPromotionCandidate(Snapshot base, Experiment experiment);
+    Path createVerificationWorkspace(Snapshot result, Experiment experiment);
+    Path createPromotionCandidate(Snapshot result, Experiment experiment);
 }

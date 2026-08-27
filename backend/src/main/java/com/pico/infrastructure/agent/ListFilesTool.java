@@ -8,6 +8,7 @@ import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -40,7 +41,8 @@ public class ListFilesTool implements Tool {
         try {
             ArrayList<String> files = new ArrayList<>();
             try (var stream = Files.walk(path, 3)) {
-                stream.filter(Files::isRegularFile).sorted(Comparator.naturalOrder()).limit(MAX_FILES)
+                stream.filter(file -> Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS))
+                        .sorted(Comparator.naturalOrder()).limit(MAX_FILES)
                         .forEach(file -> files.add(path.relativize(file).toString().replace('\\', '/')));
             }
             if (files.size() == MAX_FILES) files.add("...[file limit reached]");

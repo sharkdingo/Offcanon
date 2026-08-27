@@ -11,18 +11,23 @@ import com.pico.agent.domain.ToolCall;
 import com.pico.agent.domain.ToolDefinition;
 import com.pico.port.ModelPort;
 import com.pico.shared.domain.DomainException;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.function.Supplier;
 
 @Component
 public class OpenAiCompatibleModelAdapter implements ModelPort {
@@ -30,19 +35,37 @@ public class OpenAiCompatibleModelAdapter implements ModelPort {
     private final HttpClient http;
     private final String configuredBaseUrl;
     private final String configuredModel;
+    private final Duration requestTimeout;
+    private final Supplier<String> apiKeySupplier;
+    private static final int MAX_RESPONSE_BYTES = 2_000_000;
 
+    @Autowired
     public OpenAiCompatibleModelAdapter(ObjectMapper mapper,
                                         @Value("${pico.model.base-url:}") String configuredBaseUrl,
-                                        @Value("${pico.model.name:}") String configuredModel) {
-        this.mapper = mapper;
-        this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
+                                        @Value("${pico.model.name:}") String configuredModel,
+                                        @Value("${pico.model.request-timeout-seconds:120}") long requestTimeoutSeconds) {
+        this(mapper, HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(),
+                configuredBaseUrl, configuredModel, Duration.ofSeconds(Math.max(5, requestTimeoutSeconds)),
+                OpenAiCompatibleModelAdapter::environmentApiKey);
+    }
+
+    OpenAiCompatibleModelAdapter(ObjectMapper mapper,
+                                 HttpClient http,
+                                 String configuredBaseUrl,
+                                 String configuredModel,
+                                 Duration requestTimeout,
+                                 Supplier<String> apiKeySupplier) {
+        this.mapper = Objects.requireNonNull(mapper, "mapper");
+        this.http = Objects.requireNonNull(http, "http");
         this.configuredBaseUrl = configuredBaseUrl;
         this.configuredModel = configuredModel;
+        this.requestTimeout = Objects.requireNonNull(requestTimeout, "requestTimeout");
+        this.apiKeySupplier = Objects.requireNonNull(apiKeySupplier, "apiKeySupplier");
     }
 
     @Override
     public ModelResponse complete(ModelRequest request) {
-        String apiKey = firstNonBlank(System.getenv("PICO_MODEL_API_KEY"), System.getenv("OPENAI_API_KEY"));
+        String apiKey = firstNonBlank(apiKeySupplier.get());
         if (apiKey == null) {
             throw new DomainException("MODEL_NOT_CONFIGURED", "Set PICO_MODEL_API_KEY before starting an agent run");
         }
@@ -51,25 +74,51 @@ public class OpenAiCompatibleModelAdapter implements ModelPort {
         if (baseUrl == null || model == null) {
             throw new DomainException("MODEL_NOT_CONFIGURED", "Set PICO_MODEL_BASE_URL and PICO_MODEL_NAME before starting an agent run");
         }
+        final String requestBody;
         try {
             ObjectNode body = mapper.createObjectNode();
             body.put("model", model);
             body.set("messages", serializeMessages(request.messages()));
             body.set("tools", serializeTools(request.tools()));
             body.put("temperature", 0.1);
+            requestBody = mapper.writeValueAsString(body);
+        } catch (IOException error) {
+            throw new DomainException("MODEL_REQUEST_INVALID", "Unable to encode model request");
+        }
+        try {
+            Duration effectiveTimeout = request.timeout().compareTo(requestTimeout) < 0
+                    ? request.timeout() : requestTimeout;
             HttpRequest httpRequest = HttpRequest.newBuilder(endpoint(baseUrl))
-                    .timeout(Duration.ofSeconds(120))
+                    .timeout(effectiveTimeout)
                     .header("Content-Type", "application/json")
                     .header("Authorization", "Bearer " + apiKey)
-                    .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(body)))
+                    .POST(HttpRequest.BodyPublishers.ofString(requestBody))
                     .build();
-            HttpResponse<String> response = http.send(httpRequest, HttpResponse.BodyHandlers.ofString());
+            HttpResponse<InputStream> response = http.send(httpRequest, HttpResponse.BodyHandlers.ofInputStream());
             if (response.statusCode() / 100 != 2) {
+                response.body().close();
+                if (response.statusCode() == 408 || response.statusCode() == 429 || response.statusCode() >= 500) {
+                    throw new DomainException("MODEL_TRANSIENT_FAILURE",
+                            "Model request temporarily failed with HTTP " + response.statusCode());
+                }
                 throw new DomainException("MODEL_REQUEST_FAILED", "Model request failed with HTTP " + response.statusCode());
             }
-            return parseResponse(response.body());
+            byte[] bytes;
+            try (InputStream body = response.body()) {
+                bytes = body.readNBytes(MAX_RESPONSE_BYTES + 1);
+            }
+            if (bytes.length > MAX_RESPONSE_BYTES) {
+                throw new DomainException("MODEL_RESPONSE_TOO_LARGE", "Model response exceeded the configured safety limit");
+            }
+            try {
+                return parseResponse(new String(bytes, StandardCharsets.UTF_8));
+            } catch (IOException error) {
+                throw new DomainException("MODEL_RESPONSE_INVALID", "Unable to decode model response");
+            }
+        } catch (DomainException error) {
+            throw error;
         } catch (IOException e) {
-            throw new DomainException("MODEL_RESPONSE_INVALID", "Unable to encode or decode model response");
+            throw new DomainException("MODEL_TRANSIENT_FAILURE", "Model request failed before a response was received");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new DomainException("MODEL_INTERRUPTED", "Model request was interrupted");
@@ -155,5 +204,10 @@ public class OpenAiCompatibleModelAdapter implements ModelPort {
             if (value != null && !value.isBlank()) return value;
         }
         return null;
+    }
+
+    private static String environmentApiKey() {
+        String picoKey = System.getenv("PICO_MODEL_API_KEY");
+        return picoKey == null || picoKey.isBlank() ? System.getenv("OPENAI_API_KEY") : picoKey;
     }
 }

@@ -19,7 +19,9 @@ public record Evidence(
         Instant completedAt,
         Duration duration,
         boolean timedOut,
-        boolean trusted) {
+        boolean trusted,
+        String environmentProfile,
+        boolean cancelled) {
     public Evidence {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(experimentId, "experimentId");
@@ -32,10 +34,31 @@ public record Evidence(
         Objects.requireNonNull(startedAt, "startedAt");
         Objects.requireNonNull(completedAt, "completedAt");
         Objects.requireNonNull(duration, "duration");
+        environmentProfile = environmentProfile == null || environmentProfile.isBlank()
+                ? "unknown" : environmentProfile;
+    }
+
+    public Evidence(UUID id,
+                    UUID experimentId,
+                    UUID snapshotId,
+                    String kind,
+                    String command,
+                    String cwd,
+                    int exitCode,
+                    String stdout,
+                    String stderr,
+                    Instant startedAt,
+                    Instant completedAt,
+                    Duration duration,
+                    boolean timedOut,
+                    boolean trusted) {
+        this(id, experimentId, snapshotId, kind, command, cwd, exitCode, stdout, stderr,
+                startedAt, completedAt, duration, timedOut, trusted, "unknown", false);
     }
 
     public static Evidence verification(UUID experimentId,
                                         UUID snapshotId,
+                                        VerificationPurpose purpose,
                                         String command,
                                         String cwd,
                                         int exitCode,
@@ -44,8 +67,30 @@ public record Evidence(
                                         Instant startedAt,
                                         Instant completedAt,
                                         Duration duration,
-                                        boolean timedOut) {
-        return new Evidence(UUID.randomUUID(), experimentId, snapshotId, "VERIFICATION", command, cwd,
-                exitCode, stdout, stderr, startedAt, completedAt, duration, timedOut, true);
+                                        boolean timedOut,
+                                        boolean cancelled,
+                                        String environmentProfile,
+                                        boolean trusted) {
+        return new Evidence(UUID.randomUUID(), experimentId, snapshotId, purpose.evidenceKind(), command, cwd,
+                exitCode, stdout, stderr, startedAt, completedAt, duration, timedOut, trusted,
+                environmentProfile, cancelled);
+    }
+
+    public static Evidence command(UUID experimentId,
+                                   UUID snapshotId,
+                                   String command,
+                                   String cwd,
+                                   int exitCode,
+                                   String stdout,
+                                   String stderr,
+                                   Instant startedAt,
+                                   Instant completedAt,
+                                   Duration duration,
+                                   boolean timedOut,
+                                   boolean cancelled,
+                                   String environmentProfile) {
+        return new Evidence(UUID.randomUUID(), experimentId, snapshotId, "AGENT_COMMAND", command, cwd,
+                exitCode, stdout, stderr, startedAt, completedAt, duration, timedOut, false,
+                environmentProfile, cancelled);
     }
 }

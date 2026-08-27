@@ -19,11 +19,21 @@ public class LocalCommandExecutor implements CommandExecutor {
 
     @Override
     public CommandExecution execute(String command, Path cwd, Duration timeout, Map<String, String> environment) {
+        return execute(command, cwd, timeout, environment, "controlled-process");
+    }
+
+    @Override
+    public CommandExecution execute(String command,
+                                    Path cwd,
+                                    Duration timeout,
+                                    Map<String, String> environment,
+                                    String environmentProfile) {
         List<String> processCommand = isWindows()
                 ? List.of("cmd.exe", "/d", "/s", "/c", command)
                 : List.of("sh", "-lc", command);
         ProcessRunner.ProcessResult result = processRunner.run(processCommand, cwd, environment, timeout);
-        return new CommandExecution(result.exitCode(), result.stdout(), result.stderr(), result.duration(), result.timedOut());
+        return new CommandExecution(result.exitCode(), result.stdout(), result.stderr(), result.duration(),
+                result.timedOut(), result.cancelled(), environmentProfile);
     }
 
     private boolean isWindows() {

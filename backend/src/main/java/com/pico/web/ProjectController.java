@@ -21,6 +21,8 @@ import static com.pico.web.ApiDtos.CreateExperimentRequest;
 import static com.pico.web.ApiDtos.CreateProjectRequest;
 import static com.pico.web.ApiDtos.ExperimentResponse;
 import static com.pico.web.ApiDtos.ProjectResponse;
+import static com.pico.web.ApiDtos.SessionResponse;
+import static com.pico.web.ApiDtos.CreateSessionRequest;
 
 @RestController
 @RequestMapping("/api/projects")
@@ -49,6 +51,21 @@ public class ProjectController {
         return experimentService.listByProject(projectId).stream().map(ProjectController::toResponse).toList();
     }
 
+    @GetMapping("/{projectId}/sessions")
+    public List<SessionResponse> listSessions(@PathVariable UUID projectId) {
+        return experimentService.listSessions(projectId).stream()
+                .map(session -> new SessionResponse(session.id(), session.projectId(), session.title(), session.createdAt()))
+                .toList();
+    }
+
+    @PostMapping("/{projectId}/sessions")
+    @ResponseStatus(HttpStatus.CREATED)
+    public SessionResponse createSession(@PathVariable UUID projectId,
+                                         @Valid @RequestBody CreateSessionRequest request) {
+        var session = experimentService.createSession(projectId, request.title());
+        return new SessionResponse(session.id(), session.projectId(), session.title(), session.createdAt());
+    }
+
     @PostMapping("/{projectId}/experiments")
     @ResponseStatus(HttpStatus.CREATED)
     public ExperimentResponse createExperiment(@PathVariable UUID projectId,
@@ -63,7 +80,7 @@ public class ProjectController {
 
     private static ExperimentResponse toResponse(Experiment experiment) {
         return new ExperimentResponse(experiment.id(), experiment.projectId(), experiment.sessionId(), experiment.task(),
-                experiment.status().name(), experiment.baseSnapshotId(),
+                experiment.status().name(), experiment.baseSnapshotId(), experiment.resultSnapshotId(),
                 experiment.workspacePath() == null ? null : experiment.workspacePath().toString(),
                 experiment.agentSummary(), experiment.failureReason(), experiment.createdAt(), experiment.version());
     }
