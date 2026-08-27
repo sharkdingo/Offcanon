@@ -4,6 +4,8 @@ import com.pico.agent.domain.AgentRunResult;
 import com.pico.agent.domain.ModelRequest;
 import com.pico.agent.domain.ModelResponse;
 import com.pico.agent.domain.ToolCall;
+import com.pico.agent.domain.ToolDefinition;
+import com.pico.agent.domain.ToolResult;
 import com.pico.agent.domain.SessionContext;
 import com.pico.experiment.domain.Experiment;
 import com.pico.infrastructure.process.ProcessRunner;
@@ -24,11 +26,15 @@ import java.util.Map;
 import java.util.Queue;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class AgentLoopTest {
@@ -177,11 +183,345 @@ class AgentLoopTest {
         assertEquals("MAX_STEPS_EXCEEDED", error.code());
     }
 
+    @Test
+    void rejectsTruncatedModelOutputInsteadOfTreatingItAsCompletion() {
+        ModelPort model = request -> new ModelResponse("partial answer", List.of(), "length");
+
+        DomainException error = assertThrows(DomainException.class, () -> new AgentLoop(model,
+                new ToolRegistryImpl(List.of()), 2).run(experiment(temp), new NoCancellation()));
+
+        assertEquals("MODEL_OUTPUT_TRUNCATED", error.code());
+    }
+
+    @Test
+    void rejectsFilteredModelOutputInsteadOfTreatingItAsCompletion() {
+        ModelPort model = request -> new ModelResponse("", List.of(), "content_filter");
+
+        DomainException error = assertThrows(DomainException.class, () -> new AgentLoop(model,
+                new ToolRegistryImpl(List.of()), 2).run(experiment(temp), new NoCancellation()));
+
+        assertEquals("MODEL_OUTPUT_FILTERED", error.code());
+    }
+
+    @Test
+    void rejectsEmptyFinalResponseInsteadOfInventingASummary() {
+        ModelPort model = request -> new ModelResponse("", List.of(), "stop");
+
+        DomainException error = assertThrows(DomainException.class, () -> new AgentLoop(model,
+                new ToolRegistryImpl(List.of()), 2).run(experiment(temp), new NoCancellation()));
+
+        assertEquals("MODEL_EMPTY_RESPONSE", error.code());
+    }
+
+    @Test
+    void rejectsToolCallFinishReasonWithoutToolCallPayload() {
+        ModelPort model = request -> new ModelResponse("", List.of(), "tool_calls");
+
+        DomainException error = assertThrows(DomainException.class, () -> new AgentLoop(model,
+                new ToolRegistryImpl(List.of()), 2).run(experiment(temp), new NoCancellation()));
+
+        assertEquals("MODEL_TOOL_CALLS_MISSING", error.code());
+    }
+
+    @Test
+    void rejectsTruncatedToolBatchBeforeDispatchingAnySideEffect() {
+        AtomicInteger executions = new AtomicInteger();
+        Tool effect = countingTool("effect", executions, "ok");
+        ModelPort model = request -> new ModelResponse("", List.of(
+                new ToolCall("call-1", "effect", Map.of())), "length");
+
+        DomainException error = assertThrows(DomainException.class, () -> new AgentLoop(model,
+                new ToolRegistryImpl(List.of(effect)), 2).run(experiment(temp), new NoCancellation()));
+
+        assertEquals("MODEL_OUTPUT_TRUNCATED", error.code());
+        assertEquals(0, executions.get());
+
+        ModelPort filtered = request -> new ModelResponse("", List.of(
+                new ToolCall("call-2", "effect", Map.of())), "content_filter");
+        DomainException filteredError = assertThrows(DomainException.class, () -> new AgentLoop(filtered,
+                new ToolRegistryImpl(List.of(effect)), 2).run(experiment(temp), new NoCancellation()));
+
+        assertEquals("MODEL_OUTPUT_FILTERED", filteredError.code());
+        assertEquals(0, executions.get());
+    }
+
+    @Test
+    void rejectsDuplicateAndOversizedToolBatchesBeforeDispatch() {
+        AtomicInteger executions = new AtomicInteger();
+        Tool effect = countingTool("effect", executions, "ok");
+        ModelPort duplicate = request -> new ModelResponse("", List.of(
+                new ToolCall("same", "effect", Map.of("value", 1)),
+                new ToolCall("same", "effect", Map.of("value", 2))), "tool_calls");
+
+        DomainException duplicateError = assertThrows(DomainException.class, () -> new AgentLoop(duplicate,
+                new ToolRegistryImpl(List.of(effect)), 2).run(experiment(temp), new NoCancellation()));
+
+        assertEquals("DUPLICATE_TOOL_CALL_ID", duplicateError.code());
+        assertEquals(0, executions.get());
+
+        List<ToolCall> tooMany = java.util.stream.IntStream.range(0, 17)
+                .mapToObj(index -> new ToolCall("call-" + index, "effect", Map.of()))
+                .toList();
+        ModelPort oversized = request -> new ModelResponse("", tooMany, "tool_calls");
+
+        DomainException limitError = assertThrows(DomainException.class, () -> new AgentLoop(oversized,
+                new ToolRegistryImpl(List.of(effect)), 2).run(experiment(temp), new NoCancellation()));
+
+        assertEquals("TOOL_CALL_LIMIT_EXCEEDED", limitError.code());
+        assertEquals(0, executions.get());
+    }
+
+    @Test
+    void rejectsUnknownTerminalFinishReason() {
+        ModelPort model = request -> new ModelResponse("looks done", List.of(), "provider_specific_end");
+
+        DomainException error = assertThrows(DomainException.class, () -> new AgentLoop(model,
+                new ToolRegistryImpl(List.of()), 2).run(experiment(temp), new NoCancellation()));
+
+        assertEquals("MODEL_FINISH_REASON_UNKNOWN", error.code());
+    }
+
+    @Test
+    void overallDeadlineInterruptsAnInFlightTool() throws Exception {
+        CountDownLatch interrupted = new CountDownLatch(1);
+        Tool blocking = blockingTool("blocking", interrupted);
+        ModelPort model = request -> new ModelResponse("", List.of(
+                new ToolCall("slow", "blocking", Map.of())), "tool_calls");
+        long started = System.nanoTime();
+
+        DomainException error = assertThrows(DomainException.class, () -> new AgentLoop(model,
+                new ToolRegistryImpl(List.of(blocking)), 2, new InMemoryEventSink(), 20_000, 1,
+                Duration.ofMillis(100)).run(experiment(temp), new NoCancellation()));
+
+        assertEquals("AGENT_TIMEOUT", error.code());
+        assertTrue(interrupted.await(2, TimeUnit.SECONDS), "tool worker was not interrupted at the run deadline");
+        assertTrue(Duration.ofNanos(System.nanoTime() - started).compareTo(Duration.ofSeconds(2)) < 0);
+    }
+
+    @Test
+    void cancellationTokenInterruptsAnInFlightTool() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch interrupted = new CountDownLatch(1);
+        AtomicBoolean cancelled = new AtomicBoolean();
+        Tool blocking = new Tool() {
+            @Override
+            public ToolDefinition definition() {
+                return new ToolDefinition("blocking", "Block until interrupted", Map.of("type", "object"));
+            }
+
+            @Override
+            public ToolResult execute(Experiment experiment, String callId, Map<String, Object> arguments) {
+                started.countDown();
+                try {
+                    Thread.sleep(30_000);
+                    return ToolResult.success(callId, "blocking", "unexpected");
+                } catch (InterruptedException error) {
+                    interrupted.countDown();
+                    Thread.currentThread().interrupt();
+                    return ToolResult.failure(callId, "blocking", "interrupted");
+                }
+            }
+        };
+        Thread.ofVirtual().start(() -> {
+            try {
+                if (started.await(2, TimeUnit.SECONDS)) cancelled.set(true);
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        ModelPort model = request -> new ModelResponse("", List.of(
+                new ToolCall("cancel", "blocking", Map.of())), "tool_calls");
+
+        DomainException error = assertThrows(DomainException.class, () -> new AgentLoop(model,
+                new ToolRegistryImpl(List.of(blocking)), 2, new InMemoryEventSink(), 20_000, 1,
+                Duration.ofSeconds(5)).run(experiment(temp), cancelled::get));
+
+        assertEquals("AGENT_CANCELLED", error.code());
+        assertTrue(interrupted.await(2, TimeUnit.SECONDS), "tool worker was not interrupted on cancellation");
+    }
+
+    @Test
+    void overallDeadlineReturnsEvenWhenModelIgnoresItsTimeoutAndInterrupt() throws Exception {
+        CountDownLatch modelStarted = new CountDownLatch(1);
+        CountDownLatch interrupted = new CountDownLatch(1);
+        AtomicBoolean release = new AtomicBoolean();
+        AtomicReference<Duration> suppliedTimeout = new AtomicReference<>();
+        ModelPort model = request -> {
+            suppliedTimeout.set(request.timeout());
+            modelStarted.countDown();
+            while (!release.get()) {
+                try {
+                    Thread.sleep(25);
+                } catch (InterruptedException ignored) {
+                    interrupted.countDown();
+                    // Deliberately ignore interruption to exercise the loop's hard return boundary.
+                }
+            }
+            return new ModelResponse("late", List.of(), "stop");
+        };
+        long started = System.nanoTime();
+
+        try {
+            DomainException error = assertTimeoutPreemptively(Duration.ofSeconds(2), () ->
+                    assertThrows(DomainException.class, () -> new AgentLoop(model,
+                            new ToolRegistryImpl(List.of()), 2, new InMemoryEventSink(), 20_000, 1,
+                            Duration.ofMillis(100)).run(experiment(temp), new NoCancellation())));
+
+            assertEquals("AGENT_TIMEOUT", error.code());
+            assertTrue(modelStarted.await(1, TimeUnit.SECONDS));
+            assertTrue(interrupted.await(1, TimeUnit.SECONDS), "model worker was not interrupted at the run deadline");
+            assertTrue(suppliedTimeout.get().compareTo(Duration.ofMillis(100)) <= 0);
+            assertTrue(Duration.ofNanos(System.nanoTime() - started).compareTo(Duration.ofSeconds(2)) < 0);
+        } finally {
+            release.set(true);
+        }
+    }
+
+    @Test
+    void cancellationTokenInterruptsAnInFlightModelCall() throws Exception {
+        CountDownLatch modelStarted = new CountDownLatch(1);
+        CountDownLatch interrupted = new CountDownLatch(1);
+        AtomicBoolean cancelled = new AtomicBoolean();
+        ModelPort model = request -> {
+            modelStarted.countDown();
+            try {
+                Thread.sleep(30_000);
+                return new ModelResponse("unexpected", List.of(), "stop");
+            } catch (InterruptedException error) {
+                interrupted.countDown();
+                Thread.currentThread().interrupt();
+                return new ModelResponse("interrupted", List.of(), "stop");
+            }
+        };
+        Thread.ofVirtual().start(() -> {
+            try {
+                if (modelStarted.await(1, TimeUnit.SECONDS)) cancelled.set(true);
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        DomainException error = assertTimeoutPreemptively(Duration.ofSeconds(2), () ->
+                assertThrows(DomainException.class, () -> new AgentLoop(model,
+                        new ToolRegistryImpl(List.of()), 2, new InMemoryEventSink(), 20_000, 1,
+                        Duration.ofSeconds(5)).run(experiment(temp), cancelled::get)));
+
+        assertEquals("AGENT_CANCELLED", error.code());
+        assertTrue(interrupted.await(1, TimeUnit.SECONDS), "model worker was not interrupted on cancellation");
+    }
+
+    @Test
+    void compactsLargeLatestToolTurnWithoutDroppingItsObservation() {
+        AtomicInteger turn = new AtomicInteger();
+        AtomicReference<ModelRequest> secondRequest = new AtomicReference<>();
+        AtomicReference<Integer> dispatchedArgumentLength = new AtomicReference<>();
+        Tool large = new Tool() {
+            @Override
+            public ToolDefinition definition() {
+                return new ToolDefinition("large", "Return a large observation", Map.of("type", "object"));
+            }
+
+            @Override
+            public ToolResult execute(Experiment experiment, String callId, Map<String, Object> arguments) {
+                dispatchedArgumentLength.set(((String) arguments.get("payload")).length());
+                return ToolResult.success(callId, "large", "O".repeat(50_000));
+            }
+        };
+        ModelPort model = request -> {
+            if (turn.getAndIncrement() == 0) {
+                return new ModelResponse("planning ".repeat(2_000), List.of(
+                        new ToolCall("large-1", "large", Map.of("payload", "A".repeat(50_000)))), "tool_calls");
+            }
+            secondRequest.set(request);
+            return new ModelResponse("done", List.of(), "stop");
+        };
+
+        AgentRunResult result = new AgentLoop(model, new ToolRegistryImpl(List.of(large)), 3,
+                new InMemoryEventSink(), 8_000, 1, Duration.ofSeconds(5))
+                .run(experiment(temp), new NoCancellation());
+
+        assertEquals("done", result.summary());
+        assertEquals(50_000, dispatchedArgumentLength.get());
+        ModelRequest captured = secondRequest.get();
+        assertTrue(captured.messages().stream().anyMatch(message -> message.role() == com.pico.agent.domain.ModelMessage.Role.TOOL
+                && message.content().contains("context truncated")));
+        assertTrue(captured.messages().stream().flatMap(message -> message.toolCalls().stream())
+                .anyMatch(call -> call.arguments().containsKey("_pico_compacted")));
+        assertTrue(contextChars(captured) <= 8_000, "compacted request exceeded its configured context budget");
+    }
+
+    @Test
+    void failsExplicitlyWhenToolIdentityMetadataCannotFitTheContextBudget() {
+        AtomicInteger executions = new AtomicInteger();
+        Tool effect = countingTool("effect", executions, "ok");
+        List<ToolCall> calls = java.util.stream.IntStream.range(0, 16)
+                .mapToObj(index -> new ToolCall(index + "-" + "x".repeat(500), "effect", Map.of()))
+                .toList();
+        ModelPort model = request -> new ModelResponse("", calls, "tool_calls");
+
+        DomainException error = assertThrows(DomainException.class, () -> new AgentLoop(model,
+                new ToolRegistryImpl(List.of(effect)), 2, new InMemoryEventSink(), 8_000, 1,
+                Duration.ofSeconds(5)).run(experiment(temp), new NoCancellation()));
+
+        assertEquals("CONTEXT_BUDGET_EXCEEDED", error.code());
+        assertEquals(0, executions.get());
+    }
+
     private Experiment experiment(Path workspace) {
         Experiment experiment = Experiment.create(UUID.randomUUID(), UUID.randomUUID(), "task", Instant.now());
         experiment.beginSnapshot();
         experiment.attachBase(UUID.randomUUID(), workspace);
         return experiment;
+    }
+
+    private Tool countingTool(String name, AtomicInteger executions, String output) {
+        return new Tool() {
+            @Override
+            public ToolDefinition definition() {
+                return new ToolDefinition(name, "Count executions", Map.of("type", "object"));
+            }
+
+            @Override
+            public ToolResult execute(Experiment experiment, String callId, Map<String, Object> arguments) {
+                executions.incrementAndGet();
+                return ToolResult.success(callId, name, output);
+            }
+        };
+    }
+
+    private Tool blockingTool(String name, CountDownLatch interrupted) {
+        return new Tool() {
+            @Override
+            public ToolDefinition definition() {
+                return new ToolDefinition(name, "Block until interrupted", Map.of("type", "object"));
+            }
+
+            @Override
+            public ToolResult execute(Experiment experiment, String callId, Map<String, Object> arguments) {
+                try {
+                    Thread.sleep(30_000);
+                    return ToolResult.success(callId, name, "unexpected");
+                } catch (InterruptedException error) {
+                    interrupted.countDown();
+                    Thread.currentThread().interrupt();
+                    return ToolResult.failure(callId, name, "interrupted");
+                }
+            }
+        };
+    }
+
+    private int contextChars(ModelRequest request) {
+        int messages = request.messages().stream().mapToInt(message -> {
+            int chars = message.content().length();
+            if (message.toolCallId() != null) chars += message.toolCallId().length();
+            if (message.toolName() != null) chars += message.toolName().length();
+            chars += message.toolCalls().stream().mapToInt(call -> call.id().length() + call.name().length()
+                    + call.arguments().toString().length()).sum();
+            return chars;
+        }).sum();
+        int definitions = request.tools().stream().mapToInt(definition -> definition.name().length()
+                + definition.description().length() + definition.parameters().toString().length()).sum();
+        return messages + definitions;
     }
 
     private static final class QueueModel implements ModelPort {

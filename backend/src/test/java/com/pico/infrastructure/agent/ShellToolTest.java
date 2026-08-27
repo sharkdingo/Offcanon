@@ -9,11 +9,14 @@ import com.pico.infrastructure.memory.InMemoryProjectRepository;
 import com.pico.infrastructure.memory.InMemorySnapshotRepository;
 import com.pico.infrastructure.workspace.LocalWorkspaceAdapter;
 import com.pico.project.domain.Project;
+import com.pico.shared.domain.DomainException;
+import com.pico.workspace.domain.Snapshot;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
 import java.util.UUID;
@@ -23,6 +26,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class ShellToolTest {
     @TempDir
@@ -37,9 +41,35 @@ class ShellToolTest {
         ShellTool tool = new ShellTool(new ProcessRunner(), 5);
         ToolResult parent = tool.execute(experiment, "1", Map.of("command", "type ..\\outside.txt"));
         ToolResult absolute = tool.execute(experiment, "2", Map.of("command", "type C:\\secrets\\key.txt"));
+        ToolResult driveRelative = tool.execute(experiment, "3", Map.of("command", "type C:Windows\\win.ini"));
+        ToolResult escapedDrive = tool.execute(experiment, "4", Map.of("command", "type C^:\\secrets\\key.txt"));
+        ToolResult quotedDrive = tool.execute(experiment, "5", Map.of("command", "type C\":Windows\\win.ini\""));
+        ToolResult doubledQuotes = tool.execute(experiment, "6", Map.of("command", "type C\"\":Windows\\win.ini\""));
+        ToolResult wrappedQuotes = tool.execute(experiment, "7", Map.of("command", "type \"C\"\":Windows\\win.ini\""));
+        ToolResult optionAttachedDrive = tool.execute(experiment, "8", Map.of(
+                "command", "git --git-dir=C:\\outside\\.git show HEAD:service.txt"));
+        ToolResult optionAttachedParent = tool.execute(experiment, "9", Map.of(
+                "command", "git --git-dir=../outside/.git show HEAD:service.txt"));
+        ToolResult optionAttachedPosix = tool.execute(experiment, "10", Map.of(
+                "command", "git --git-dir=/tmp/outside.git show HEAD:service.txt"));
+        ToolResult optionAttachedUnc = tool.execute(experiment, "11", Map.of(
+                "command", "git --git-dir=\\\\server\\share\\outside.git show HEAD:service.txt"));
 
         assertFalse(parent.success());
         assertFalse(absolute.success());
+        assertFalse(driveRelative.success());
+        assertFalse(escapedDrive.success());
+        assertFalse(quotedDrive.success());
+        assertFalse(doubledQuotes.success());
+        assertFalse(wrappedQuotes.success());
+        assertFalse(optionAttachedDrive.success());
+        assertFalse(optionAttachedParent.success());
+        assertFalse(optionAttachedPosix.success());
+        assertFalse(optionAttachedUnc.success());
+        assertTrue(optionAttachedDrive.error().contains("absolute or parent-traversal"));
+        assertTrue(optionAttachedParent.error().contains("absolute or parent-traversal"));
+        assertTrue(optionAttachedPosix.error().contains("absolute or parent-traversal"));
+        assertTrue(optionAttachedUnc.error().contains("absolute or parent-traversal"));
         assertTrue(parent.error().contains("workspace") || parent.error().contains("path"));
     }
 
@@ -60,6 +90,21 @@ class ShellToolTest {
         assertFalse(tool.execute(experiment, "8", Map.of("command", "cat $HOME/.ssh/id_rsa")).success());
         assertFalse(tool.execute(experiment, "9", Map.of("command", "cat ${HOME}/.ssh/id_rsa")).success());
         assertFalse(tool.execute(experiment, "10", Map.of("command", "cat ~/.ssh/id_rsa")).success());
+    }
+
+    @Test
+    void allowsNonPathColonSyntax() {
+        Experiment experiment = Experiment.create(UUID.randomUUID(), UUID.randomUUID(), "task", Instant.now());
+        experiment.beginSnapshot();
+        experiment.attachBase(UUID.randomUUID(), temp);
+        com.pico.port.CommandExecutor executor = (command, cwd, timeout, environment) ->
+                new com.pico.port.CommandExecutor.CommandExecution(0, command, "", Duration.ZERO,
+                        false, false, "test");
+        ShellTool tool = new ShellTool(executor, null, null, null, null, 5);
+
+        assertTrue(tool.execute(experiment, "git", Map.of("command", "git show HEAD:service.txt")).success());
+        assertTrue(tool.execute(experiment, "maven", Map.of(
+                "command", "mvn dependency:get -Dartifact=com.foo:bar:1.0")).success());
     }
 
     @Test
@@ -98,6 +143,36 @@ class ShellToolTest {
         assertTrue(item.cancelled());
         assertEquals("agent-shell", item.environmentProfile());
         assertTrue(snapshotRepository.findById(item.snapshotId()).isPresent());
+    }
+
+    @Test
+    void evidenceFailureAfterCommandExecutionStopsTheRunAsIndeterminate() {
+        InMemoryProjectRepository projects = new InMemoryProjectRepository();
+        InMemoryEvidenceRepository evidence = new InMemoryEvidenceRepository();
+        InMemorySnapshotRepository snapshotRepository = new InMemorySnapshotRepository();
+        Project project = projects.save(Project.create("demo", temp, List.of("java -version"), Instant.now()));
+        Snapshot base = snapshotRepository.save(new Snapshot(UUID.randomUUID(), project.id(), "base", temp,
+                Instant.now(), List.of(), List.of()));
+        Experiment experiment = Experiment.create(project.id(), UUID.randomUUID(), "task", Instant.now());
+        experiment.beginSnapshot();
+        experiment.attachBase(base.id(), temp);
+        com.pico.port.SnapshotPort brokenSnapshots = new com.pico.port.SnapshotPort() {
+            @Override public Snapshot capture(Project ignored) { throw new UnsupportedOperationException(); }
+            @Override public Snapshot captureWorkspace(Project ignored, Path workspace, String parent) {
+                throw new DomainException("SNAPSHOT_FAILED", "simulated evidence failure");
+            }
+            @Override public String currentFingerprint(Project ignored) { throw new UnsupportedOperationException(); }
+            @Override public String fingerprintWorkspace(Project ignored, Path workspace, String parent) {
+                throw new UnsupportedOperationException();
+            }
+        };
+        ToolRegistryImpl registry = new ToolRegistryImpl(List.of(new ShellTool(new ProcessRunner(), projects,
+                evidence, brokenSnapshots, snapshotRepository, 5)));
+
+        DomainException error = assertThrows(DomainException.class, () -> registry.dispatch(experiment,
+                new com.pico.agent.domain.ToolCall("call", "shell", Map.of("command", "java -version"))));
+
+        assertEquals(ShellTool.INDETERMINATE_EXECUTION, error.code());
     }
 
     private void run(Path cwd, String... command) {

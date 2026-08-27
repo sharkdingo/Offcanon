@@ -27,6 +27,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
 
 @Component
@@ -88,6 +93,7 @@ public class OpenAiCompatibleModelAdapter implements ModelPort {
         try {
             Duration effectiveTimeout = request.timeout().compareTo(requestTimeout) < 0
                     ? request.timeout() : requestTimeout;
+            long deadline = System.nanoTime() + effectiveTimeout.toNanos();
             HttpRequest httpRequest = HttpRequest.newBuilder(endpoint(baseUrl))
                     .timeout(effectiveTimeout)
                     .header("Content-Type", "application/json")
@@ -104,9 +110,7 @@ public class OpenAiCompatibleModelAdapter implements ModelPort {
                 throw new DomainException("MODEL_REQUEST_FAILED", "Model request failed with HTTP " + response.statusCode());
             }
             byte[] bytes;
-            try (InputStream body = response.body()) {
-                bytes = body.readNBytes(MAX_RESPONSE_BYTES + 1);
-            }
+            bytes = readBodyWithDeadline(response.body(), deadline);
             if (bytes.length > MAX_RESPONSE_BYTES) {
                 throw new DomainException("MODEL_RESPONSE_TOO_LARGE", "Model response exceeded the configured safety limit");
             }
@@ -125,6 +129,63 @@ public class OpenAiCompatibleModelAdapter implements ModelPort {
         }
     }
 
+    private byte[] readBodyWithDeadline(InputStream body, long deadline) {
+        FutureTask<byte[]> task = new FutureTask<>(() -> {
+            try (body) {
+                return body.readNBytes(MAX_RESPONSE_BYTES + 1);
+            }
+        });
+        Thread worker = Thread.ofVirtual().name("pico-model-response-body").start(task);
+        try {
+            long remainingNanos = deadline - System.nanoTime();
+            if (remainingNanos <= 0) {
+                closeQuietly(body);
+                cancelWorker(task, worker);
+                throw modelReadTimeout();
+            }
+            return task.get(remainingNanos, TimeUnit.NANOSECONDS);
+        } catch (TimeoutException error) {
+            closeQuietly(body);
+            cancelWorker(task, worker);
+            throw modelReadTimeout();
+        } catch (InterruptedException error) {
+            closeQuietly(body);
+            cancelWorker(task, worker);
+            Thread.currentThread().interrupt();
+            throw new DomainException("MODEL_INTERRUPTED", "Model response body read was interrupted");
+        } catch (CancellationException error) {
+            closeQuietly(body);
+            cancelWorker(task, worker);
+            throw new DomainException("MODEL_INTERRUPTED", "Model response body read was cancelled");
+        } catch (ExecutionException error) {
+            Throwable cause = error.getCause();
+            if (cause instanceof DomainException domain) throw domain;
+            if (cause instanceof IOException) {
+                throw new DomainException("MODEL_TRANSIENT_FAILURE", "Model response body could not be read");
+            }
+            if (cause instanceof RuntimeException runtime) throw runtime;
+            if (cause instanceof Error fatal) throw fatal;
+            throw new IllegalStateException("Model response body read failed", cause);
+        }
+    }
+
+    private void cancelWorker(FutureTask<?> task, Thread worker) {
+        task.cancel(true);
+        worker.interrupt();
+    }
+
+    private void closeQuietly(InputStream body) {
+        try {
+            body.close();
+        } catch (IOException ignored) {
+            // Closing is best effort after cancellation; the caller must still return promptly.
+        }
+    }
+
+    private DomainException modelReadTimeout() {
+        return new DomainException("MODEL_TRANSIENT_FAILURE", "Model response body timed out");
+    }
+
     private URI endpoint(String baseUrl) {
         String trimmed = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
         return URI.create(trimmed.endsWith("/chat/completions") ? trimmed : trimmed + "/chat/completions");
@@ -136,7 +197,8 @@ public class OpenAiCompatibleModelAdapter implements ModelPort {
             ObjectNode item = array.addObject();
             item.put("role", message.role().name().toLowerCase());
             if (message.role() == ModelMessage.Role.ASSISTANT && !message.toolCalls().isEmpty()) {
-                item.putNull("content");
+                if (message.content().isBlank()) item.putNull("content");
+                else item.put("content", message.content());
             } else {
                 item.put("content", message.content());
             }

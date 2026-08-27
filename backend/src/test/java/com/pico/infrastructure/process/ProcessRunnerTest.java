@@ -10,7 +10,9 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ProcessRunnerTest {
@@ -52,6 +54,25 @@ class ProcessRunnerTest {
         assertTrue(result.stdout().contains("process output truncated; head/tail retained"));
         assertTrue(result.stdout().endsWith("TAIL_MARKER"));
         assertTrue(result.stdout().length() < 1_100_000);
+    }
+
+    @Test
+    void inheritsOnlyBuildRuntimeVariablesAndRejectsUnknownExplicitVariables() {
+        ProcessRunner runner = new ProcessRunner();
+
+        Map<String, String> sanitized = runner.sanitizedEnvironment(Map.of(
+                "PATH", "safe-path",
+                "JAVA_HOME", "safe-java",
+                "DATABASE_URL", "jdbc:mysql://user:secret@localhost/db",
+                "PICO_MODEL_API_KEY", "secret"), Map.of("PICO_EXPERIMENT_ID", "experiment-1"));
+
+        assertEquals("safe-path", sanitized.get("PATH"));
+        assertEquals("safe-java", sanitized.get("JAVA_HOME"));
+        assertEquals("experiment-1", sanitized.get("PICO_EXPERIMENT_ID"));
+        assertFalse(sanitized.containsKey("DATABASE_URL"));
+        assertFalse(sanitized.containsKey("PICO_MODEL_API_KEY"));
+        assertThrows(IllegalArgumentException.class, () -> runner.sanitizedEnvironment(
+                Map.of(), Map.of("DATABASE_URL", "secret")));
     }
 
     private List<String> javaCommand(String mode) {

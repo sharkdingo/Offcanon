@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
@@ -19,6 +20,18 @@ public class ProcessRunner {
     private static final int MAX_CAPTURE_BYTES = 1_000_000;
     private static final int HEAD_CAPTURE_BYTES = MAX_CAPTURE_BYTES / 2;
     private static final int TAIL_CAPTURE_BYTES = MAX_CAPTURE_BYTES - HEAD_CAPTURE_BYTES;
+    private static final Set<String> INHERITED_ENVIRONMENT = Set.of(
+            "APPDATA", "CARGO_HOME", "CI", "CLASSPATH", "COLORTERM", "COMSPEC",
+            "DOTNET_ROOT", "GOPATH", "GOROOT", "GRADLE_HOME", "GRADLE_USER_HOME",
+            "HOME", "HOMEDRIVE", "HOMEPATH", "JAVA_HOME", "LANG", "LANGUAGE",
+            "LC_ALL", "LC_CTYPE", "LOCALAPPDATA", "M2_HOME", "MAVEN_HOME",
+            "NODE_HOME", "NO_COLOR", "NPM_CONFIG_CACHE", "NUMBER_OF_PROCESSORS", "OS",
+            "PATH", "PATHEXT", "PNPM_HOME", "PROCESSOR_ARCHITECTURE", "PROGRAMDATA",
+            "RUSTUP_HOME", "SYSTEMROOT", "TEMP", "TERM", "TMP", "TMPDIR", "TZ",
+            "USERPROFILE", "WINDIR");
+    private static final Set<String> EXPLICIT_ENVIRONMENT = Set.of(
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_DIR", "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY", "GIT_WORK_TREE", "PICO_EXPERIMENT_ID");
 
     public ProcessResult run(List<String> command, Path cwd, Map<String, String> environment, Duration timeout) {
         long started = System.nanoTime();
@@ -27,13 +40,7 @@ public class ProcessRunner {
         CompletableFuture<String> stderr = CompletableFuture.completedFuture("");
         try {
             ProcessBuilder builder = new ProcessBuilder(command).directory(cwd.toFile());
-            Map<String, String> safeEnvironment = new HashMap<>(builder.environment());
-            safeEnvironment.keySet().removeIf(this::isSensitiveName);
-            environment.forEach((name, value) -> {
-                if (!isSensitiveName(name)) {
-                    safeEnvironment.put(name, value);
-                }
-            });
+            Map<String, String> safeEnvironment = sanitizedEnvironment(builder.environment(), environment);
             builder.environment().clear();
             builder.environment().putAll(safeEnvironment);
             process = builder.start();
@@ -70,6 +77,25 @@ public class ProcessRunner {
             return new ProcessResult(-1, out, err,
                     Duration.ofNanos(System.nanoTime() - started), false, true);
         }
+    }
+
+    Map<String, String> sanitizedEnvironment(Map<String, String> inherited,
+                                             Map<String, String> requested) {
+        Map<String, String> safe = new HashMap<>();
+        inherited.forEach((name, value) -> {
+            String normalized = name.toUpperCase(Locale.ROOT);
+            if (INHERITED_ENVIRONMENT.contains(normalized) && !isSensitiveName(name)) {
+                safe.put(name, value);
+            }
+        });
+        requested.forEach((name, value) -> {
+            String normalized = name.toUpperCase(Locale.ROOT);
+            if (!EXPLICIT_ENVIRONMENT.contains(normalized) || isSensitiveName(name)) {
+                throw new IllegalArgumentException("Process environment variable is not allowed: " + name);
+            }
+            safe.put(name, value);
+        });
+        return safe;
     }
 
     private boolean isSensitiveName(String name) {

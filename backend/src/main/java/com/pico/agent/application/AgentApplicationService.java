@@ -31,6 +31,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 @Service
 public class AgentApplicationService {
+    private static final int STATE_SETTLEMENT_ATTEMPTS = 8;
     private final ExperimentRepository experimentRepository;
     private final ProjectRepository projectRepository;
     private final SnapshotRepository snapshotRepository;
@@ -73,6 +74,10 @@ public class AgentApplicationService {
             throw new DomainException("SESSION_ALREADY_RUNNING", "A session can run only one experiment at a time");
         }
         try {
+            if (experimentRepository.hasRunningExperiment(experiment.sessionId())) {
+                throw new DomainException("SESSION_ALREADY_RUNNING",
+                        "A session already has an active experiment in persistent state");
+            }
             experiment.start();
             experimentRepository.save(experiment);
         } catch (RuntimeException error) {
@@ -101,8 +106,7 @@ public class AgentApplicationService {
         };
         if (runs.putIfAbsent(experimentId, run) != null) {
             cancellations.remove(experimentId, cancellation);
-            experiment.fail("EXPERIMENT_ALREADY_RUNNING");
-            experimentRepository.save(experiment);
+            settleFailure(experimentId, "EXPERIMENT_ALREADY_RUNNING");
             sessionRunLease.release(experiment.sessionId(), experiment.id());
             throw new DomainException("EXPERIMENT_ALREADY_RUNNING", "An agent run is already scheduled for this experiment");
         }
@@ -111,8 +115,8 @@ public class AgentApplicationService {
         } catch (RuntimeException error) {
             runs.remove(experimentId, run);
             cancellations.remove(experimentId, cancellation);
-            experiment.fail("AGENT_EXECUTOR_REJECTED: " + (error.getMessage() == null ? "executor unavailable" : error.getMessage()));
-            experimentRepository.save(experiment);
+            settleFailure(experimentId, "AGENT_EXECUTOR_REJECTED: "
+                    + (error.getMessage() == null ? "executor unavailable" : error.getMessage()));
             sessionRunLease.release(experiment.sessionId(), experiment.id());
             throw error;
         }
@@ -128,10 +132,9 @@ public class AgentApplicationService {
             return experiment;
         }
         if (experiment.status() == ExperimentStatus.READY_TO_RUN) {
-            experiment.cancel();
-            experimentRepository.save(experiment);
-            publishBestEffort(experimentId, "EXPERIMENT_CANCELLED", java.util.Map.of("status", experiment.status().name()));
-            return experiment;
+            StateSettlement settlement = settleCancellation(experimentId);
+            publishCancellationIfChanged(experimentId, settlement);
+            return settlement.experiment();
         }
         AtomicBoolean token = cancellations.computeIfAbsent(experimentId, ignored -> new AtomicBoolean(false));
         token.set(true);
@@ -142,29 +145,26 @@ public class AgentApplicationService {
             cancellations.remove(experimentId, token);
             sessionRunLease.release(experiment.sessionId(), experiment.id());
         }
-        if (experiment.status() == ExperimentStatus.READY_TO_RUN
-                || experiment.status() == ExperimentStatus.RUNNING
-                || experiment.status() == ExperimentStatus.AGENT_COMPLETED
-                || experiment.status() == ExperimentStatus.VERIFYING) {
-            experiment.cancel();
-            experimentRepository.save(experiment);
-        }
-        if (run == null) {
-            publishBestEffort(experimentId, "EXPERIMENT_CANCELLED", java.util.Map.of("status", experiment.status().name()));
-        }
-        return experiment;
+        StateSettlement settlement = settleCancellation(experimentId);
+        publishCancellationIfChanged(experimentId, settlement);
+        return settlement.experiment();
     }
 
     private void run(UUID experimentId, AtomicBoolean cancellation) {
         Experiment experiment = get(experimentId);
+        if (experiment.status() != ExperimentStatus.RUNNING) {
+            return;
+        }
+        if (cancellation.get()) {
+            publishCancellationIfChanged(experimentId, settleCancellation(experimentId));
+            return;
+        }
         try {
             AgentRunResult result = agentLoop.run(experiment, cancellation::get, sessionContext(experiment));
             experiment.markAgentCompleted(result.summary());
             experimentRepository.save(experiment);
             if (cancellation.get()) {
-                experiment.cancel();
-                experimentRepository.save(experiment);
-                publishBestEffort(experimentId, "EXPERIMENT_CANCELLED", java.util.Map.of("status", experiment.status().name()));
+                publishCancellationIfChanged(experimentId, settleCancellation(experimentId));
                 return;
             }
 
@@ -180,9 +180,7 @@ public class AgentApplicationService {
                     "snapshotId", resultSnapshot.id().toString(),
                     "fingerprint", resultSnapshot.fingerprint()));
             if (cancellation.get()) {
-                experiment.cancel();
-                experimentRepository.save(experiment);
-                publishBestEffort(experimentId, "EXPERIMENT_CANCELLED", java.util.Map.of("status", experiment.status().name()));
+                publishCancellationIfChanged(experimentId, settleCancellation(experimentId));
                 return;
             }
             experiment.beginVerification();
@@ -202,9 +200,7 @@ public class AgentApplicationService {
                 throw new DomainException("RESULT_SNAPSHOT_MUTATED", "Sealed result snapshot changed after capture");
             }
             if (cancellation.get()) {
-                experiment.cancel();
-                experimentRepository.save(experiment);
-                publishBestEffort(experimentId, "EXPERIMENT_CANCELLED", java.util.Map.of("status", experiment.status().name()));
+                publishCancellationIfChanged(experimentId, settleCancellation(experimentId));
                 return;
             }
             experiment.markVerified(verificationResult);
@@ -212,34 +208,85 @@ public class AgentApplicationService {
             publishBestEffort(experimentId, "VERIFICATION_FINISHED", java.util.Map.of("status", experiment.status().name(), "passed", experiment.status().name().equals("VERIFIED")));
         } catch (DomainException error) {
             if (cancellation.get() || "AGENT_CANCELLED".equals(error.code())) {
-                if (experiment.status() != ExperimentStatus.CANCELLED) {
-                    experiment.cancel();
-                    experimentRepository.save(experiment);
-                }
-                publishBestEffort(experimentId, "EXPERIMENT_CANCELLED", java.util.Map.of("status", experiment.status().name()));
+                publishCancellationIfChanged(experimentId, settleCancellation(experimentId));
                 return;
             }
-            if (experiment.status() != ExperimentStatus.CANCELLED) {
-                experiment.fail(error.code() + ": " + error.getMessage());
-                experimentRepository.save(experiment);
+            StateSettlement settlement = settleFailure(experimentId, error.code() + ": " + error.getMessage());
+            if (settlement.changed()) {
+                publishBestEffort(experimentId, "EXPERIMENT_FAILED", java.util.Map.of(
+                        "code", error.code(), "message", error.getMessage() == null ? "" : error.getMessage()));
             }
-            publishBestEffort(experimentId, "EXPERIMENT_FAILED", java.util.Map.of("code", error.code(), "message", error.getMessage() == null ? "" : error.getMessage()));
         } catch (RuntimeException error) {
             if (cancellation.get()) {
-                if (experiment.status() != ExperimentStatus.CANCELLED) {
-                    experiment.cancel();
-                    experimentRepository.save(experiment);
-                }
-                publishBestEffort(experimentId, "EXPERIMENT_CANCELLED", java.util.Map.of("status", experiment.status().name()));
+                publishCancellationIfChanged(experimentId, settleCancellation(experimentId));
                 return;
             }
-            if (experiment.status() != ExperimentStatus.CANCELLED) {
-                experiment.fail(error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage());
-                experimentRepository.save(experiment);
+            StateSettlement settlement = settleFailure(experimentId,
+                    error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage());
+            if (settlement.changed()) {
                 publishBestEffort(experimentId, "EXPERIMENT_FAILED", java.util.Map.of("message", error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage()));
             }
         }
     }
+
+    private StateSettlement settleCancellation(UUID experimentId) {
+        for (int attempt = 1; attempt <= STATE_SETTLEMENT_ATTEMPTS; attempt++) {
+            Experiment current = get(experimentId);
+            if (!isCancellable(current.status())) return new StateSettlement(current, false);
+            current.cancel();
+            try {
+                return new StateSettlement(experimentRepository.save(current), true);
+            } catch (DomainException error) {
+                if (!isVersionConflict(error)) throw error;
+            }
+        }
+        throw stateContention(experimentId, "cancel");
+    }
+
+    private StateSettlement settleFailure(UUID experimentId, String reason) {
+        for (int attempt = 1; attempt <= STATE_SETTLEMENT_ATTEMPTS; attempt++) {
+            Experiment current = get(experimentId);
+            if (!canFail(current.status())) return new StateSettlement(current, false);
+            current.fail(reason);
+            try {
+                return new StateSettlement(experimentRepository.save(current), true);
+            } catch (DomainException error) {
+                if (!isVersionConflict(error)) throw error;
+            }
+        }
+        throw stateContention(experimentId, "fail");
+    }
+
+    private boolean isCancellable(ExperimentStatus status) {
+        return status == ExperimentStatus.READY_TO_RUN
+                || status == ExperimentStatus.RUNNING
+                || status == ExperimentStatus.AGENT_COMPLETED
+                || status == ExperimentStatus.VERIFYING;
+    }
+
+    private boolean canFail(ExperimentStatus status) {
+        return status == ExperimentStatus.RUNNING
+                || status == ExperimentStatus.AGENT_COMPLETED
+                || status == ExperimentStatus.VERIFYING;
+    }
+
+    private boolean isVersionConflict(DomainException error) {
+        return "EXPERIMENT_VERSION_CONFLICT".equals(error.code());
+    }
+
+    private DomainException stateContention(UUID experimentId, String transition) {
+        return new DomainException("EXPERIMENT_STATE_CONTENTION",
+                "Could not " + transition + " experiment after concurrent state changes: " + experimentId);
+    }
+
+    private void publishCancellationIfChanged(UUID experimentId, StateSettlement settlement) {
+        if (settlement.changed() && settlement.experiment().status() == ExperimentStatus.CANCELLED) {
+            publishBestEffort(experimentId, "EXPERIMENT_CANCELLED",
+                    java.util.Map.of("status", settlement.experiment().status().name()));
+        }
+    }
+
+    private record StateSettlement(Experiment experiment, boolean changed) {}
 
     private void cleanupRun(Experiment experiment, AtomicBoolean cancellation) {
         cancellations.remove(experiment.id(), cancellation);

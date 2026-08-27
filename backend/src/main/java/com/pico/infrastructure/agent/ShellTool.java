@@ -26,13 +26,15 @@ import java.util.regex.Pattern;
 
 @Component
 public class ShellTool implements Tool {
+    static final String INDETERMINATE_EXECUTION = "TOOL_EXECUTION_INDETERMINATE";
     private static final int MAX_OUTPUT_CHARS = 12_000;
-    private static final Pattern PARENT_SEGMENT = Pattern.compile("(^|[\\\\/\\s\"'])\\.\\.([\\\\/\\s\"']|$)");
-    private static final Pattern WINDOWS_ABSOLUTE = Pattern.compile("[a-z]:[\\\\/]");
+    private static final Pattern PARENT_SEGMENT = Pattern.compile("(^|[\\\\/\\s\"'=])\\.\\.([\\\\/\\s\"'=]|$)");
+    private static final Pattern WINDOWS_DRIVE_PATH = Pattern.compile(
+            "(?i)(?:[a-z]:[\\\\/]|(?:^|[\\s\"'=])[a-z]:)");
     private static final Pattern UNC_ABSOLUTE = Pattern.compile("^\\\\\\\\");
-    private static final Pattern POSIX_ABSOLUTE = Pattern.compile("(^|[\\s\"'])/");
+    private static final Pattern POSIX_ABSOLUTE = Pattern.compile("(^|[\\s\"'=])/");
     private static final Pattern SHELL_METACHARACTER = Pattern.compile(
-            "[;&|<>`]|\\$\\(|%[a-z0-9_]+%|\\$env:|\\$\\{?[a-z_][a-z0-9_]*}?|(^|[\\s\"'])~(?=[\\\\/]|$)",
+            "[;&|<>`^%$]|(^|[\\s\"'])~(?=[\\\\/]|$)",
             Pattern.CASE_INSENSITIVE);
     private static final Pattern DANGEROUS_GIT = Pattern.compile(
             "(?i)(^|[\\s\\\"'])git(?:\\.exe)?[\\s\\\"']+(reset|clean|restore|checkout|switch|branch|update-ref|config|worktree|gc|submodule|commit|push|fetch|merge|rebase)(?:[\\s\\\"']|$)");
@@ -103,7 +105,13 @@ public class ShellTool implements Tool {
             Instant completed = Instant.now();
             boolean interrupted = Thread.interrupted();
             try {
-                recordEvidence(project, experiment, command, result, started, completed);
+                try {
+                    recordEvidence(project, experiment, command, result, started, completed);
+                } catch (RuntimeException evidenceFailure) {
+                    throw new DomainException(INDETERMINATE_EXECUTION,
+                            "Command finished, but its resulting state could not be sealed as evidence; "
+                                    + "the run stopped to avoid repeating a possible side effect");
+                }
             } finally {
                 if (interrupted) Thread.currentThread().interrupt();
             }
@@ -121,6 +129,7 @@ public class ShellTool implements Tool {
             }
             return ToolResult.success(callId, definition().name(), output);
         } catch (DomainException error) {
+            if (INDETERMINATE_EXECUTION.equals(error.code())) throw error;
             return ToolResult.failure(callId, definition().name(), error.getMessage());
         }
     }
@@ -144,28 +153,30 @@ public class ShellTool implements Tool {
     }
 
     private void validateCommand(String command, Path workspace, Path canonical) {
-        String normalized = command.replace('\\', '/').toLowerCase(Locale.ROOT);
-        if (DANGEROUS_GIT.matcher(normalized).find()
-                || NESTED_INTERPRETER.matcher(normalized).find()
-                || DESTRUCTIVE_COMMAND.matcher(normalized).find()
-                || NETWORK_COMMAND.matcher(normalized).find()
-                || normalized.contains("start-process")
-                || normalized.contains("invoke-expression")
-                || normalized.matches(".*(^|[\\s\\\"'])iex(?:[\\s\\\"']|$).*") ) {
+        String dequoted = command.toLowerCase(Locale.ROOT).replace("\"", "").replace("'", "");
+        String commandView = dequoted.replace("\\", "");
+        String pathView = dequoted.replace('\\', '/');
+        if (DANGEROUS_GIT.matcher(commandView).find()
+                || NESTED_INTERPRETER.matcher(commandView).find()
+                || DESTRUCTIVE_COMMAND.matcher(commandView).find()
+                || NETWORK_COMMAND.matcher(commandView).find()
+                || commandView.contains("start-process")
+                || commandView.contains("invoke-expression")
+                || commandView.matches(".*(^|[\\s\\\"'])iex(?:[\\s\\\"']|$).*") ) {
             throw new DomainException("DANGEROUS_COMMAND_BLOCKED", "Command is blocked by the experiment policy");
         }
         if (SHELL_METACHARACTER.matcher(command).find()) {
             throw new DomainException("DANGEROUS_COMMAND_BLOCKED", "Shell operators, command substitution and environment expansion are blocked by the experiment policy");
         }
-        if (PARENT_SEGMENT.matcher(normalized).find()
-                || WINDOWS_ABSOLUTE.matcher(normalized).find()
-                || UNC_ABSOLUTE.matcher(normalized).find()
-                || POSIX_ABSOLUTE.matcher(normalized).find()) {
+        if (PARENT_SEGMENT.matcher(pathView).find()
+                || WINDOWS_DRIVE_PATH.matcher(pathView).find()
+                || UNC_ABSOLUTE.matcher(pathView).find()
+                || POSIX_ABSOLUTE.matcher(pathView).find()) {
             throw new DomainException("WORKSPACE_PATH_BLOCKED", "Shell command contains an absolute or parent-traversal path");
         }
         if (canonical != null) {
             String canonicalText = canonical.toString().replace('\\', '/').toLowerCase(Locale.ROOT);
-            if (normalized.contains(canonicalText)) {
+            if (pathView.contains(canonicalText)) {
                 throw new DomainException("CANONICAL_ACCESS_BLOCKED", "Shell command references the canonical workspace");
             }
         }
