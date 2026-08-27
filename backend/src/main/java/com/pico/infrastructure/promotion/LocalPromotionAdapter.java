@@ -23,6 +23,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Locale;
 import java.util.Set;
 
 @Component
@@ -36,7 +37,11 @@ public class LocalPromotionAdapter implements PromotionPort {
         List<Operation> applied = new ArrayList<>();
         try {
             for (Operation operation : operations) {
-                applyOperation(operation);
+                ensureSafeCanonicalParent(canonical, operation.target().getParent());
+                if (!sameState(operation.target(), operation.before())) {
+                    throw new DomainException("STALE_DURING_PROMOTION", "Canonical preimage changed: " + operation.relativePath());
+                }
+                applyOperation(canonical, operation);
                 applied.add(operation);
             }
             for (Operation operation : operations) {
@@ -56,6 +61,9 @@ public class LocalPromotionAdapter implements PromotionPort {
         paths.addAll(after.keySet());
         List<Operation> operations = new ArrayList<>();
         for (String relative : paths.stream().sorted().toList()) {
+            if (isProtectedPath(relative)) {
+                throw new DomainException("PROMOTION_PROTECTED_PATH", "Refusing to promote internal or sensitive path: " + relative);
+            }
             byte[] expected = before.get(relative);
             byte[] next = after.get(relative);
             if (Arrays.equals(expected, next)) continue;
@@ -63,9 +71,7 @@ public class LocalPromotionAdapter implements PromotionPort {
             if (!target.startsWith(canonical)) {
                 throw new DomainException("PROMOTION_PATH_ESCAPE", "Promotion path escapes canonical workspace");
             }
-            if (Files.exists(target, LinkOption.NOFOLLOW_LINKS) && Files.isSymbolicLink(target)) {
-                throw new DomainException("PROMOTION_SYMLINK_BLOCKED", "Refusing to promote through symlink: " + relative);
-            }
+            ensureSafeCanonicalParent(canonical, target.getParent());
             if (!sameState(target, expected)) {
                 throw new DomainException("STALE_DURING_PROMOTION", "Canonical preimage changed: " + relative);
             }
@@ -74,8 +80,9 @@ public class LocalPromotionAdapter implements PromotionPort {
         return operations;
     }
 
-    private void applyOperation(Operation operation) {
+    private void applyOperation(Path canonical, Operation operation) {
         try {
+            ensureSafeCanonicalParent(canonical, operation.target().getParent());
             if (operation.after() == null) {
                 Files.deleteIfExists(operation.target());
                 return;
@@ -120,6 +127,14 @@ public class LocalPromotionAdapter implements PromotionPort {
             }
             Files.walkFileTree(root, new SimpleFileVisitor<>() {
                 @Override
+                public FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attrs) {
+                    if (!directory.equals(root) && Files.isSymbolicLink(directory)) {
+                        throw new DomainException("PROMOTION_SYMLINK_BLOCKED", "Symlink directory in promotion candidate: " + root.relativize(directory));
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
                 public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
                     if (Files.isSymbolicLink(file)) {
                         throw new DomainException("PROMOTION_SYMLINK_BLOCKED", "Symlink in promotion candidate: " + root.relativize(file));
@@ -141,6 +156,36 @@ public class LocalPromotionAdapter implements PromotionPort {
         } catch (IOException error) {
             return false;
         }
+    }
+
+    private void ensureSafeCanonicalParent(Path canonical, Path parent) {
+        Path current = parent;
+        while (current != null && current.startsWith(canonical)) {
+            if (Files.exists(current, LinkOption.NOFOLLOW_LINKS) && Files.isSymbolicLink(current)) {
+                throw new DomainException("PROMOTION_SYMLINK_BLOCKED", "Refusing to promote through symlink: " + canonical.relativize(current));
+            }
+            if (Files.exists(current, LinkOption.NOFOLLOW_LINKS)) {
+                try {
+                    if (!current.toRealPath().startsWith(canonical.toRealPath())) {
+                        throw new DomainException("PROMOTION_PATH_ESCAPE", "Canonical parent resolves outside project");
+                    }
+                } catch (IOException error) {
+                    throw new DomainException("PROMOTION_PATH_INVALID", "Unable to resolve canonical parent");
+                }
+                return;
+            }
+            current = current.getParent();
+        }
+        throw new DomainException("PROMOTION_PATH_ESCAPE", "Promotion path escapes canonical workspace");
+    }
+
+    private boolean isProtectedPath(String relative) {
+        String[] parts = relative.toLowerCase(Locale.ROOT).split("/");
+        for (String part : parts) {
+            if (part.equals(".git") || part.equals(".pico")) return true;
+        }
+        String file = parts.length == 0 ? relative : parts[parts.length - 1];
+        return file.equals(".env") || file.startsWith(".env.");
     }
 
     private String fingerprint(Map<String, byte[]> files) {

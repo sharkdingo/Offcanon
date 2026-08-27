@@ -15,6 +15,7 @@ import java.util.Map;
 
 @Component
 public class ListFilesTool implements Tool {
+    private static final int MAX_FILES = 500;
     private final WorkspacePathResolver paths;
 
     public ListFilesTool(WorkspacePathResolver paths) {
@@ -38,7 +39,11 @@ public class ListFilesTool implements Tool {
         }
         try {
             ArrayList<String> files = new ArrayList<>();
-            Files.walk(path, 3).filter(Files::isRegularFile).sorted(Comparator.naturalOrder()).forEach(file -> files.add(path.relativize(file).toString().replace('\\', '/')));
+            try (var stream = Files.walk(path, 3)) {
+                stream.filter(Files::isRegularFile).sorted(Comparator.naturalOrder()).limit(MAX_FILES)
+                        .forEach(file -> files.add(path.relativize(file).toString().replace('\\', '/')));
+            }
+            if (files.size() == MAX_FILES) files.add("...[file limit reached]");
             return ToolResult.success(callId, definition().name(), String.join("\n", files));
         } catch (IOException error) {
             return ToolResult.failure(callId, definition().name(), "Unable to list " + requested + ": " + error.getMessage());

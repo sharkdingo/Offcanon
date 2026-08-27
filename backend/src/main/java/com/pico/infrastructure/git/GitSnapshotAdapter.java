@@ -22,6 +22,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Locale;
 import java.util.UUID;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
@@ -48,10 +49,14 @@ public class GitSnapshotAdapter implements SnapshotPort {
             Files.createDirectories(snapshotPath.getParent());
             archive = Files.createTempFile("pico-snapshot-", ".zip");
             String before = writeWorkingTree(root);
-            runGit(root, List.of("archive", "--format=zip", "-o", archive.toString(), before));
+            ProcessRunner.ProcessResult archiveResult = runGit(root, List.of("archive", "--format=zip", "-o", archive.toString(), before));
+            if (archiveResult.exitCode() != 0) {
+                throw gitFailure("Unable to materialize snapshot archive", archiveResult);
+            }
 
             List<String> included = new ArrayList<>();
             List<Snapshot.ExcludedPath> excluded = new ArrayList<>();
+            collectExcluded(root, excluded);
             extractArchive(archive, snapshotPath, included, excluded);
 
             String after = writeWorkingTree(root);
@@ -108,10 +113,23 @@ public class GitSnapshotAdapter implements SnapshotPort {
                     throw gitFailure("Unable to initialise temporary index", readTree);
                 }
             }
-            ProcessRunner.ProcessResult add = runGit(root, List.of("add", "-A", "--", "."), env);
+            List<String> addArgs = new ArrayList<>(List.of("add", "-A", "--", "."));
+            addArgs.addAll(List.of(
+                    ":(exclude,icase,glob)**/.env",
+                    ":(exclude,icase,glob)**/.env.*",
+                    ":(exclude,icase,glob)**/.git/**",
+                    ":(exclude,icase,glob)**/.pico/**",
+                    ":(exclude,glob)**/node_modules/**",
+                    ":(exclude,glob)**/target/**",
+                    ":(exclude,glob)**/build/**",
+                    ":(exclude,glob)**/dist/**",
+                    ":(exclude,glob)**/.idea/**",
+                    ":(exclude,glob)**/.vscode/**"));
+            ProcessRunner.ProcessResult add = runGit(root, addArgs, env);
             if (add.exitCode() != 0) {
                 throw gitFailure("Unable to capture working tree", add);
             }
+            removeExcludedIndexEntries(root, env);
             ProcessRunner.ProcessResult tree = runGit(root, List.of("write-tree"), env);
             if (tree.exitCode() != 0 || tree.stdout().isBlank()) {
                 throw gitFailure("Unable to write snapshot tree", tree);
@@ -119,6 +137,18 @@ public class GitSnapshotAdapter implements SnapshotPort {
             return tree.stdout().trim();
         } finally {
             deleteQuietly(index);
+        }
+    }
+
+    private void removeExcludedIndexEntries(Path root, Map<String, String> env) {
+        ProcessRunner.ProcessResult listed = runGit(root, List.of("ls-files"), env);
+        if (listed.exitCode() != 0 || listed.stdout().isBlank()) return;
+        for (String relative : listed.stdout().split("\\R")) {
+            if (relative.isBlank() || exclusionReason(relative.replace('\\', '/')) == null) continue;
+            ProcessRunner.ProcessResult removed = runGit(root, List.of("update-index", "--force-remove", "--", relative), env);
+            if (removed.exitCode() != 0) {
+                throw gitFailure("Unable to exclude protected snapshot path", removed);
+            }
         }
     }
 
@@ -155,8 +185,32 @@ public class GitSnapshotAdapter implements SnapshotPort {
         }
     }
 
+    private void collectExcluded(Path root, List<Snapshot.ExcludedPath> excluded) throws IOException {
+        Files.walkFileTree(root, new SimpleFileVisitor<>() {
+            @Override
+            public FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attrs) {
+                if (directory.equals(root)) return FileVisitResult.CONTINUE;
+                String relative = root.relativize(directory).toString().replace('\\', '/');
+                String reason = exclusionReason(relative);
+                if (reason != null) {
+                    excluded.add(new Snapshot.ExcludedPath(relative, reason));
+                    return FileVisitResult.SKIP_SUBTREE;
+                }
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                String relative = root.relativize(file).toString().replace('\\', '/');
+                String reason = exclusionReason(relative);
+                if (reason != null) excluded.add(new Snapshot.ExcludedPath(relative, reason));
+                return FileVisitResult.CONTINUE;
+            }
+        });
+    }
+
     private String exclusionReason(String relative) {
-        String[] parts = relative.split("/");
+        String[] parts = relative.toLowerCase(Locale.ROOT).split("/");
         for (String part : parts) {
             if (part.equals(".git") || part.equals(".pico") || part.equals("node_modules")
                     || part.equals("target") || part.equals("build") || part.equals("dist")

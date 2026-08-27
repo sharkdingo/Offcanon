@@ -38,6 +38,30 @@ public final class Experiment {
         return new Experiment(UUID.randomUUID(), projectId, sessionId, task.trim(), now);
     }
 
+    /** Rehydrates persisted state without replaying side effects or lifecycle events. */
+    public static Experiment restore(UUID id,
+                                     UUID projectId,
+                                     UUID sessionId,
+                                     String task,
+                                     Instant createdAt,
+                                     ExperimentStatus status,
+                                     UUID baseSnapshotId,
+                                     Path workspacePath,
+                                     String agentSummary,
+                                     VerificationResult verificationResult,
+                                     String failureReason,
+                                     long version) {
+        Experiment experiment = new Experiment(id, projectId, sessionId, task, createdAt);
+        experiment.status = Objects.requireNonNull(status, "status");
+        experiment.baseSnapshotId = baseSnapshotId;
+        experiment.workspacePath = workspacePath == null ? null : workspacePath.toAbsolutePath().normalize();
+        experiment.agentSummary = agentSummary;
+        experiment.verificationResult = verificationResult;
+        experiment.failureReason = failureReason;
+        experiment.version = version;
+        return experiment;
+    }
+
     public void beginSnapshot() {
         transition(ExperimentStatus.CREATED, ExperimentStatus.SNAPSHOTTING);
     }
@@ -59,7 +83,7 @@ public final class Experiment {
 
     public void markAgentCompleted(String summary) {
         requireStatus(ExperimentStatus.RUNNING);
-        agentSummary = summary;
+        agentSummary = Objects.requireNonNull(summary, "summary").trim();
         status = ExperimentStatus.AGENT_COMPLETED;
         version++;
     }
@@ -96,7 +120,7 @@ public final class Experiment {
             throw new DomainException("INVALID_RECOVERY_TRANSITION", "Recovery is only required during promotion");
         }
         failureReason = Objects.requireNonNull(reason, "reason");
-        status = ExperimentStatus.FAILED;
+        status = ExperimentStatus.RECOVERY_REQUIRED;
         version++;
     }
 
@@ -113,7 +137,13 @@ public final class Experiment {
     }
 
     public void cancel() {
-        if (status == ExperimentStatus.PROMOTED || status == ExperimentStatus.REJECTED) {
+        if (status == ExperimentStatus.CANCELLED) {
+            return;
+        }
+        if (status != ExperimentStatus.READY_TO_RUN
+                && status != ExperimentStatus.RUNNING
+                && status != ExperimentStatus.AGENT_COMPLETED
+                && status != ExperimentStatus.VERIFYING) {
             throw new DomainException("INVALID_CANCEL", "Terminal experiment cannot be cancelled");
         }
         status = ExperimentStatus.CANCELLED;
@@ -121,8 +151,15 @@ public final class Experiment {
     }
 
     public void fail(String reason) {
-        if (status == ExperimentStatus.PROMOTED) {
-            throw new DomainException("INVALID_FAILURE", "Promoted experiment cannot be failed");
+        if (status != ExperimentStatus.CREATED
+                && status != ExperimentStatus.SNAPSHOTTING
+                && status != ExperimentStatus.READY_TO_RUN
+                && status != ExperimentStatus.RUNNING
+                && status != ExperimentStatus.AGENT_COMPLETED
+                && status != ExperimentStatus.VERIFYING
+                && status != ExperimentStatus.PREPARING_PROMOTION
+                && status != ExperimentStatus.PROMOTING) {
+            throw new DomainException("INVALID_FAILURE", "Experiment cannot be failed from " + status);
         }
         failureReason = Objects.requireNonNull(reason, "reason");
         status = ExperimentStatus.FAILED;

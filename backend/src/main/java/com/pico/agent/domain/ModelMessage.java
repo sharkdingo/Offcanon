@@ -10,7 +10,7 @@ public record ModelMessage(Role role, String content, String toolCallId, String 
     public ModelMessage {
         Objects.requireNonNull(role, "role");
         Objects.requireNonNull(content, "content");
-        toolCalls = java.util.List.copyOf(toolCalls);
+        toolCalls = toolCalls == null ? java.util.List.of() : java.util.List.copyOf(toolCalls);
     }
 
     public static ModelMessage system(String content) {

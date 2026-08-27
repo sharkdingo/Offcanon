@@ -42,12 +42,12 @@ public class OpenAiCompatibleModelAdapter implements ModelPort {
 
     @Override
     public ModelResponse complete(ModelRequest request) {
-        String apiKey = firstNonBlank(System.getenv("PICO_MODEL_API_KEY"), System.getenv("OPENAI_API_KEY"), System.getenv("IOT_VERIFY_OPENAI_API_KEY"));
+        String apiKey = firstNonBlank(System.getenv("PICO_MODEL_API_KEY"), System.getenv("OPENAI_API_KEY"));
         if (apiKey == null) {
             throw new DomainException("MODEL_NOT_CONFIGURED", "Set PICO_MODEL_API_KEY before starting an agent run");
         }
-        String baseUrl = firstNonBlank(configuredBaseUrl, System.getenv("PICO_MODEL_BASE_URL"), System.getenv("OPENAI_BASE_URL"), System.getenv("IOT_VERIFY_OPENAI_BASE_URL"));
-        String model = firstNonBlank(configuredModel, System.getenv("PICO_MODEL_NAME"), System.getenv("OPENAI_MODEL"), System.getenv("IOT_VERIFY_OPENAI_MODEL"));
+        String baseUrl = firstNonBlank(configuredBaseUrl, System.getenv("PICO_MODEL_BASE_URL"), System.getenv("OPENAI_BASE_URL"));
+        String model = firstNonBlank(configuredModel, System.getenv("PICO_MODEL_NAME"), System.getenv("OPENAI_MODEL"));
         if (baseUrl == null || model == null) {
             throw new DomainException("MODEL_NOT_CONFIGURED", "Set PICO_MODEL_BASE_URL and PICO_MODEL_NAME before starting an agent run");
         }
@@ -86,7 +86,11 @@ public class OpenAiCompatibleModelAdapter implements ModelPort {
         for (ModelMessage message : messages) {
             ObjectNode item = array.addObject();
             item.put("role", message.role().name().toLowerCase());
-            item.put("content", message.content());
+            if (message.role() == ModelMessage.Role.ASSISTANT && !message.toolCalls().isEmpty()) {
+                item.putNull("content");
+            } else {
+                item.put("content", message.content());
+            }
             if (message.role() == ModelMessage.Role.TOOL) {
                 item.put("tool_call_id", message.toolCallId());
                 item.put("name", message.toolName());

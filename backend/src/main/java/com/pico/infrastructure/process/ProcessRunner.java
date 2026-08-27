@@ -11,9 +11,13 @@ import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.TimeUnit;
 
 public class ProcessRunner {
+    private static final int MAX_CAPTURE_BYTES = 1_000_000;
+
     public ProcessResult run(List<String> command, Path cwd, Map<String, String> environment, Duration timeout) {
         long started = System.nanoTime();
         Process process = null;
@@ -25,7 +29,13 @@ public class ProcessRunner {
                 return upper.contains("API_KEY") || upper.contains("AUTH_TOKEN") || upper.contains("PASSWORD")
                         || upper.contains("SECRET") || upper.contains("CREDENTIAL");
             });
-            safeEnvironment.putAll(environment);
+            environment.forEach((name, value) -> {
+                String upper = name.toUpperCase(Locale.ROOT);
+                if (!upper.contains("API_KEY") && !upper.contains("AUTH_TOKEN") && !upper.contains("PASSWORD")
+                        && !upper.contains("SECRET") && !upper.contains("CREDENTIAL")) {
+                    safeEnvironment.put(name, value);
+                }
+            });
             builder.environment().clear();
             builder.environment().putAll(safeEnvironment);
             process = builder.start();
@@ -41,8 +51,8 @@ public class ProcessRunner {
             }
             return new ProcessResult(
                     finished ? process.exitValue() : -1,
-                    stdout.join(),
-                    stderr.join(),
+                    awaitOutput(stdout),
+                    awaitOutput(stderr),
                     Duration.ofNanos(System.nanoTime() - started),
                     timedOut);
         } catch (IOException e) {
@@ -57,12 +67,40 @@ public class ProcessRunner {
         }
     }
 
+    private String awaitOutput(CompletableFuture<String> output) {
+        try {
+            return output.get(2, TimeUnit.SECONDS);
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            output.cancel(true);
+            return "...[process output unavailable: interrupted]...";
+        } catch (ExecutionException | TimeoutException error) {
+            output.cancel(true);
+            return "...[process output unavailable: " + error.getClass().getSimpleName() + "]...";
+        }
+    }
+
     private CompletableFuture<String> readAsync(InputStream stream) {
         return CompletableFuture.supplyAsync(() -> {
             try (stream) {
                 ByteArrayOutputStream output = new ByteArrayOutputStream();
-                stream.transferTo(output);
-                return output.toString(StandardCharsets.UTF_8);
+                byte[] buffer = new byte[8192];
+                int captured = 0;
+                boolean truncated = false;
+                int read;
+                while ((read = stream.read(buffer)) != -1) {
+                    int remaining = MAX_CAPTURE_BYTES - captured;
+                    if (remaining > 0) {
+                        int toWrite = Math.min(remaining, read);
+                        output.write(buffer, 0, toWrite);
+                        captured += toWrite;
+                        if (toWrite < read) truncated = true;
+                    } else {
+                        truncated = true;
+                    }
+                }
+                String result = output.toString(StandardCharsets.UTF_8);
+                return truncated ? result + "\n...[process output truncated]..." : result;
             } catch (IOException e) {
                 throw new IllegalStateException("Unable to read process output", e);
             }

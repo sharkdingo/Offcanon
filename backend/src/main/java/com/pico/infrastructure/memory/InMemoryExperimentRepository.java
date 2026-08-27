@@ -4,6 +4,7 @@ import com.pico.experiment.domain.Experiment;
 import com.pico.experiment.domain.ExperimentStatus;
 import com.pico.port.ExperimentRepository;
 import org.springframework.stereotype.Repository;
+import org.springframework.context.annotation.Profile;
 
 import java.util.Comparator;
 import java.util.List;
@@ -12,6 +13,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Repository
+@Profile("!mysql")
 public class InMemoryExperimentRepository implements ExperimentRepository {
     private final ConcurrentHashMap<UUID, Experiment> experiments = new ConcurrentHashMap<>();
 
@@ -35,6 +37,9 @@ public class InMemoryExperimentRepository implements ExperimentRepository {
     @Override
     public boolean hasRunningExperiment(UUID sessionId) {
         return experiments.values().stream().anyMatch(e -> e.sessionId().equals(sessionId)
-                && e.status() == ExperimentStatus.RUNNING);
+                && switch (e.status()) {
+                    case RUNNING, AGENT_COMPLETED, VERIFYING -> true;
+                    default -> false;
+                });
     }
 }

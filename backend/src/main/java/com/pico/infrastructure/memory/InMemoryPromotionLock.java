@@ -2,6 +2,7 @@ package com.pico.infrastructure.memory;
 
 import com.pico.port.PromotionLockPort;
 import org.springframework.stereotype.Component;
+import org.springframework.context.annotation.Profile;
 
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -9,6 +10,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 
 @Component
+@Profile("!redis")
 public class InMemoryPromotionLock implements PromotionLockPort {
     private final ConcurrentHashMap<UUID, ReentrantLock> locks = new ConcurrentHashMap<>();
 
@@ -20,9 +22,6 @@ public class InMemoryPromotionLock implements PromotionLockPort {
             return action.get();
         } finally {
             lock.unlock();
-            if (!lock.hasQueuedThreads()) {
-                locks.remove(projectId, lock);
-            }
         }
     }
 }

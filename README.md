@@ -23,3 +23,5 @@ npm run dev
 ```
 
 The model key is read from the environment only. Never commit credentials.
+
+For durable local deployment, activate the optional `mysql` and `redis` profiles and provide their connection settings through environment variables. The default profile is intentionally self-contained and uses in-memory repositories.

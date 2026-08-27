@@ -8,6 +8,7 @@ frontend/dist/
 
 # Local runtime data and secrets
 .pico/
+.pico-runtime/
 backend/.pico/
 .env
 .env.*

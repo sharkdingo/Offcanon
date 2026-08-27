@@ -67,6 +67,25 @@ class GitSnapshotAdapterTest {
         assertEquals("canonical\n", Files.readString(repository.resolve("file.txt")));
     }
 
+    @Test
+    void excludesTrackedSensitiveFilesFromSnapshot() throws Exception {
+        Path repository = temp.resolve("tracked-sensitive");
+        Files.createDirectories(repository);
+        run(repository, "git", "init", "-q");
+        run(repository, "git", "config", "user.email", "pico-test@example.invalid");
+        run(repository, "git", "config", "user.name", "PICO Test");
+        Files.writeString(repository.resolve(".env"), "FAKE_SECRET=test-fixture-only\n");
+        Files.writeString(repository.resolve("safe.txt"), "safe\n");
+        run(repository, "git", "add", "-f", ".env", "safe.txt");
+        run(repository, "git", "commit", "-qm", "initial");
+
+        GitSnapshotAdapter adapter = new GitSnapshotAdapter(new ProcessRunner(), temp.resolve("tracked-sensitive-data").toString());
+        Snapshot snapshot = adapter.capture(Project.create("demo", repository, List.of(), Instant.now()));
+
+        assertFalse(Files.exists(snapshot.materializedPath().resolve(".env")));
+        assertTrue(Files.exists(snapshot.materializedPath().resolve("safe.txt")));
+    }
+
     private String run(Path cwd, String... command) {
         ProcessRunner.ProcessResult result = new ProcessRunner().run(List.of(command), cwd, java.util.Map.of(), java.time.Duration.ofSeconds(20));
         if (result.exitCode() != 0) {

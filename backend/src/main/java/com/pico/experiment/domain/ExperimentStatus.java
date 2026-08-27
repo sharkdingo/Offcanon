@@ -13,6 +13,7 @@ public enum ExperimentStatus {
     PREPARING_PROMOTION,
     PROMOTING,
     PROMOTED,
+    RECOVERY_REQUIRED,
     FAILED,
     CANCELLED
 }

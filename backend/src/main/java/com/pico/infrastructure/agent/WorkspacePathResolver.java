@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.util.Locale;
 
 @Component
 public class WorkspacePathResolver {
@@ -23,10 +24,14 @@ public class WorkspacePathResolver {
         if (!candidate.startsWith(workspace)) {
             throw new DomainException("PATH_ESCAPE", "Path escapes experiment workspace");
         }
+        String relative = workspace.relativize(candidate).toString().replace('\\', '/');
+        if (isProtectedPath(relative)) {
+            throw new DomainException("PROTECTED_PATH", "Tool access is blocked for internal or sensitive path: " + relative);
+        }
         try {
             Path existingParent = candidate;
-            if (!Files.exists(existingParent, LinkOption.NOFOLLOW_LINKS)) {
-                existingParent = candidate.getParent();
+            while (existingParent != null && !Files.exists(existingParent, LinkOption.NOFOLLOW_LINKS)) {
+                existingParent = existingParent.getParent();
             }
             if (existingParent != null) {
                 Path realParent = existingParent.toRealPath();
@@ -44,5 +49,14 @@ public class WorkspacePathResolver {
             throw new DomainException("NOT_A_FILE", "Write target is not a regular file: " + requestedPath);
         }
         return candidate;
+    }
+
+    private boolean isProtectedPath(String relative) {
+        String[] parts = relative.toLowerCase(Locale.ROOT).split("/");
+        for (String part : parts) {
+            if (part.equals(".git") || part.equals(".pico")) return true;
+        }
+        String file = parts.length == 0 ? relative : parts[parts.length - 1];
+        return file.equals(".env") || file.startsWith(".env.");
     }
 }

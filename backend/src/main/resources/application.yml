@@ -1,6 +1,11 @@
 spring:
   application:
     name: pico
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
 server:
   port: 8080
   shutdown: graceful
@@ -8,5 +13,6 @@ pico:
   data-root: ${PICO_DATA_ROOT:${user.home}/.pico}
   agent:
     max-steps: ${PICO_AGENT_MAX_STEPS:20}
+    context-limit-chars: ${PICO_AGENT_CONTEXT_LIMIT_CHARS:80000}
     command-timeout-seconds: ${PICO_COMMAND_TIMEOUT_SECONDS:30}
     observation-limit: ${PICO_OBSERVATION_LIMIT:12000}

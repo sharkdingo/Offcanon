@@ -63,4 +63,7 @@ public final class ApiDtos {
             List<String> changedFiles,
             String fingerprint) {
     }
+
+    public record DiffEntryResponse(String path, String change, long beforeBytes, long afterBytes, boolean binary) {
+    }
 }

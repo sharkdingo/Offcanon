@@ -51,6 +51,9 @@ public class LocalWorkspaceAdapter implements WorkspacePort {
             Files.walkFileTree(source, new SimpleFileVisitor<>() {
                 @Override
                 public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
+                    if (!dir.equals(source) && Files.isSymbolicLink(dir)) {
+                        throw new DomainException("WORKSPACE_SYMLINK_BLOCKED", "Symlink directory cannot be materialized: " + source.relativize(dir));
+                    }
                     Path relative = source.relativize(dir);
                     Files.createDirectories(destination.resolve(relative));
                     return FileVisitResult.CONTINUE;
@@ -58,6 +61,9 @@ public class LocalWorkspaceAdapter implements WorkspacePort {
 
                 @Override
                 public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                    if (Files.isSymbolicLink(file)) {
+                        throw new DomainException("WORKSPACE_SYMLINK_BLOCKED", "Symlink cannot be materialized: " + source.relativize(file));
+                    }
                     Path relative = source.relativize(file);
                     Files.copy(file, destination.resolve(relative), StandardCopyOption.COPY_ATTRIBUTES);
                     return FileVisitResult.CONTINUE;

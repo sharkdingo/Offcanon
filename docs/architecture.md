@@ -35,4 +35,14 @@ temporary Git index -> immutable snapshot -> isolated experiment workspace
 
 The backend is a modular monolith organized by business capability. Domain objects do not depend on Spring, persistence DTOs, model-provider DTOs or Git implementation details. Ports describe change boundaries; adapters implement them.
 
-The first implementation uses in-memory repositories so the execution model can be tested without external services. MySQL durability and Redis promotion coordination will be added behind the same ports; they are infrastructure choices, not domain rules.
+The default profile uses in-memory repositories so the execution model can be tested without external services. The `mysql` profile supplies JDBC repositories and initializes `schema-mysql.sql`; the `redis` profile supplies a leased, token-checked promotion lock. Both adapters sit behind the same ports and can be enabled independently of the domain rules:
+
+```powershell
+$env:SPRING_PROFILES_ACTIVE = "mysql,redis"
+$env:PICO_MYSQL_URL = "jdbc:mysql://localhost:3306/pico?createDatabaseIfNotExist=true&serverTimezone=UTC"
+$env:PICO_MYSQL_USERNAME = "pico"
+$env:PICO_MYSQL_PASSWORD = "..."
+$env:PICO_REDIS_HOST = "localhost"
+```
+
+The local workspace remains application-level isolation rather than an OS security sandbox. Shell policy rejects absolute paths, parent traversal, nested interpreters and network utilities; a deployment that needs hostile-code guarantees must add a container or OS sandbox around the worker.

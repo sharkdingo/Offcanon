@@ -17,6 +17,8 @@ import org.springframework.stereotype.Service;
 
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 
 @Service
 public class ExperimentApplicationService {
@@ -27,6 +29,7 @@ public class ExperimentApplicationService {
     private final SnapshotPort snapshotPort;
     private final WorkspacePort workspacePort;
     private final ClockPort clock;
+    private final ConcurrentHashMap<UUID, ReentrantLock> sessionLocks = new ConcurrentHashMap<>();
 
     public ExperimentApplicationService(ProjectRepository projectRepository,
                                         SessionRepository sessionRepository,
@@ -47,25 +50,32 @@ public class ExperimentApplicationService {
     public Experiment create(UUID projectId, UUID sessionId, String title, String task) {
         Project project = projectRepository.findById(projectId)
                 .orElseThrow(() -> new NotFoundException("Project not found: " + projectId));
-        Session session = resolveSession(project, sessionId, title);
-        if (experimentRepository.hasRunningExperiment(session.id())) {
-            throw new DomainException("SESSION_ALREADY_RUNNING", "A session can run only one experiment at a time");
-        }
-
-        Experiment experiment = Experiment.create(project.id(), session.id(), task, clock.now());
-        experimentRepository.save(experiment);
+        UUID lockKey = sessionId == null ? project.id() : sessionId;
+        ReentrantLock lock = sessionLocks.computeIfAbsent(lockKey, ignored -> new ReentrantLock());
+        lock.lock();
         try {
-            experiment.beginSnapshot();
+            Session session = resolveSession(project, sessionId, title);
+            if (experimentRepository.hasRunningExperiment(session.id())) {
+                throw new DomainException("SESSION_ALREADY_RUNNING", "A session can run only one experiment at a time");
+            }
+
+            Experiment experiment = Experiment.create(project.id(), session.id(), task, clock.now());
             experimentRepository.save(experiment);
-            Snapshot snapshot = snapshotPort.capture(project);
-            snapshotRepository.save(snapshot);
-            experiment.attachBase(snapshot.id(), workspacePort.materialize(snapshot, experiment.id()));
-            experimentRepository.save(experiment);
-            return experiment;
-        } catch (RuntimeException error) {
-            experiment.fail(error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage());
-            experimentRepository.save(experiment);
-            throw error;
+            try {
+                experiment.beginSnapshot();
+                experimentRepository.save(experiment);
+                Snapshot snapshot = snapshotPort.capture(project);
+                snapshotRepository.save(snapshot);
+                experiment.attachBase(snapshot.id(), workspacePort.materialize(snapshot, experiment.id()));
+                experimentRepository.save(experiment);
+                return experiment;
+            } catch (RuntimeException error) {
+                experiment.fail(error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage());
+                experimentRepository.save(experiment);
+                throw error;
+            }
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -89,8 +99,12 @@ public class ExperimentApplicationService {
 
     private Session resolveSession(Project project, UUID sessionId, String title) {
         if (sessionId != null) {
-            return sessionRepository.findById(sessionId)
+            Session session = sessionRepository.findById(sessionId)
                     .orElseThrow(() -> new NotFoundException("Session not found: " + sessionId));
+            if (!session.projectId().equals(project.id())) {
+                throw new DomainException("SESSION_PROJECT_MISMATCH", "Session belongs to a different project");
+            }
+            return session;
         }
         String sessionTitle = title == null || title.isBlank() ? "Session " + (sessionRepository.findByProjectId(project.id()).size() + 1) : title;
         return sessionRepository.save(Session.create(project.id(), sessionTitle, clock.now()));

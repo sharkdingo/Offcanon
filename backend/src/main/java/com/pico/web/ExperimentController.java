@@ -4,6 +4,8 @@ import com.pico.application.ExperimentApplicationService;
 import com.pico.agent.application.AgentApplicationService;
 import com.pico.experiment.domain.Experiment;
 import com.pico.port.EvidenceRepository;
+import com.pico.port.DiffPort;
+import com.pico.port.SnapshotRepository;
 import com.pico.promotion.application.PromotionApplicationService;
 import com.pico.verification.domain.Evidence;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -18,6 +20,7 @@ import java.util.List;
 import static com.pico.web.ApiDtos.ExperimentResponse;
 import static com.pico.web.ApiDtos.EvidenceResponse;
 import static com.pico.web.ApiDtos.PromotionResponse;
+import static com.pico.web.ApiDtos.DiffEntryResponse;
 
 @RestController
 @RequestMapping("/api/experiments")
@@ -26,15 +29,21 @@ public class ExperimentController {
     private final AgentApplicationService agentService;
     private final EvidenceRepository evidenceRepository;
     private final PromotionApplicationService promotionService;
+    private final DiffPort diffPort;
+    private final SnapshotRepository snapshotRepository;
 
     public ExperimentController(ExperimentApplicationService experimentService,
                                 AgentApplicationService agentService,
                                 EvidenceRepository evidenceRepository,
-                                PromotionApplicationService promotionService) {
+                                PromotionApplicationService promotionService,
+                                DiffPort diffPort,
+                                SnapshotRepository snapshotRepository) {
         this.experimentService = experimentService;
         this.agentService = agentService;
         this.evidenceRepository = evidenceRepository;
         this.promotionService = promotionService;
+        this.diffPort = diffPort;
+        this.snapshotRepository = snapshotRepository;
     }
 
     @GetMapping("/{experimentId}")
@@ -56,6 +65,17 @@ public class ExperimentController {
     public List<EvidenceResponse> evidence(@PathVariable UUID experimentId) {
         experimentService.get(experimentId);
         return evidenceRepository.findByExperimentId(experimentId).stream().map(ExperimentController::toEvidence).toList();
+    }
+
+    @GetMapping("/{experimentId}/diff")
+    public List<DiffEntryResponse> diff(@PathVariable UUID experimentId) {
+        Experiment experiment = experimentService.get(experimentId);
+        if (experiment.baseSnapshotId() == null || experiment.workspacePath() == null) return List.of();
+        var snapshot = snapshotRepository.findById(experiment.baseSnapshotId())
+                .orElseThrow(() -> new com.pico.shared.web.NotFoundException("Snapshot not found: " + experiment.baseSnapshotId()));
+        return diffPort.compare(snapshot, experiment.workspacePath()).stream()
+                .map(item -> new DiffEntryResponse(item.path(), item.change().name(), item.beforeBytes(), item.afterBytes(), item.binary()))
+                .toList();
     }
 
     @PostMapping("/{experimentId}/promote")

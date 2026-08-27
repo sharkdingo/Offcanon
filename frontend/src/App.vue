@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
-import { Archive, Ban, CheckCircle2, CircleDot, FolderGit2, GitBranch, LoaderCircle, Plus, RefreshCw, ShieldCheck, TerminalSquare, X } from 'lucide-vue-next'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { Archive, Ban, CheckCircle2, CircleDot, FileDiff, FolderGit2, GitBranch, LoaderCircle, Plus, RefreshCw, ShieldCheck, TerminalSquare, X } from 'lucide-vue-next'
 import { useWorkspaceStore } from './stores/workspace'
 
 const store = useWorkspaceStore()
@@ -9,11 +9,13 @@ const showExperimentForm = ref(false)
 const submitting = ref(false)
 const projectForm = ref({ name: '', canonicalPath: '', verificationCommands: '' })
 const experimentForm = ref({ sessionTitle: 'Default session', task: '' })
+const activity = ref<Array<{ sequence: number; type: string; timestamp: string; payload: Record<string, unknown> }>>([])
+let eventSource: EventSource | null = null
 
 const statusLabel = (status: string) => status.replaceAll('_', ' ')
 const statusTone = (status: string) => {
   if (status === 'VERIFIED' || status === 'PROMOTED') return 'success'
-  if (status === 'FAILED' || status === 'REJECTED' || status === 'STALE') return 'danger'
+  if (status === 'FAILED' || status === 'REJECTED' || status === 'STALE' || status === 'RECOVERY_REQUIRED') return 'danger'
   if (status === 'RUNNING' || status === 'VERIFYING' || status === 'PROMOTING') return 'active'
   return 'neutral'
 }
@@ -55,6 +57,24 @@ async function refresh() {
   if (store.selectedProjectId) await store.selectProject(store.selectedProjectId)
   else await store.loadProjects()
 }
+
+function connectEvents(experimentId: string | null) {
+  eventSource?.close()
+  eventSource = null
+  activity.value = []
+  if (!experimentId) return
+  eventSource = new EventSource(`/api/experiments/${experimentId}/events`)
+  eventSource.onmessage = (message) => {
+    const event = JSON.parse(message.data) as { sequence: number; type: string; timestamp: string; payload: Record<string, unknown> }
+    if (!activity.value.some((item) => item.sequence === event.sequence)) activity.value.push(event)
+    if (['VERIFICATION_FINISHED', 'EXPERIMENT_FAILED', 'PROMOTED'].includes(event.type)) {
+      window.setTimeout(() => store.reloadSelectedProject(), 120)
+    }
+  }
+}
+
+watch(() => store.selectedExperimentId, connectEvents)
+onUnmounted(() => eventSource?.close())
 
 onMounted(() => store.loadProjects())
 </script>
@@ -122,7 +142,7 @@ onMounted(() => store.loadProjects())
               :key="experiment.id"
               class="timeline-row"
               :class="{ selected: experiment.id === store.selectedExperimentId }"
-              @click="store.selectedExperimentId = experiment.id"
+              @click="store.selectExperiment(experiment.id)"
             >
               <div class="timeline-marker" :class="statusTone(experiment.status)"><CheckCircle2 v-if="experiment.status === 'VERIFIED' || experiment.status === 'PROMOTED'" :size="16" /><LoaderCircle v-else-if="experiment.status === 'RUNNING' || experiment.status === 'VERIFYING'" class="spin" :size="16" /><CircleDot v-else :size="16" /></div>
               <div class="timeline-content">
@@ -149,7 +169,14 @@ onMounted(() => store.loadProjects())
           <div class="detail-block"><div class="detail-label">BASE SNAPSHOT</div><code>{{ store.selectedExperiment.baseSnapshotId ?? 'pending' }}</code></div>
           <div class="detail-block"><div class="detail-label">SESSION</div><code>{{ store.selectedExperiment.sessionId }}</code></div>
           <div v-if="store.selectedExperiment.failureReason" class="detail-block failure"><div class="detail-label">FAILURE</div><p>{{ store.selectedExperiment.failureReason }}</p></div>
-          <button v-if="!['CANCELLED', 'FAILED', 'REJECTED', 'PROMOTED'].includes(store.selectedExperiment.status)" class="button danger-outline" @click="store.cancelExperiment(store.selectedExperiment.id)"><Ban :size="16" /> Cancel experiment</button>
+          <div class="detail-actions">
+            <button v-if="store.selectedExperiment.status === 'READY_TO_RUN'" class="button primary" @click="store.startExperiment(store.selectedExperiment.id)"><LoaderCircle :size="16" /> Start agent</button>
+            <button v-if="store.selectedExperiment.status === 'VERIFIED'" class="button primary" @click="store.promoteExperiment(store.selectedExperiment.id)"><ShieldCheck :size="16" /> Promote to canonical</button>
+            <button v-if="!['CANCELLED', 'FAILED', 'REJECTED', 'PROMOTED', 'VERIFIED'].includes(store.selectedExperiment.status)" class="button danger-outline" @click="store.cancelExperiment(store.selectedExperiment.id)"><Ban :size="16" /> Cancel experiment</button>
+          </div>
+          <div v-if="activity.length" class="detail-block activity-block"><div class="detail-label">LIVE ACTIVITY</div><div v-for="event in activity" :key="event.sequence" class="activity-row"><span class="activity-sequence">{{ String(event.sequence).padStart(2, '0') }}</span><span>{{ event.type.replaceAll('_', ' ') }}</span><span class="activity-time">{{ new Date(event.timestamp).toLocaleTimeString() }}</span></div></div>
+          <div v-if="store.diff.length" class="detail-block"><div class="detail-label"><FileDiff :size="14" /> EXPERIMENT DIFF <span class="muted">{{ store.diff.length }} files</span></div><div v-for="item in store.diff" :key="item.path" class="diff-row"><span class="diff-kind" :class="item.change.toLowerCase()">{{ item.change === 'MODIFIED' ? 'M' : item.change === 'ADDED' ? '+' : '-' }}</span><code>{{ item.path }}</code><span class="diff-size">{{ item.binary ? 'binary' : `${item.beforeBytes} -> ${item.afterBytes} B` }}</span></div></div>
+          <div v-if="store.evidence.length" class="detail-block"><div class="detail-label">TRUSTED EVIDENCE</div><div v-for="item in store.evidence" :key="item.id" class="evidence-row"><div><span class="evidence-command">{{ item.command }}</span><span class="evidence-meta">exit {{ item.exitCode }} · {{ item.durationMillis }}ms · snapshot {{ item.snapshotId.slice(0, 8) }}</span></div><CheckCircle2 v-if="item.exitCode === 0 && !item.timedOut" class="evidence-ok" :size="15" /><Ban v-else class="evidence-fail" :size="15" /></div></div>
         </template>
         <div v-else class="detail-empty"><TerminalSquare :size="24" /><span>Select an experiment to inspect its execution state.</span></div>
       </aside>
