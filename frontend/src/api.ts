@@ -77,6 +77,23 @@ export type PromotionPreview = {
   promotable: boolean
 }
 
+export type PromotionReconcile = {
+  promotionId: string
+  experimentStatus: string
+  journalPhase: string
+  fingerprint: string | null
+  detail: string
+}
+
+export type RunEvent = {
+  eventId: string
+  experimentId: string
+  sequence: number
+  type: string
+  timestamp: string
+  payload: Record<string, unknown>
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -132,6 +149,8 @@ export const api = {
     request<PromotionOutcome>(`/api/experiments/${experimentId}/promote`, { method: 'POST' }),
   promotionPreview: (experimentId: string) =>
     request<PromotionPreview>(`/api/experiments/${experimentId}/promotion-preview`),
+  reconcilePromotion: (experimentId: string) =>
+    request<PromotionReconcile>(`/api/experiments/${experimentId}/promotion-reconcile`, { method: 'POST' }),
   evidence: (experimentId: string) => request<Evidence[]>(`/api/experiments/${experimentId}/evidence`),
   diff: (experimentId: string) => request<DiffEntry[]>(`/api/experiments/${experimentId}/diff`),
 }

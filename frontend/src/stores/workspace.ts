@@ -1,6 +1,16 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
-import { api, type DiffEntry, type Evidence, type Experiment, type Project, type PromotionOutcome, type PromotionPreview, type Session } from '../api'
+import {
+  api,
+  type DiffEntry,
+  type Evidence,
+  type Experiment,
+  type Project,
+  type PromotionOutcome,
+  type PromotionPreview,
+  type PromotionReconcile,
+  type Session,
+} from '../api'
 
 export const useWorkspaceStore = defineStore('workspace', () => {
   const projects = ref<Project[]>([])
@@ -10,10 +20,12 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   const selectedSessionId = ref<string | null>(null)
   const selectedExperimentId = ref<string | null>(null)
   const loading = ref(false)
+  const detailLoading = ref(false)
   const error = ref<string | null>(null)
   const evidence = ref<Evidence[]>([])
   const diff = ref<DiffEntry[]>([])
   const promotionOutcome = ref<PromotionOutcome | null>(null)
+  const promotionReconcile = ref<PromotionReconcile | null>(null)
   const promotionPreview = ref<PromotionPreview | null>(null)
   let detailRequest = 0
   let projectRequest = 0
@@ -30,9 +42,6 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     error.value = null
     try {
       projects.value = await api.projects()
-      if (!selectedProjectId.value && projects.value.length > 0) {
-        await selectProject(projects.value[0].id)
-      }
     } catch (cause) {
       error.value = cause instanceof Error ? cause.message : 'Unable to load projects'
     } finally {
@@ -40,15 +49,22 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     }
   }
 
-  async function selectProject(projectId: string) {
+  async function selectProject(projectId: string, experimentId: string | null = null) {
     const requestId = ++projectRequest
+    const projectChanged = selectedProjectId.value !== projectId
     selectedProjectId.value = projectId
     selectedSessionId.value = null
     selectedExperimentId.value = null
+    detailLoading.value = false
     evidence.value = []
     diff.value = []
     promotionOutcome.value = null
+    promotionReconcile.value = null
     promotionPreview.value = null
+    if (projectChanged) {
+      sessions.value = []
+      experiments.value = []
+    }
     try {
       const [loadedSessions, loadedExperiments] = await Promise.all([
         api.sessions(projectId),
@@ -57,8 +73,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       if (requestId !== projectRequest || selectedProjectId.value !== projectId) return
       sessions.value = loadedSessions
       experiments.value = loadedExperiments
-      selectedSessionId.value = null
-      selectedExperimentId.value = loadedExperiments.at(-1)?.id ?? null
+      selectedExperimentId.value = loadedExperiments.some((item) => item.id === experimentId) ? experimentId : null
       if (selectedExperimentId.value) {
         await loadExperimentDetails(selectedExperimentId.value)
       }
@@ -68,11 +83,14 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   }
 
   async function selectExperiment(experimentId: string) {
+    if (!experiments.value.some((experiment) => experiment.id === experimentId)) {
+      throw new Error('Experiment does not belong to the selected project')
+    }
     selectedExperimentId.value = experimentId
-    selectedSessionId.value = experiments.value.find((experiment) => experiment.id === experimentId)?.sessionId ?? selectedSessionId.value
     evidence.value = []
     diff.value = []
     promotionOutcome.value = null
+    promotionReconcile.value = null
     promotionPreview.value = null
     try {
       await loadExperimentDetails(experimentId)
@@ -84,22 +102,17 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   async function selectSession(sessionId: string | null) {
     selectedSessionId.value = sessionId
     promotionOutcome.value = null
+    promotionReconcile.value = null
     promotionPreview.value = null
-    const candidate = visibleExperiments.value.at(-1)
-    selectedExperimentId.value = candidate?.id ?? null
-    evidence.value = []
-    diff.value = []
-    if (candidate) {
-      try {
-        await loadExperimentDetails(candidate.id)
-      } catch (cause) {
-        error.value = cause instanceof Error ? cause.message : 'Unable to load experiment details'
-      }
+    const selectedIsVisible = visibleExperiments.value.some((experiment) => experiment.id === selectedExperimentId.value)
+    if (!selectedIsVisible) {
+      clearExperimentSelection()
     }
   }
 
   async function loadExperimentDetails(experimentId: string) {
     const requestId = ++detailRequest
+    detailLoading.value = true
     promotionPreview.value = null
     const [evidenceResult, diffResult, previewResult] = await Promise.allSettled([
       api.evidence(experimentId),
@@ -107,12 +120,13 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       api.promotionPreview(experimentId),
     ])
     if (requestId !== detailRequest || selectedExperimentId.value !== experimentId) return
-    if (evidenceResult.status === 'fulfilled') evidence.value = evidenceResult.value
-    if (diffResult.status === 'fulfilled') diff.value = diffResult.value
-    if (previewResult.status === 'fulfilled') promotionPreview.value = previewResult.value
+    evidence.value = evidenceResult.status === 'fulfilled' ? evidenceResult.value : []
+    diff.value = diffResult.status === 'fulfilled' ? diffResult.value : []
+    promotionPreview.value = previewResult.status === 'fulfilled' ? previewResult.value : null
     const failure = evidenceResult.status === 'rejected' ? evidenceResult.reason
-      : diffResult.status === 'rejected' ? diffResult.reason
+        : diffResult.status === 'rejected' ? diffResult.reason
         : previewResult.status === 'rejected' ? previewResult.reason : null
+    detailLoading.value = false
     if (failure) throw (failure instanceof Error ? failure : new Error('Unable to load experiment details'))
   }
 
@@ -120,6 +134,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     const project = await api.createProject(body)
     projects.value.push(project)
     await selectProject(project.id)
+    return project
   }
 
   async function createExperiment(body: { sessionTitle: string; task: string; sessionId?: string | null; newSession?: boolean }) {
@@ -136,6 +151,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     selectedSessionId.value = experiment.sessionId
     selectedExperimentId.value = experiment.id
     await loadExperimentDetails(experiment.id)
+    return experiment
   }
 
   async function startExperiment(experimentId: string) {
@@ -157,6 +173,15 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     if (projectId && selectedProjectId.value === projectId) await reloadSelectedProject()
   }
 
+  async function reconcilePromotion(experimentId: string) {
+    const projectId = selectedProjectId.value
+    const outcome = await api.reconcilePromotion(experimentId)
+    if (selectedProjectId.value === projectId && selectedExperimentId.value === experimentId) {
+      promotionReconcile.value = outcome
+    }
+    if (projectId && selectedProjectId.value === projectId) await reloadSelectedProject()
+  }
+
   async function reloadSelectedProject() {
     if (!selectedProjectId.value) return
     const projectId = selectedProjectId.value
@@ -168,9 +193,45 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     if (requestId !== projectRequest || selectedProjectId.value !== projectId) return
     sessions.value = loadedSessions
     experiments.value = loadedExperiments
-    if (selectedExperimentId.value) {
-      await loadExperimentDetails(selectedExperimentId.value)
+    if (selectedSessionId.value && !loadedSessions.some((session) => session.id === selectedSessionId.value)) {
+      selectedSessionId.value = null
     }
+    if (selectedExperimentId.value && loadedExperiments.some((item) => item.id === selectedExperimentId.value)) {
+      await loadExperimentDetails(selectedExperimentId.value)
+    } else {
+      selectedExperimentId.value = null
+      evidence.value = []
+      diff.value = []
+      promotionPreview.value = null
+      detailLoading.value = false
+    }
+  }
+
+  function clearSelection() {
+    ++projectRequest
+    ++detailRequest
+    selectedProjectId.value = null
+    selectedSessionId.value = null
+    selectedExperimentId.value = null
+    sessions.value = []
+    experiments.value = []
+    evidence.value = []
+    diff.value = []
+    promotionOutcome.value = null
+    promotionReconcile.value = null
+    promotionPreview.value = null
+    detailLoading.value = false
+  }
+
+  function clearExperimentSelection() {
+    ++detailRequest
+    selectedExperimentId.value = null
+    evidence.value = []
+    diff.value = []
+    promotionOutcome.value = null
+    promotionReconcile.value = null
+    promotionPreview.value = null
+    detailLoading.value = false
   }
 
   function replaceExperiment(updated: Experiment) {
@@ -190,10 +251,12 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     selectedExperiment,
     sessionTitle,
     loading,
+    detailLoading,
     error,
     evidence,
     diff,
     promotionOutcome,
+    promotionReconcile,
     promotionPreview,
     loadProjects,
     selectProject,
@@ -203,7 +266,10 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     startExperiment,
     cancelExperiment,
     promoteExperiment,
+    reconcilePromotion,
     selectSession,
     reloadSelectedProject,
+    clearSelection,
+    clearExperimentSelection,
   }
 })
