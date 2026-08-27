@@ -7,10 +7,12 @@ frontend/node_modules/
 frontend/dist/
 
 # Local runtime data and secrets
-.pico/
-.pico-runtime/
-.pico-runtime*/
-backend/.pico/
+.offcanon/
+.offcanon-runtime/
+.offcanon-runtime*/
+backend/.offcanon/
+.offcanon-backend*.log
+.offcanon-frontend*.log
 .env
 .env.*
 !.env.example

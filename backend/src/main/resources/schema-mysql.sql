@@ -1,5 +1,6 @@
 CREATE TABLE IF NOT EXISTS projects (
     id CHAR(36) PRIMARY KEY,
+    owner_id CHAR(36) NOT NULL,
     name VARCHAR(255) NOT NULL,
     canonical_path TEXT NOT NULL,
     canonical_path_key CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
@@ -7,6 +8,37 @@ CREATE TABLE IF NOT EXISTS projects (
     created_at TIMESTAMP(6) NOT NULL,
     version BIGINT NOT NULL,
     UNIQUE KEY uk_projects_canonical_path_key (canonical_path_key)
+);
+
+CREATE TABLE IF NOT EXISTS users (
+    id CHAR(36) PRIMARY KEY,
+    username VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    password_hash VARCHAR(512) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    version BIGINT NOT NULL,
+    UNIQUE KEY uk_users_username (username)
+);
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    token_hash CHAR(43) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+    user_id CHAR(36) NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    expires_at TIMESTAMP(6) NOT NULL,
+    INDEX idx_auth_sessions_user (user_id),
+    INDEX idx_auth_sessions_expiry (expires_at)
+);
+
+CREATE TABLE IF NOT EXISTS user_settings (
+    user_id CHAR(36) PRIMARY KEY,
+    theme VARCHAR(16) NOT NULL,
+    locale VARCHAR(32) NOT NULL,
+    model_endpoint VARCHAR(2048) NOT NULL,
+    model_name VARCHAR(200) NOT NULL,
+    agent_max_steps INT NOT NULL,
+    agent_run_timeout_seconds BIGINT NOT NULL,
+    context_limit_chars INT NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL,
+    version BIGINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sessions (

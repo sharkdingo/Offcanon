@@ -11,10 +11,10 @@
         <relativePath/>
     </parent>
 
-    <groupId>com.pico</groupId>
-    <artifactId>pico-backend</artifactId>
+    <groupId>com.offcanon</groupId>
+    <artifactId>offcanon-backend</artifactId>
     <version>0.1.0-SNAPSHOT</version>
-    <name>pico-backend</name>
+    <name>offcanon-backend</name>
     <description>Experiment-first coding agent backend</description>
 
     <properties>

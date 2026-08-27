@@ -1,0 +1,15 @@
+package com.offcanon.agent.domain;
+
+import java.util.List;
+
+public record ModelResponse(String text, List<ToolCall> toolCalls, String finishReason) {
+    public ModelResponse {
+        text = text == null ? "" : text;
+        toolCalls = toolCalls == null ? List.of() : List.copyOf(toolCalls);
+        finishReason = finishReason == null || finishReason.isBlank() ? "unknown" : finishReason;
+    }
+
+    public boolean hasToolCalls() {
+        return !toolCalls.isEmpty();
+    }
+}

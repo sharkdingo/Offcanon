@@ -1,6 +1,6 @@
 spring:
   application:
-    name: pico
+    name: offcanon
   autoconfigure:
     exclude:
       - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
@@ -9,18 +9,18 @@ spring:
 server:
   port: 8080
   shutdown: graceful
-pico:
-  data-root: ${PICO_DATA_ROOT:${user.home}/.pico}
+offcanon:
+  data-root: ${OFFCANON_DATA_ROOT:${user.home}/.offcanon}
   agent:
-    max-steps: ${PICO_AGENT_MAX_STEPS:20}
-    model-max-attempts: ${PICO_MODEL_MAX_ATTEMPTS:3}
-    run-timeout-seconds: ${PICO_AGENT_RUN_TIMEOUT_SECONDS:600}
-    context-limit-chars: ${PICO_AGENT_CONTEXT_LIMIT_CHARS:80000}
-    command-timeout-seconds: ${PICO_COMMAND_TIMEOUT_SECONDS:30}
-    observation-limit: ${PICO_OBSERVATION_LIMIT:12000}
+    max-steps: ${OFFCANON_AGENT_MAX_STEPS:20}
+    model-max-attempts: ${OFFCANON_MODEL_MAX_ATTEMPTS:3}
+    run-timeout-seconds: ${OFFCANON_AGENT_RUN_TIMEOUT_SECONDS:600}
+    context-limit-chars: ${OFFCANON_AGENT_CONTEXT_LIMIT_CHARS:80000}
+    command-timeout-seconds: ${OFFCANON_COMMAND_TIMEOUT_SECONDS:30}
+    observation-limit: ${OFFCANON_OBSERVATION_LIMIT:12000}
   model:
-    request-timeout-seconds: ${PICO_MODEL_REQUEST_TIMEOUT_SECONDS:120}
+    request-timeout-seconds: ${OFFCANON_MODEL_REQUEST_TIMEOUT_SECONDS:120}
   events:
-    in-memory-retention: ${PICO_EVENT_RETENTION:2000}
-    poll-interval-ms: ${PICO_EVENT_POLL_INTERVAL_MS:500}
-    heartbeat-interval-ms: ${PICO_EVENT_HEARTBEAT_INTERVAL_MS:15000}
+    in-memory-retention: ${OFFCANON_EVENT_RETENTION:2000}
+    poll-interval-ms: ${OFFCANON_EVENT_POLL_INTERVAL_MS:500}
+    heartbeat-interval-ms: ${OFFCANON_EVENT_HEARTBEAT_INTERVAL_MS:15000}
