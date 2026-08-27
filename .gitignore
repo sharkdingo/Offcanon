@@ -1,0 +1,25 @@
+# Java / Maven
+backend/target/
+*.class
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Local runtime data and secrets
+.pico/
+backend/.pico/
+.env
+.env.*
+!.env.example
+
+# Workspace input material
+tmp/
+*.pdf
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+Thumbs.db
+Desktop.ini
