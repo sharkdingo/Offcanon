@@ -54,6 +54,26 @@ class PromotionJournalTest {
         assertEquals(PromotionPhase.APPLYING, applying.phase());
     }
 
+    @Test
+    void manuallyReconcilesOnlyARecoveryJournalWithoutReusingItsExpiredLease() {
+        InMemoryPromotionJournal store = new InMemoryPromotionJournal();
+        PromotionJournal prepared = store.create(journal(NOW.plusSeconds(60)));
+        PromotionJournal recovery = store.markRecoveryRequired(prepared, "inspect canonical", NOW.plusSeconds(1));
+
+        assertThrows(IllegalStateException.class,
+                () -> store.markCommitted(recovery, "candidate", NOW.plusSeconds(2)));
+        PromotionJournal committed = store.resolveRecoveryCommitted(recovery, "candidate", NOW.plusSeconds(120));
+
+        assertEquals(PromotionPhase.COMMITTED, committed.phase());
+        assertEquals("candidate", committed.resultingFingerprint());
+
+        PromotionJournal second = store.create(journal(NOW.plusSeconds(60)));
+        PromotionJournal secondRecovery = store.markRecoveryRequired(second, "inspect canonical", NOW.plusSeconds(1));
+        PromotionJournal aborted = store.resolveRecoveryAborted(secondRecovery, "canonical is base", NOW.plusSeconds(120));
+        assertEquals(PromotionPhase.ABORTED, aborted.phase());
+        assertEquals("canonical is base", aborted.failureReason());
+    }
+
     private PromotionJournal journal(Instant leaseUntil) {
         UUID experiment = UUID.randomUUID();
         return PromotionJournal.create(experiment, UUID.randomUUID(), "base", "candidate",

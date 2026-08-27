@@ -29,8 +29,6 @@ import java.util.UUID;
 import java.util.function.Supplier;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipInputStream;
 
 @Component
 public class GitSnapshotAdapter implements SnapshotPort {
@@ -59,64 +57,66 @@ public class GitSnapshotAdapter implements SnapshotPort {
     @Override
     public Snapshot capture(Project project) {
         Path root = requireGitRoot(project.canonicalPath());
-        return captureTree(project, root, () -> writeWorkingTree(root));
+        GitObjectStore objectStore = objectStore(project, root);
+        return captureTree(project, root, objectStore, () -> writeWorkingTree(root, objectStore));
     }
 
     @Override
     public Snapshot captureWorkspace(Project project, Path workspace, String parentFingerprint) {
         Path root = requireGitRoot(project.canonicalPath());
         Path source = requireWorkspace(workspace);
-        return captureTree(project, source, () -> writeWorkspaceTree(root, source, parentFingerprint));
+        GitObjectStore objectStore = objectStore(project, root);
+        return captureTree(project, source, objectStore,
+                () -> writeWorkspaceTree(root, source, parentFingerprint, objectStore));
     }
 
     @Override
     public String fingerprintWorkspace(Project project, Path workspace, String parentFingerprint) {
-        return writeWorkspaceTree(requireGitRoot(project.canonicalPath()), requireWorkspace(workspace), parentFingerprint);
+        Path root = requireGitRoot(project.canonicalPath());
+        return writeWorkspaceTree(root, requireWorkspace(workspace), parentFingerprint,
+                objectStore(project, root));
     }
 
-    private Snapshot captureTree(Project project, Path source, Supplier<String> fingerprint) {
+    private Snapshot captureTree(Project project,
+                                 Path source,
+                                 GitObjectStore objectStore,
+                                 Supplier<String> fingerprint) {
         UUID snapshotId = UUID.randomUUID();
         Path snapshotPath = dataRoot.resolve("snapshots").resolve(snapshotId.toString());
-        Path archive = null;
+        boolean completed = false;
         try {
             Files.createDirectories(snapshotPath.getParent());
-            archive = Files.createTempFile("pico-snapshot-", ".zip");
             Set<String> ignored = gitIgnored(project, source);
             String rawBefore = rawFingerprint(source, ignored);
             String before = fingerprint.get();
             Path gitRoot = requireGitRoot(project.canonicalPath());
-            ProcessRunner.ProcessResult archiveResult = runGit(gitRoot, List.of("archive", "--format=zip", "-o", archive.toString(), before));
-            if (archiveResult.exitCode() != 0) {
-                throw gitFailure("Unable to materialize snapshot archive", archiveResult);
-            }
+            List<String> treeFiles = listTreeFiles(gitRoot, before, objectStore.environment());
 
             List<String> included = new ArrayList<>();
             List<Snapshot.ExcludedPath> excluded = new ArrayList<>();
             collectExcluded(source, excluded, ignored);
-            extractArchive(archive, snapshotPath, included, excluded);
-            copyRawFiles(source, snapshotPath, included);
+            materializeTreeFiles(source, snapshotPath, treeFiles, included);
 
             String after = fingerprint.get();
             String rawAfter = rawFingerprint(source, ignored);
             if (!before.equals(after) || !rawBefore.equals(rawAfter)) {
-                deleteRecursively(snapshotPath);
                 throw new DomainException("SNAPSHOT_RACED",
                         "The source workspace changed while the snapshot was captured");
             }
-            return new Snapshot(snapshotId, project.id(), before, snapshotPath, Instant.now(), included, excluded);
+            Snapshot snapshot = new Snapshot(snapshotId, project.id(), before, snapshotPath, Instant.now(), included, excluded);
+            completed = true;
+            return snapshot;
         } catch (IOException e) {
-            deleteQuietly(snapshotPath);
             throw new DomainException("SNAPSHOT_FAILED", e.getMessage() == null ? "Unable to capture snapshot" : e.getMessage());
         } finally {
-            if (archive != null) {
-                deleteQuietly(archive);
-            }
+            if (!completed) deleteQuietly(snapshotPath);
         }
     }
 
     @Override
     public String currentFingerprint(Project project) {
-        return writeWorkingTree(requireGitRoot(project.canonicalPath()));
+        Path root = requireGitRoot(project.canonicalPath());
+        return writeWorkingTree(root, objectStore(project, root));
     }
 
     private Path requireWorkspace(Path path) {
@@ -161,7 +161,7 @@ public class GitSnapshotAdapter implements SnapshotPort {
         }
     }
 
-    private String writeWorkingTree(Path root) {
+    private String writeWorkingTree(Path root, GitObjectStore objectStore) {
         Path index;
         try {
             index = Files.createTempFile("pico-index-", ".tmp");
@@ -170,7 +170,8 @@ public class GitSnapshotAdapter implements SnapshotPort {
             throw new DomainException("SNAPSHOT_FAILED", "Unable to create temporary Git index");
         }
         try {
-            Map<String, String> env = Map.of("GIT_INDEX_FILE", index.toString());
+            Map<String, String> env = new HashMap<>(objectStore.environment());
+            env.put("GIT_INDEX_FILE", index.toString());
             ProcessRunner.ProcessResult readTree = runGit(root, List.of("read-tree", "HEAD"), env);
             if (readTree.exitCode() != 0) {
                 readTree = runGit(root, List.of("read-tree", "--empty"), env);
@@ -189,7 +190,10 @@ public class GitSnapshotAdapter implements SnapshotPort {
         }
     }
 
-    private String writeWorkspaceTree(Path gitRoot, Path workspace, String parentFingerprint) {
+    private String writeWorkspaceTree(Path gitRoot,
+                                      Path workspace,
+                                      String parentFingerprint,
+                                      GitObjectStore objectStore) {
         if (parentFingerprint == null || parentFingerprint.isBlank()) {
             throw new DomainException("SNAPSHOT_PARENT_MISSING", "Workspace snapshot requires a parent fingerprint");
         }
@@ -205,7 +209,7 @@ public class GitSnapshotAdapter implements SnapshotPort {
             if (gitDirResult.exitCode() != 0 || gitDirResult.stdout().isBlank()) {
                 throw gitFailure("Unable to resolve Git object database", gitDirResult);
             }
-            Map<String, String> env = new HashMap<>();
+            Map<String, String> env = new HashMap<>(objectStore.environment());
             env.put("GIT_INDEX_FILE", index.toString());
             env.put("GIT_DIR", gitDirResult.stdout().trim());
             env.put("GIT_WORK_TREE", workspace.toString());
@@ -221,6 +225,26 @@ public class GitSnapshotAdapter implements SnapshotPort {
             return tree.stdout().trim();
         } finally {
             deleteQuietly(index);
+        }
+    }
+
+    private GitObjectStore objectStore(Project project, Path gitRoot) {
+        Path objectDirectory = dataRoot.resolve("git-objects").resolve(project.id().toString())
+                .toAbsolutePath().normalize();
+        try {
+            Files.createDirectories(objectDirectory);
+            ProcessRunner.ProcessResult commonDirResult = runGit(gitRoot, List.of("rev-parse", "--git-common-dir"));
+            if (commonDirResult.exitCode() != 0 || commonDirResult.stdout().isBlank()) {
+                throw gitFailure("Unable to resolve canonical Git common directory", commonDirResult);
+            }
+            Path commonDirectory = Path.of(commonDirResult.stdout().trim());
+            if (!commonDirectory.isAbsolute()) commonDirectory = gitRoot.resolve(commonDirectory);
+            Path canonicalObjects = commonDirectory.toRealPath().resolve("objects").toRealPath();
+            return new GitObjectStore(objectDirectory, canonicalObjects);
+        } catch (IOException error) {
+            throw new DomainException("SNAPSHOT_FAILED",
+                    "Unable to prepare isolated Git object storage: "
+                            + (error.getMessage() == null ? objectDirectory : error.getMessage()));
         }
     }
 
@@ -299,37 +323,50 @@ public class GitSnapshotAdapter implements SnapshotPort {
         }
     }
 
-    private void extractArchive(Path archive,
-                                Path destination,
-                                List<String> included,
-                                List<Snapshot.ExcludedPath> excluded) throws IOException {
-        Files.createDirectories(destination);
-        Path realDestination = destination.toRealPath();
-        try (InputStream input = Files.newInputStream(archive); ZipInputStream zip = new ZipInputStream(input)) {
-            ZipEntry entry;
-            while ((entry = zip.getNextEntry()) != null) {
-                String relative = entry.getName().replace('\\', '/');
-                Path target = destination.resolve(relative).normalize();
-                if (!target.startsWith(destination)) {
-                    throw new DomainException("SNAPSHOT_INVALID_ENTRY", "Archive entry escapes snapshot: " + relative);
-                }
-                String reason = exclusionReason(relative);
-                if (reason != null) {
-                    excluded.add(new Snapshot.ExcludedPath(relative, reason));
-                    continue;
-                }
-                if (entry.isDirectory()) {
-                    Files.createDirectories(target);
-                } else {
-                    Files.createDirectories(target.getParent());
-                    if (Files.exists(target) && !target.toRealPath().startsWith(realDestination)) {
-                        throw new DomainException("SNAPSHOT_PATH_ESCAPE", "Snapshot target escapes destination: " + relative);
-                    }
-                    Files.copy(zip, target, StandardCopyOption.REPLACE_EXISTING);
-                    included.add(relative);
-                }
-            }
+    private List<String> listTreeFiles(Path gitRoot,
+                                       String fingerprint,
+                                       Map<String, String> environment) {
+        ProcessRunner.ProcessResult listed = runGit(gitRoot,
+                List.of("ls-tree", "-r", "-z", "--full-tree", fingerprint), environment);
+        if (listed.exitCode() != 0) {
+            throw gitFailure("Unable to enumerate snapshot tree", listed);
         }
+        if (listed.stdout().contains("process output truncated; head/tail retained")) {
+            throw new DomainException("SNAPSHOT_TREE_TOO_LARGE",
+                    "Snapshot tree path metadata exceeded the capture safety limit");
+        }
+
+        List<String> files = new ArrayList<>();
+        for (String record : listed.stdout().split("\0", -1)) {
+            if (record.isEmpty()) continue;
+            int separator = record.indexOf('\t');
+            if (separator <= 0 || separator == record.length() - 1) {
+                throw new DomainException("SNAPSHOT_INVALID_ENTRY", "Malformed entry in snapshot tree");
+            }
+            String[] metadata = record.substring(0, separator).split(" ");
+            String relative = record.substring(separator + 1);
+            if (metadata.length != 3) {
+                throw new DomainException("SNAPSHOT_INVALID_ENTRY", "Malformed entry in snapshot tree: " + relative);
+            }
+            if ("120000".equals(metadata[0])) {
+                throw new DomainException("SNAPSHOT_SYMLINK_UNSUPPORTED", "Symlink is not supported: " + relative);
+            }
+            if ("160000".equals(metadata[0])) {
+                throw new DomainException("SNAPSHOT_GITLINK_UNSUPPORTED",
+                        "Git submodules are not supported in an experiment snapshot: " + relative);
+            }
+            if (!"blob".equals(metadata[1])
+                    || !("100644".equals(metadata[0]) || "100755".equals(metadata[0]))) {
+                throw new DomainException("SNAPSHOT_INVALID_ENTRY", "Unsupported snapshot tree entry: " + relative);
+            }
+            validateTreePath(relative);
+            if (exclusionReason(relative) != null) {
+                throw new DomainException("SNAPSHOT_PROTECTED_ENTRY",
+                        "Protected path remained in snapshot tree: " + relative);
+            }
+            files.add(relative);
+        }
+        return List.copyOf(files);
     }
 
     private void collectExcluded(Path root,
@@ -364,17 +401,47 @@ public class GitSnapshotAdapter implements SnapshotPort {
         });
     }
 
-    private void copyRawFiles(Path source, Path destination, List<String> included) throws IOException {
-        for (String relative : included) {
+    private void materializeTreeFiles(Path source,
+                                      Path destination,
+                                      List<String> treeFiles,
+                                      List<String> included) throws IOException {
+        Files.createDirectories(destination);
+        Path realSource = source.toRealPath();
+        Path realDestination = destination.toRealPath();
+        for (String relative : treeFiles) {
             Path original = source.resolve(relative).normalize();
             Path target = destination.resolve(relative).normalize();
             if (!original.startsWith(source) || !target.startsWith(destination)
                     || !Files.isRegularFile(original, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
                 throw new DomainException("SNAPSHOT_SOURCE_CHANGED", "Snapshot source changed while copying: " + relative);
             }
+            if (!original.toRealPath().startsWith(realSource)) {
+                throw new DomainException("SNAPSHOT_PATH_ESCAPE", "Snapshot source path escapes workspace: " + relative);
+            }
             validateSnapshotFile(original, relative);
             Files.createDirectories(target.getParent());
+            if (!target.getParent().toRealPath().startsWith(realDestination)
+                    || (Files.exists(target, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                    && (Files.isSymbolicLink(target) || !target.toRealPath().startsWith(realDestination)))) {
+                throw new DomainException("SNAPSHOT_PATH_ESCAPE", "Snapshot target escapes destination: " + relative);
+            }
             Files.copy(original, target, StandardCopyOption.REPLACE_EXISTING);
+            included.add(relative);
+        }
+    }
+
+    private void validateTreePath(String relative) {
+        if (relative.isBlank() || relative.indexOf('\\') >= 0) {
+            throw new DomainException("SNAPSHOT_INVALID_ENTRY", "Invalid snapshot tree path: " + relative);
+        }
+        Path path;
+        try {
+            path = Path.of(relative);
+        } catch (RuntimeException error) {
+            throw new DomainException("SNAPSHOT_INVALID_ENTRY", "Invalid snapshot tree path: " + relative);
+        }
+        if (path.isAbsolute() || path.normalize().startsWith("..") || !path.normalize().toString().equals(path.toString())) {
+            throw new DomainException("SNAPSHOT_INVALID_ENTRY", "Snapshot tree path escapes destination: " + relative);
         }
     }
 
@@ -527,6 +594,14 @@ public class GitSnapshotAdapter implements SnapshotPort {
             deleteRecursively(path);
         } catch (IOException ignored) {
             // Best-effort cleanup. The immutable snapshot remains outside canonical.
+        }
+    }
+
+    private record GitObjectStore(Path objectDirectory, Path canonicalObjects) {
+        private Map<String, String> environment() {
+            return Map.of(
+                    "GIT_OBJECT_DIRECTORY", objectDirectory.toString(),
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES", canonicalObjects.toString());
         }
     }
 }

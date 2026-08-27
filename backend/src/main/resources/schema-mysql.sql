@@ -97,5 +97,6 @@ CREATE TABLE IF NOT EXISTS promotion_journal (
     failure_reason TEXT NULL,
     version BIGINT NOT NULL,
     INDEX idx_promotion_journal_experiment (experiment_id),
-    INDEX idx_promotion_journal_open (phase, lease_until)
+    INDEX idx_promotion_journal_open (phase, lease_until),
+    INDEX idx_promotion_journal_project_phase (project_id, phase, created_at)
 );

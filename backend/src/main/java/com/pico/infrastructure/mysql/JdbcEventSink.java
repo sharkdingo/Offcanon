@@ -21,6 +21,7 @@ import java.util.UUID;
 @Component
 @Profile("mysql")
 public class JdbcEventSink implements EventSink {
+    private static final int MAX_FETCH_EVENTS = 500;
     private final JdbcTemplate jdbc;
     private final ObjectMapper mapper;
 
@@ -46,8 +47,8 @@ public class JdbcEventSink implements EventSink {
 
     @Override
     public List<RunEvent> after(UUID experimentId, long sequence) {
-        return jdbc.query("SELECT * FROM run_events WHERE experiment_id=? AND sequence>? ORDER BY sequence",
-                this::map, experimentId.toString(), sequence);
+        return jdbc.query("SELECT * FROM run_events WHERE experiment_id=? AND sequence>? ORDER BY sequence LIMIT ?",
+                this::map, experimentId.toString(), sequence, MAX_FETCH_EVENTS);
     }
 
     private RunEvent map(ResultSet rs, int row) throws SQLException {

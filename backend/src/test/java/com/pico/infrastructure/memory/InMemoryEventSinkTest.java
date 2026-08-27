@@ -40,4 +40,20 @@ class InMemoryEventSinkTest {
         assertEquals(publishers * perPublisher, sequences.size());
         assertEquals(java.util.stream.LongStream.rangeClosed(1, publishers * perPublisher).boxed().toList(), sequences);
     }
+
+    @Test
+    void retainsOnlyTheNewestEventsWithoutReusingCursorSequences() {
+        InMemoryEventSink sink = new InMemoryEventSink(100);
+        UUID experimentId = UUID.randomUUID();
+
+        for (int index = 0; index < 125; index++) {
+            sink.publish(experimentId, "TEST", Map.of("index", index));
+        }
+
+        List<Long> retained = sink.after(experimentId, 0).stream().map(event -> event.sequence()).toList();
+        assertEquals(100, retained.size());
+        assertEquals(26L, retained.getFirst());
+        assertEquals(125L, retained.getLast());
+        assertEquals(126L, sink.publish(experimentId, "TEST", Map.of()).sequence());
+    }
 }

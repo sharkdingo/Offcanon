@@ -11,6 +11,8 @@ import com.pico.port.SnapshotPort;
 import com.pico.project.domain.Project;
 import com.pico.promotion.domain.PromotionJournal;
 import com.pico.promotion.domain.PromotionPhase;
+import com.pico.shared.domain.DomainException;
+import com.pico.shared.web.NotFoundException;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.event.EventListener;
@@ -20,7 +22,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.UUID;
 
 /**
  * Audits every open journal at startup, but reconciles only expired leases.
@@ -38,6 +43,7 @@ public class PromotionRecoveryService {
     private final PromotionLockPort promotionLock;
     private final PromotionStateCoordinator states;
     private final String ownerId = "recovery-" + java.util.UUID.randomUUID();
+    private final AtomicBoolean applicationReady = new AtomicBoolean();
 
     @Autowired
     public PromotionRecoveryService(PromotionJournalPort journals,
@@ -69,10 +75,12 @@ public class PromotionRecoveryService {
     @EventListener(ApplicationReadyEvent.class)
     public void reconcileOnStartup() {
         auditOpenJournals(Instant.now());
+        applicationReady.set(true);
     }
 
     @Scheduled(fixedDelayString = "${pico.promotion.recovery-interval-ms:30000}")
     public void reconcileExpiredJournals() {
+        if (!applicationReady.get()) return;
         reconcile(Instant.now());
     }
 
@@ -97,6 +105,61 @@ public class PromotionRecoveryService {
                     "leaseUntil", journal.leaseUntil().toString(),
                     "promotionBlocked", true));
         }
+    }
+
+    /**
+     * Resolves a journal already marked for manual recovery. This never replays
+     * filesystem operations: it only records an outcome proven by the current
+     * canonical fingerprint while holding the same project promotion lock.
+     */
+    public ManualReconciliation reconcileRequired(UUID experimentId) {
+        Experiment initial = experiments.findById(experimentId)
+                .orElseThrow(() -> new NotFoundException("Experiment not found: " + experimentId));
+        Project initialProject = projects.findById(initial.projectId())
+                .orElseThrow(() -> new NotFoundException("Project not found: " + initial.projectId()));
+        return promotionLock.withProjectLock(initialProject.id(), () -> {
+            Experiment experiment = experiments.findById(experimentId)
+                    .orElseThrow(() -> new NotFoundException("Experiment not found: " + experimentId));
+            Project project = projects.findById(experiment.projectId())
+                    .orElseThrow(() -> new NotFoundException("Project not found: " + experiment.projectId()));
+            List<PromotionJournal> unresolved = journals.findUnresolvedByProject(project.id());
+            List<PromotionJournal> matching = unresolved.stream()
+                    .filter(journal -> journal.experimentId().equals(experimentId))
+                    .filter(journal -> journal.phase() == PromotionPhase.RECOVERY_REQUIRED)
+                    .toList();
+            if (matching.isEmpty()) {
+                throw new DomainException("PROMOTION_RECOVERY_JOURNAL_MISSING",
+                        "No RECOVERY_REQUIRED promotion journal exists for experiment " + experimentId);
+            }
+            if (matching.size() != 1) {
+                throw new DomainException("PROMOTION_RECOVERY_JOURNAL_AMBIGUOUS",
+                        "Multiple recovery journals exist for experiment " + experimentId);
+            }
+            PromotionJournal journal = matching.get(0);
+            if (unresolved.isEmpty() || !unresolved.get(0).promotionId().equals(journal.promotionId())) {
+                throw new DomainException("PROMOTION_RECOVERY_ORDER_CONFLICT",
+                        "An earlier promotion journal must be reconciled first");
+            }
+
+            String current = snapshots.currentFingerprint(project);
+            Instant now = Instant.now();
+            if (journal.candidateFingerprint().equals(current)) {
+                states.reconcileCommitted(experiment, journal, current, now);
+                publish("PROMOTION_MANUALLY_RECONCILED", journal,
+                        Map.of("status", "PROMOTED", "fingerprint", current));
+                return new ManualReconciliation(journal.promotionId(), "PROMOTED", "COMMITTED", current,
+                        "Canonical matches the promotion candidate");
+            }
+            if (journal.baseFingerprint().equals(current)) {
+                String reason = "Canonical matches the promotion base; manual recovery confirmed no applied result";
+                states.reconcileAborted(experiment, journal, reason, now);
+                publish("PROMOTION_MANUALLY_RECONCILED", journal,
+                        Map.of("status", "VERIFIED", "fingerprint", current));
+                return new ManualReconciliation(journal.promotionId(), "VERIFIED", "ABORTED", current, reason);
+            }
+            throw new DomainException("PROMOTION_RECOVERY_FINGERPRINT_MISMATCH",
+                    "Canonical fingerprint " + current + " matches neither recovery base nor candidate; no state was changed");
+        });
     }
 
     private void reconcileExpired(PromotionJournal journal, Instant now) {
@@ -190,5 +253,12 @@ public class PromotionRecoveryService {
         } catch (RuntimeException ignored) {
             // Recovery state is authoritative; event persistence is telemetry.
         }
+    }
+
+    public record ManualReconciliation(UUID promotionId,
+                                       String experimentStatus,
+                                       String journalPhase,
+                                       String fingerprint,
+                                       String detail) {
     }
 }

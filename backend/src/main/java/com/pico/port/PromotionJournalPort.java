@@ -14,6 +14,8 @@ public interface PromotionJournalPort {
     PromotionJournal markCommitted(PromotionJournal journal, String resultingFingerprint, Instant now);
     PromotionJournal markAborted(PromotionJournal journal, String reason, Instant now);
     PromotionJournal markRecoveryRequired(PromotionJournal journal, String reason, Instant now);
+    PromotionJournal resolveRecoveryCommitted(PromotionJournal journal, String resultingFingerprint, Instant now);
+    PromotionJournal resolveRecoveryAborted(PromotionJournal journal, String reason, Instant now);
     Optional<PromotionJournal> tryClaimExpired(PromotionJournal journal, String newOwnerId, Instant now, Instant newLeaseUntil);
     List<PromotionJournal> findOpen();
     List<PromotionJournal> findExpiredOpen(Instant now);

@@ -8,6 +8,7 @@ import com.pico.port.DiffPort;
 import com.pico.port.SnapshotRepository;
 import com.pico.promotion.application.PromotionApplicationService;
 import com.pico.promotion.application.PromotionPreviewApplicationService;
+import com.pico.promotion.application.PromotionRecoveryService;
 import com.pico.verification.domain.Evidence;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -22,6 +23,7 @@ import static com.pico.web.ApiDtos.ExperimentResponse;
 import static com.pico.web.ApiDtos.EvidenceResponse;
 import static com.pico.web.ApiDtos.PromotionResponse;
 import static com.pico.web.ApiDtos.PromotionPreviewResponse;
+import static com.pico.web.ApiDtos.PromotionReconcileResponse;
 import static com.pico.web.ApiDtos.DiffEntryResponse;
 
 @RestController
@@ -32,6 +34,7 @@ public class ExperimentController {
     private final EvidenceRepository evidenceRepository;
     private final PromotionApplicationService promotionService;
     private final PromotionPreviewApplicationService promotionPreviewService;
+    private final PromotionRecoveryService promotionRecoveryService;
     private final DiffPort diffPort;
     private final SnapshotRepository snapshotRepository;
 
@@ -40,6 +43,7 @@ public class ExperimentController {
                                 EvidenceRepository evidenceRepository,
                                 PromotionApplicationService promotionService,
                                 PromotionPreviewApplicationService promotionPreviewService,
+                                PromotionRecoveryService promotionRecoveryService,
                                 DiffPort diffPort,
                                 SnapshotRepository snapshotRepository) {
         this.experimentService = experimentService;
@@ -47,6 +51,7 @@ public class ExperimentController {
         this.evidenceRepository = evidenceRepository;
         this.promotionService = promotionService;
         this.promotionPreviewService = promotionPreviewService;
+        this.promotionRecoveryService = promotionRecoveryService;
         this.diffPort = diffPort;
         this.snapshotRepository = snapshotRepository;
     }
@@ -101,6 +106,13 @@ public class ExperimentController {
         return new PromotionPreviewResponse(preview.baseFingerprint(), preview.currentFingerprint(),
                 preview.finalCandidateFingerprint(), preview.verificationStatus(), preview.trustedVerification(),
                 preview.conflict(), preview.blockingReason(), preview.promotable());
+    }
+
+    @PostMapping("/{experimentId}/promotion-reconcile")
+    public PromotionReconcileResponse reconcilePromotion(@PathVariable UUID experimentId) {
+        PromotionRecoveryService.ManualReconciliation outcome = promotionRecoveryService.reconcileRequired(experimentId);
+        return new PromotionReconcileResponse(outcome.promotionId(), outcome.experimentStatus(), outcome.journalPhase(),
+                outcome.fingerprint(), outcome.detail());
     }
 
     private static ExperimentResponse toResponse(Experiment experiment) {

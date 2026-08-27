@@ -4,6 +4,7 @@ import com.pico.application.ExperimentApplicationService;
 import com.pico.agent.domain.RunEvent;
 import com.pico.port.EventSink;
 import org.springframework.http.MediaType;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -26,13 +27,16 @@ public class ExperimentEventController {
     private final ExperimentApplicationService experimentService;
     private final EventSink events;
     private final ScheduledExecutorService executor;
+    private final long pollIntervalMillis;
 
     public ExperimentEventController(ExperimentApplicationService experimentService,
                                      EventSink events,
-                                     ScheduledExecutorService eventStreamExecutor) {
+                                     ScheduledExecutorService eventStreamExecutor,
+                                     @Value("${pico.events.poll-interval-ms:500}") long pollIntervalMillis) {
         this.experimentService = experimentService;
         this.events = events;
         this.executor = eventStreamExecutor;
+        this.pollIntervalMillis = Math.max(250, pollIntervalMillis);
     }
 
     @GetMapping(value = "/{experimentId}/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
@@ -53,7 +57,7 @@ public class ExperimentEventController {
             } catch (IOException | RuntimeException error) {
                 emitter.completeWithError(error);
             }
-        }, 0, 250, TimeUnit.MILLISECONDS);
+        }, 0, pollIntervalMillis, TimeUnit.MILLISECONDS);
         emitter.onCompletion(() -> poller.cancel(false));
         emitter.onTimeout(() -> poller.cancel(false));
         emitter.onError(error -> poller.cancel(false));

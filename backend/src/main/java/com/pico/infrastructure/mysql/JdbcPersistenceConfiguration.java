@@ -2,13 +2,14 @@ package com.pico.infrastructure.mysql;
 
 import com.pico.project.domain.CanonicalPathIdentity;
 import com.pico.port.SnapshotPort;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Profile;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.jdbc.datasource.init.ResourceDatabasePopulator;
 import org.springframework.jdbc.support.JdbcTransactionManager;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -22,17 +23,24 @@ import java.util.Map;
 @Configuration
 @Profile("mysql")
 public class JdbcPersistenceConfiguration {
-    @Bean
+    @Bean(destroyMethod = "close")
     public DataSource dataSource(
             @Value("${pico.mysql.url:${PICO_MYSQL_URL:jdbc:mysql://localhost:3306/pico?createDatabaseIfNotExist=true&serverTimezone=UTC}}") String url,
             @Value("${pico.mysql.username:${PICO_MYSQL_USERNAME:pico}}") String username,
-            @Value("${pico.mysql.password:${PICO_MYSQL_PASSWORD:}}") String password) {
-        DriverManagerDataSource dataSource = new DriverManagerDataSource();
-        dataSource.setDriverClassName("com.mysql.cj.jdbc.Driver");
-        dataSource.setUrl(url);
-        dataSource.setUsername(username);
-        dataSource.setPassword(password);
-        return dataSource;
+            @Value("${pico.mysql.password:${PICO_MYSQL_PASSWORD:}}") String password,
+            @Value("${pico.mysql.maximum-pool-size:${PICO_MYSQL_POOL_SIZE:8}}") int maximumPoolSize) {
+        HikariConfig config = new HikariConfig();
+        config.setPoolName("pico-mysql");
+        config.setDriverClassName("com.mysql.cj.jdbc.Driver");
+        config.setJdbcUrl(url);
+        config.setUsername(username);
+        config.setPassword(password);
+        config.setMinimumIdle(1);
+        config.setMaximumPoolSize(Math.max(2, maximumPoolSize));
+        config.setConnectionTimeout(5_000);
+        config.setValidationTimeout(3_000);
+        config.setInitializationFailTimeout(10_000);
+        return new HikariDataSource(config);
     }
 
     @Bean
@@ -66,6 +74,8 @@ public class JdbcPersistenceConfiguration {
                     "ALTER TABLE promotion_journal ADD COLUMN preimage_hashes JSON NULL AFTER touched_files");
             ensureColumn(jdbc, "promotion_journal", "postimage_hashes",
                     "ALTER TABLE promotion_journal ADD COLUMN postimage_hashes JSON NULL AFTER preimage_hashes");
+            ensureIndex(jdbc, "promotion_journal", "idx_promotion_journal_project_phase",
+                    "ALTER TABLE promotion_journal ADD INDEX idx_promotion_journal_project_phase (project_id, phase, created_at)");
             jdbc.update("UPDATE promotion_journal SET touched_files=JSON_ARRAY() WHERE touched_files IS NULL");
             jdbc.update("UPDATE promotion_journal SET preimage_hashes=JSON_OBJECT() WHERE preimage_hashes IS NULL");
             jdbc.update("UPDATE promotion_journal SET postimage_hashes=JSON_OBJECT() WHERE postimage_hashes IS NULL");

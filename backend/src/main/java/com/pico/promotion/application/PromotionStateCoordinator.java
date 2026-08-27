@@ -120,6 +120,41 @@ public class PromotionStateCoordinator {
         });
     }
 
+    public PromotionJournal reconcileCommitted(Experiment experiment,
+                                                PromotionJournal journal,
+                                                String fingerprint,
+                                                Instant now) {
+        return inTransaction(() -> {
+            Experiment current = currentExperiment(experiment);
+            long before = current.version();
+            current.reconcilePromotionCommitted();
+            if (current.version() != before) {
+                experiments.save(current);
+            }
+            return journals.resolveRecoveryCommitted(journal, fingerprint, now);
+        });
+    }
+
+    public PromotionJournal reconcileAborted(Experiment experiment,
+                                              PromotionJournal journal,
+                                              String reason,
+                                              Instant now) {
+        return inTransaction(() -> {
+            Experiment current = currentExperiment(experiment);
+            long before = current.version();
+            current.reconcilePromotionAborted();
+            if (current.version() != before) {
+                experiments.save(current);
+            }
+            return journals.resolveRecoveryAborted(journal, reason, now);
+        });
+    }
+
+    private Experiment currentExperiment(Experiment experiment) {
+        return experiments.findById(experiment.id())
+                .orElseThrow(() -> new DomainException("EXPERIMENT_MISSING", "Promotion experiment disappeared"));
+    }
+
     private <T> T inTransaction(Supplier<T> work) {
         if (transactionManager == null) return work.get();
         T result = new TransactionTemplate(transactionManager).execute(status -> work.get());

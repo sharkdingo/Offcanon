@@ -11,20 +11,25 @@ import com.pico.port.SnapshotPort;
 import com.pico.project.domain.Project;
 import com.pico.promotion.domain.PromotionJournal;
 import com.pico.promotion.domain.PromotionPhase;
+import com.pico.shared.domain.DomainException;
 import com.pico.verification.domain.VerificationResult;
 import com.pico.workspace.domain.Snapshot;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class PromotionRecoveryServiceTest {
@@ -183,6 +188,122 @@ class PromotionRecoveryServiceTest {
         assertEquals(PromotionPhase.ABORTED, storedJournal(fixture).phase());
     }
 
+    @Test
+    void manualReconcileCommitsRecoveryWhenCanonicalMatchesCandidate() {
+        Fixture fixture = fixture("unexpected-fingerprint", NOW.minusSeconds(1));
+        fixture.service().reconcile(NOW);
+        fixture.snapshots().setCurrent(CANDIDATE);
+
+        var outcome = fixture.service().reconcileRequired(fixture.experimentId());
+
+        assertEquals("PROMOTED", outcome.experimentStatus());
+        assertEquals("COMMITTED", outcome.journalPhase());
+        assertEquals(CANDIDATE, outcome.fingerprint());
+        assertEquals(ExperimentStatus.PROMOTED, storedExperiment(fixture).status());
+        assertEquals(PromotionPhase.COMMITTED, storedJournal(fixture).phase());
+        assertEquals(CANDIDATE, storedJournal(fixture).resultingFingerprint());
+    }
+
+    @Test
+    void manualReconcileAbortsRecoveryWhenCanonicalMatchesBase() {
+        Fixture fixture = fixture("unexpected-fingerprint", NOW.minusSeconds(1));
+        fixture.service().reconcile(NOW);
+        fixture.snapshots().setCurrent(BASE);
+
+        var outcome = fixture.service().reconcileRequired(fixture.experimentId());
+
+        assertEquals("VERIFIED", outcome.experimentStatus());
+        assertEquals("ABORTED", outcome.journalPhase());
+        assertEquals(BASE, outcome.fingerprint());
+        assertEquals(ExperimentStatus.VERIFIED, storedExperiment(fixture).status());
+        assertEquals(PromotionPhase.ABORTED, storedJournal(fixture).phase());
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = ExperimentStatus.class, names = {"VERIFIED", "PREPARING_PROMOTION", "PROMOTING"})
+    void manualReconcileCommitsWhenRecoveryJournalOutranExperimentMarker(ExperimentStatus status) {
+        Fixture fixture = fixture(CANDIDATE, NOW.plusSeconds(30), status);
+        markJournalRecoveryRequired(fixture);
+
+        var outcome = fixture.service().reconcileRequired(fixture.experimentId());
+
+        assertEquals("PROMOTED", outcome.experimentStatus());
+        assertEquals("COMMITTED", outcome.journalPhase());
+        assertEquals(ExperimentStatus.PROMOTED, storedExperiment(fixture).status());
+        assertEquals(PromotionPhase.COMMITTED, storedJournal(fixture).phase());
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = ExperimentStatus.class, names = {"VERIFIED", "PREPARING_PROMOTION", "PROMOTING"})
+    void manualReconcileAbortsWhenRecoveryJournalOutranExperimentMarker(ExperimentStatus status) {
+        Fixture fixture = fixture(BASE, NOW.plusSeconds(30), status);
+        markJournalRecoveryRequired(fixture);
+
+        var outcome = fixture.service().reconcileRequired(fixture.experimentId());
+
+        assertEquals("VERIFIED", outcome.experimentStatus());
+        assertEquals("ABORTED", outcome.journalPhase());
+        assertEquals(ExperimentStatus.VERIFIED, storedExperiment(fixture).status());
+        assertEquals(PromotionPhase.ABORTED, storedJournal(fixture).phase());
+    }
+
+    @Test
+    void manualReconcileClosesJournalWhenExperimentCommitWasAlreadyPersisted() {
+        Fixture fixture = fixture(CANDIDATE, NOW.plusSeconds(30), ExperimentStatus.PROMOTED);
+        markJournalRecoveryRequired(fixture);
+        long version = storedExperiment(fixture).version();
+
+        fixture.service().reconcileRequired(fixture.experimentId());
+
+        assertEquals(ExperimentStatus.PROMOTED, storedExperiment(fixture).status());
+        assertEquals(version, storedExperiment(fixture).version());
+        assertEquals(PromotionPhase.COMMITTED, storedJournal(fixture).phase());
+    }
+
+    @Test
+    void manualReconcileRejectsPromotedExperimentWhenCanonicalIsAtBase() {
+        Fixture fixture = fixture(BASE, NOW.plusSeconds(30), ExperimentStatus.PROMOTED);
+        markJournalRecoveryRequired(fixture);
+        PromotionJournal beforeJournal = storedJournal(fixture);
+
+        DomainException error = assertThrows(DomainException.class,
+                () -> fixture.service().reconcileRequired(fixture.experimentId()));
+
+        assertEquals("PROMOTION_STATE_MISMATCH", error.code());
+        assertEquals(ExperimentStatus.PROMOTED, storedExperiment(fixture).status());
+        assertEquals(beforeJournal, storedJournal(fixture));
+    }
+
+    @Test
+    void manualReconcileRejectsUnrelatedTerminalExperimentEvenWhenCandidateMatches() {
+        Fixture fixture = fixture(CANDIDATE, NOW.plusSeconds(30), ExperimentStatus.FAILED);
+        markJournalRecoveryRequired(fixture);
+        PromotionJournal beforeJournal = storedJournal(fixture);
+
+        DomainException error = assertThrows(DomainException.class,
+                () -> fixture.service().reconcileRequired(fixture.experimentId()));
+
+        assertEquals("PROMOTION_STATE_MISMATCH", error.code());
+        assertEquals(ExperimentStatus.FAILED, storedExperiment(fixture).status());
+        assertEquals(beforeJournal, storedJournal(fixture));
+    }
+
+    @Test
+    void manualReconcileLeavesRecoveryBlockedForUnknownCanonicalFingerprint() {
+        Fixture fixture = fixture("unexpected-fingerprint", NOW.minusSeconds(1));
+        fixture.service().reconcile(NOW);
+        Experiment beforeExperiment = storedExperiment(fixture);
+        PromotionJournal beforeJournal = storedJournal(fixture);
+
+        DomainException error = assertThrows(DomainException.class,
+                () -> fixture.service().reconcileRequired(fixture.experimentId()));
+
+        assertEquals("PROMOTION_RECOVERY_FINGERPRINT_MISMATCH", error.code());
+        assertEquals(ExperimentStatus.RECOVERY_REQUIRED, storedExperiment(fixture).status());
+        assertEquals(beforeExperiment.version(), storedExperiment(fixture).version());
+        assertEquals(beforeJournal, storedJournal(fixture));
+    }
+
     private Fixture fixture(String currentFingerprint, Instant leaseUntil) {
         return fixture(currentFingerprint, leaseUntil, ExperimentStatus.PROMOTING);
     }
@@ -229,6 +350,11 @@ class PromotionRecoveryServiceTest {
         return journals.findById(fixture.promotionId()).orElseThrow();
     }
 
+    private void markJournalRecoveryRequired(Fixture fixture) {
+        journals.markRecoveryRequired(storedJournal(fixture),
+                "Experiment lifecycle marker could not be persisted", NOW);
+    }
+
     private record Fixture(PromotionRecoveryService service,
                            FixedSnapshotPort snapshots,
                            UUID experimentId,
@@ -236,11 +362,11 @@ class PromotionRecoveryServiceTest {
     }
 
     private static final class FixedSnapshotPort implements SnapshotPort {
-        private final String currentFingerprint;
+        private final AtomicReference<String> currentFingerprint;
         private final AtomicInteger calls = new AtomicInteger();
 
         private FixedSnapshotPort(String currentFingerprint) {
-            this.currentFingerprint = currentFingerprint;
+            this.currentFingerprint = new AtomicReference<>(currentFingerprint);
         }
 
         @Override
@@ -256,7 +382,7 @@ class PromotionRecoveryServiceTest {
         @Override
         public String currentFingerprint(Project project) {
             calls.incrementAndGet();
-            return currentFingerprint;
+            return currentFingerprint.get();
         }
 
         @Override
@@ -266,6 +392,10 @@ class PromotionRecoveryServiceTest {
 
         private int calls() {
             return calls.get();
+        }
+
+        private void setCurrent(String fingerprint) {
+            currentFingerprint.set(fingerprint);
         }
     }
 }

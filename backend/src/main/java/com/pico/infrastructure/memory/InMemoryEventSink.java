@@ -2,41 +2,65 @@ package com.pico.infrastructure.memory;
 
 import com.pico.agent.domain.RunEvent;
 import com.pico.port.EventSink;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.context.annotation.Profile;
 
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.atomic.AtomicLong;
 
 @Component
 @Profile("!mysql")
 public class InMemoryEventSink implements EventSink {
-    private final ConcurrentHashMap<UUID, CopyOnWriteArrayList<RunEvent>> events = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<UUID, AtomicLong> sequences = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<UUID, Object> locks = new ConcurrentHashMap<>();
+    private static final int DEFAULT_RETENTION = 2_000;
+    private final ConcurrentHashMap<UUID, EventBuffer> buffers = new ConcurrentHashMap<>();
+    private final int retention;
+
+    @Autowired
+    public InMemoryEventSink(
+            @Value("${pico.events.in-memory-retention:" + DEFAULT_RETENTION + "}") int retention) {
+        this.retention = Math.max(100, retention);
+    }
+
+    public InMemoryEventSink() {
+        this(DEFAULT_RETENTION);
+    }
 
     @Override
     public RunEvent publish(UUID experimentId, String type, Map<String, Object> payload) {
-        synchronized (locks.computeIfAbsent(experimentId, ignored -> new Object())) {
-            long sequence = sequences.computeIfAbsent(experimentId, ignored -> new AtomicLong()).incrementAndGet();
+        EventBuffer buffer = buffers.computeIfAbsent(experimentId, ignored -> new EventBuffer());
+        synchronized (buffer) {
+            long sequence = ++buffer.lastSequence;
             RunEvent event = new RunEvent(UUID.randomUUID(), experimentId, sequence, type, Instant.now(), payload);
-            events.computeIfAbsent(experimentId, ignored -> new CopyOnWriteArrayList<>()).add(event);
+            buffer.events.addLast(event);
+            while (buffer.events.size() > retention) {
+                buffer.events.removeFirst();
+            }
             return event;
         }
     }
 
     @Override
     public List<RunEvent> after(UUID experimentId, long sequence) {
-        synchronized (locks.computeIfAbsent(experimentId, ignored -> new Object())) {
-            return events.getOrDefault(experimentId, new CopyOnWriteArrayList<>()).stream()
-                    .filter(event -> event.sequence() > sequence)
-                    .sorted(java.util.Comparator.comparingLong(RunEvent::sequence))
-                    .toList();
+        EventBuffer buffer = buffers.get(experimentId);
+        if (buffer == null) return List.of();
+        synchronized (buffer) {
+            ArrayList<RunEvent> pending = new ArrayList<>();
+            for (RunEvent event : buffer.events) {
+                if (event.sequence() > sequence) pending.add(event);
+            }
+            return List.copyOf(pending);
         }
+    }
+
+    private static final class EventBuffer {
+        private final ArrayDeque<RunEvent> events = new ArrayDeque<>();
+        private long lastSequence;
     }
 }

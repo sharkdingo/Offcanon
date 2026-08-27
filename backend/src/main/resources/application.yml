@@ -20,3 +20,6 @@ pico:
     observation-limit: ${PICO_OBSERVATION_LIMIT:12000}
   model:
     request-timeout-seconds: ${PICO_MODEL_REQUEST_TIMEOUT_SECONDS:120}
+  events:
+    in-memory-retention: ${PICO_EVENT_RETENTION:2000}
+    poll-interval-ms: ${PICO_EVENT_POLL_INTERVAL_MS:500}

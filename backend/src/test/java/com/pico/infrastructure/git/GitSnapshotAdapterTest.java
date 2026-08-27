@@ -40,8 +40,11 @@ class GitSnapshotAdapterTest {
         Path dataRoot = temp.resolve("data");
         GitSnapshotAdapter adapter = new GitSnapshotAdapter(new ProcessRunner(), dataRoot.toString());
         Project project = Project.create("demo", repository, List.of(), Instant.now());
+        CanonicalGitState canonicalBefore = canonicalGitState(repository);
         Snapshot snapshot = adapter.capture(project);
 
+        assertEquals(canonicalBefore, canonicalGitState(repository));
+        assertTrue(hasStoredObjects(dataRoot.resolve("git-objects").resolve(project.id().toString())));
         assertTrue(snapshot.includedFiles().contains("tracked.txt"));
         assertTrue(snapshot.includedFiles().contains("new.txt"));
         assertTrue(snapshot.excludedFiles().stream().anyMatch(item -> item.path().equals(".env")));
@@ -49,6 +52,27 @@ class GitSnapshotAdapterTest {
         assertTrue(Files.exists(snapshot.materializedPath().resolve("new.txt")));
         assertFalse(Files.exists(snapshot.materializedPath().resolve(".env")));
         assertEquals(statusBefore, run(repository, "git", "status", "--porcelain=v1"));
+    }
+
+    @Test
+    void exportIgnoreDoesNotRemoveAFileFromTheMaterializedTree() throws Exception {
+        Path repository = initialise("export-ignore-repo");
+        Files.writeString(repository.resolve(".gitattributes"), "kept.txt export-ignore\n");
+        Files.writeString(repository.resolve("kept.txt"), "committed\n");
+        run(repository, "git", "add", ".gitattributes", "kept.txt");
+        run(repository, "git", "commit", "-qm", "export attributes");
+        Files.writeString(repository.resolve("kept.txt"), "dirty working tree\n");
+
+        Path dataRoot = temp.resolve("export-ignore-data");
+        Project project = Project.create("demo", repository, List.of(), Instant.now());
+        CanonicalGitState canonicalBefore = canonicalGitState(repository);
+        Snapshot snapshot = new GitSnapshotAdapter(new ProcessRunner(), dataRoot.toString()).capture(project);
+
+        assertEquals(canonicalBefore, canonicalGitState(repository));
+        assertTrue(hasStoredObjects(dataRoot.resolve("git-objects").resolve(project.id().toString())));
+        assertTrue(snapshot.includedFiles().contains("kept.txt"));
+        assertEquals("dirty working tree\n",
+                Files.readString(snapshot.materializedPath().resolve("kept.txt")).replace("\r\n", "\n"));
     }
 
     @Test
@@ -101,18 +125,23 @@ class GitSnapshotAdapterTest {
 
         GitSnapshotAdapter adapter = new GitSnapshotAdapter(new ProcessRunner(), temp.resolve("result-data").toString());
         Project project = Project.create("demo", repository, List.of(), Instant.now());
+        CanonicalGitState canonicalBeforeBase = canonicalGitState(repository);
         Snapshot base = adapter.capture(project);
+        assertEquals(canonicalBeforeBase, canonicalGitState(repository));
         Path experiment = temp.resolve("result-workspace");
         copyTree(base.materializedPath(), experiment);
         Files.writeString(experiment.resolve("service.txt"), "experiment\n");
         Files.writeString(experiment.resolve("added.txt"), "new\n");
 
+        CanonicalGitState canonicalBeforeResult = canonicalGitState(repository);
         Snapshot result = adapter.captureWorkspace(project, experiment, base.fingerprint());
+        assertEquals(canonicalBeforeResult, canonicalGitState(repository));
         Files.writeString(experiment.resolve("service.txt"), "tampered later\n");
 
         assertEquals("experiment\n", Files.readString(result.materializedPath().resolve("service.txt")).replace("\r\n", "\n"));
         assertEquals("new\n", Files.readString(result.materializedPath().resolve("added.txt")).replace("\r\n", "\n"));
         assertEquals(result.fingerprint(), adapter.fingerprintWorkspace(project, result.materializedPath(), base.fingerprint()));
+        assertEquals(canonicalBeforeResult, canonicalGitState(repository));
     }
 
     @Test
@@ -164,6 +193,7 @@ class GitSnapshotAdapterTest {
 
         assertEquals("SNAPSHOT_LFS_UNSUPPORTED", assertThrows(DomainException.class,
                 () -> lfsAdapter.capture(Project.create("lfs", lfsRepository, List.of(), Instant.now()))).code());
+        assertTrue(directoryIsEmpty(temp.resolve("lfs-data").resolve("snapshots")));
 
         Path largeRepository = initialise("large-repo");
         try (var file = new java.io.RandomAccessFile(largeRepository.resolve("large.bin").toFile(), "rw")) {
@@ -173,6 +203,7 @@ class GitSnapshotAdapterTest {
 
         assertEquals("SNAPSHOT_FILE_TOO_LARGE", assertThrows(DomainException.class,
                 () -> largeAdapter.capture(Project.create("large", largeRepository, List.of(), Instant.now()))).code());
+        assertTrue(directoryIsEmpty(temp.resolve("large-data").resolve("snapshots")));
     }
 
     @Test
@@ -203,7 +234,7 @@ class GitSnapshotAdapterTest {
             public ProcessResult run(List<String> command, Path cwd, java.util.Map<String, String> environment,
                                      java.time.Duration timeout) {
                 ProcessResult result = super.run(command, cwd, environment, timeout);
-                if (!changed && command.contains("archive")) {
+                if (!changed && command.contains("ls-tree")) {
                     changed = true;
                     try {
                         Files.writeString(file, "during capture\n");
@@ -247,5 +278,62 @@ class GitSnapshotAdapterTest {
             throw new AssertionError(result.stderr());
         }
         return result.stdout().trim();
+    }
+
+    private CanonicalGitState canonicalGitState(Path repository) throws Exception {
+        Path gitDirectory = Path.of(run(repository, "git", "rev-parse", "--absolute-git-dir"));
+        return new CanonicalGitState(
+                digestTree(gitDirectory.resolve("objects")),
+                digestTree(gitDirectory.resolve("refs")),
+                digestTree(gitDirectory.resolve("index")),
+                digestTree(gitDirectory.resolve("packed-refs")),
+                digestTree(gitDirectory.resolve("HEAD")));
+    }
+
+    private String digestTree(Path root) throws Exception {
+        java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+        if (!Files.exists(root, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            digest.update("missing".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            return java.util.HexFormat.of().formatHex(digest.digest());
+        }
+        try (var paths = Files.walk(root)) {
+            for (Path path : paths.sorted().toList()) {
+                String relative = root.equals(path) ? "." : root.relativize(path).toString().replace('\\', '/');
+                digest.update(relative.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                if (Files.isDirectory(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                    digest.update((byte) 'D');
+                } else if (Files.isRegularFile(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                    digest.update((byte) 'F');
+                    try (var input = Files.newInputStream(path)) {
+                        byte[] buffer = new byte[8192];
+                        int read;
+                        while ((read = input.read(buffer)) != -1) digest.update(buffer, 0, read);
+                    }
+                } else {
+                    digest.update((byte) 'O');
+                }
+            }
+        }
+        return java.util.HexFormat.of().formatHex(digest.digest());
+    }
+
+    private boolean hasStoredObjects(Path objectDirectory) throws Exception {
+        try (var paths = Files.walk(objectDirectory)) {
+            return paths.anyMatch(path -> Files.isRegularFile(path, java.nio.file.LinkOption.NOFOLLOW_LINKS));
+        }
+    }
+
+    private boolean directoryIsEmpty(Path directory) throws Exception {
+        if (!Files.exists(directory)) return true;
+        try (var entries = Files.list(directory)) {
+            return entries.findAny().isEmpty();
+        }
+    }
+
+    private record CanonicalGitState(String objects,
+                                     String refs,
+                                     String index,
+                                     String packedRefs,
+                                     String head) {
     }
 }

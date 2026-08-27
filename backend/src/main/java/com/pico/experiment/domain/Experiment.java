@@ -192,6 +192,40 @@ public final class Experiment {
         version++;
     }
 
+    /**
+     * Resolves a durable promotion-recovery journal after the canonical tree has
+     * been independently proven to match its candidate. The wider input set is
+     * intentional: persistence may have failed before the lifecycle marker caught
+     * up with the already-durable journal.
+     */
+    public void reconcilePromotionCommitted() {
+        if (status == ExperimentStatus.PROMOTED) return;
+        if (status != ExperimentStatus.VERIFIED
+                && status != ExperimentStatus.PREPARING_PROMOTION
+                && status != ExperimentStatus.PROMOTING
+                && status != ExperimentStatus.RECOVERY_REQUIRED) {
+            throw new DomainException("PROMOTION_STATE_MISMATCH",
+                    "Cannot reconcile committed promotion from " + status);
+        }
+        failureReason = null;
+        status = ExperimentStatus.PROMOTED;
+        version++;
+    }
+
+    /** Resolves a recovery journal after the canonical tree is proven unchanged. */
+    public void reconcilePromotionAborted() {
+        if (status == ExperimentStatus.VERIFIED) return;
+        if (status != ExperimentStatus.PREPARING_PROMOTION
+                && status != ExperimentStatus.PROMOTING
+                && status != ExperimentStatus.RECOVERY_REQUIRED) {
+            throw new DomainException("PROMOTION_STATE_MISMATCH",
+                    "Cannot reconcile aborted promotion from " + status);
+        }
+        failureReason = null;
+        status = ExperimentStatus.VERIFIED;
+        version++;
+    }
+
     public void requirePromotionRecovery(String reason) {
         if (status != ExperimentStatus.VERIFIED
                 && status != ExperimentStatus.PREPARING_PROMOTION

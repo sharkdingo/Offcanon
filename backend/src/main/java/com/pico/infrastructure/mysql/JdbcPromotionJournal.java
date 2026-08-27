@@ -78,6 +78,20 @@ public class JdbcPromotionJournal implements PromotionJournalPort {
 
     @Override
     @Transactional
+    public PromotionJournal resolveRecoveryCommitted(PromotionJournal journal,
+                                                      String resultingFingerprint,
+                                                      Instant now) {
+        return resolveRecovery(journal, PromotionPhase.COMMITTED, resultingFingerprint, null, now);
+    }
+
+    @Override
+    @Transactional
+    public PromotionJournal resolveRecoveryAborted(PromotionJournal journal, String reason, Instant now) {
+        return resolveRecovery(journal, PromotionPhase.ABORTED, null, reason, now);
+    }
+
+    @Override
+    @Transactional
     public Optional<PromotionJournal> tryClaimExpired(PromotionJournal expected,
                                                       String newOwnerId,
                                                       Instant now,
@@ -113,6 +127,19 @@ public class JdbcPromotionJournal implements PromotionJournalPort {
                 next.name(), Timestamp.from(now), result, reason, expected.promotionId().toString(),
                 expected.phase().name(), expected.version(), expected.ownerId(), Timestamp.from(now));
         if (changed != 1) throw new DomainException("PROMOTION_JOURNAL_CONFLICT", "Promotion journal changed concurrently");
+        return findById(expected.promotionId()).orElseThrow(() -> new DomainException("PROMOTION_JOURNAL_MISSING", "Promotion journal disappeared"));
+    }
+
+    private PromotionJournal resolveRecovery(PromotionJournal expected,
+                                              PromotionPhase next,
+                                              String result,
+                                              String reason,
+                                              Instant now) {
+        expected.reconciled(next, now, result, reason);
+        int changed = jdbc.update("UPDATE promotion_journal SET phase=?, updated_at=?, resulting_fingerprint=?, failure_reason=?, version=version+1 WHERE promotion_id=? AND phase='RECOVERY_REQUIRED' AND version=? AND owner_id=?",
+                next.name(), Timestamp.from(now), result, reason, expected.promotionId().toString(),
+                expected.version(), expected.ownerId());
+        if (changed != 1) throw new DomainException("PROMOTION_JOURNAL_CONFLICT", "Recovery journal changed concurrently");
         return findById(expected.promotionId()).orElseThrow(() -> new DomainException("PROMOTION_JOURNAL_MISSING", "Promotion journal disappeared"));
     }
 

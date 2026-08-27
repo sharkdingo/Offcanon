@@ -53,6 +53,18 @@ public class InMemoryPromotionJournal implements PromotionJournalPort {
     }
 
     @Override
+    public PromotionJournal resolveRecoveryCommitted(PromotionJournal journal,
+                                                      String resultingFingerprint,
+                                                      Instant now) {
+        return resolveRecovery(journal, PromotionPhase.COMMITTED, resultingFingerprint, null, now);
+    }
+
+    @Override
+    public PromotionJournal resolveRecoveryAborted(PromotionJournal journal, String reason, Instant now) {
+        return resolveRecovery(journal, PromotionPhase.ABORTED, null, reason, now);
+    }
+
+    @Override
     public Optional<PromotionJournal> tryClaimExpired(PromotionJournal expected,
                                                       String newOwnerId,
                                                       Instant now,
@@ -101,6 +113,17 @@ public class InMemoryPromotionJournal implements PromotionJournalPort {
             throw new DomainException("PROMOTION_JOURNAL_EXPIRED", "Promotion journal lease has expired");
         }
         PromotionJournal updated = expected.transitioned(phase, now, result, reason);
+        boolean replaced = journals.replace(expected.promotionId(), expected, updated);
+        if (!replaced) throw new DomainException("PROMOTION_JOURNAL_CONFLICT", "Promotion journal changed concurrently");
+        return updated;
+    }
+
+    private PromotionJournal resolveRecovery(PromotionJournal expected,
+                                              PromotionPhase phase,
+                                              String result,
+                                              String reason,
+                                              Instant now) {
+        PromotionJournal updated = expected.reconciled(phase, now, result, reason);
         boolean replaced = journals.replace(expected.promotionId(), expected, updated);
         if (!replaced) throw new DomainException("PROMOTION_JOURNAL_CONFLICT", "Promotion journal changed concurrently");
         return updated;

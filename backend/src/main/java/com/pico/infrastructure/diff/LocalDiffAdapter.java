@@ -6,6 +6,7 @@ import com.pico.workspace.domain.Snapshot;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -29,31 +30,52 @@ import java.nio.charset.StandardCharsets;
 public class LocalDiffAdapter implements DiffPort {
     private static final long MAX_FILE_BYTES = 2_000_000;
     private static final int MAX_ENTRIES = 1_000;
+    private static final int MAX_PATCH_LINES = 2_000;
+    private static final int MAX_LCS_LINES = 1_000;
 
     @Override
     public List<DiffEntry> compare(Snapshot base, Path workspace) {
-        Map<String, byte[]> before = files(base.materializedPath());
-        Map<String, byte[]> after = files(workspace);
+        Map<String, Path> before = files(base.materializedPath());
+        Map<String, Path> after = files(workspace);
         Set<String> paths = new HashSet<>(before.keySet());
         paths.addAll(after.keySet());
         List<DiffEntry> result = new ArrayList<>();
         for (String path : paths.stream().sorted().toList()) {
-            byte[] oldBytes = before.get(path);
-            byte[] newBytes = after.get(path);
+            Path oldFile = before.get(path);
+            Path newFile = after.get(path);
+            if (sameContent(oldFile, newFile)) continue;
+            DiffEntry.Change change = oldFile == null ? DiffEntry.Change.ADDED
+                    : newFile == null ? DiffEntry.Change.DELETED : DiffEntry.Change.MODIFIED;
+            BoundedRead oldRead = readBounded(oldFile);
+            BoundedRead newRead = readBounded(newFile);
+            long oldSize = oldRead.size();
+            long newSize = newRead.size();
+            if (oldRead.exceeded() || newRead.exceeded()) {
+                result.add(new DiffEntry(path, change, oldSize, newSize, true,
+                        0, 0, "File differs but exceeds the 2 MB preview limit"));
+                if (result.size() >= MAX_ENTRIES) break;
+                continue;
+            }
+            if (oldRead.unstable() || newRead.unstable()) {
+                result.add(new DiffEntry(path, change, oldSize, newSize, true,
+                        0, 0, "File changed while being read; preview is unavailable"));
+                if (result.size() >= MAX_ENTRIES) break;
+                continue;
+            }
+            byte[] oldBytes = oldRead.bytes();
+            byte[] newBytes = newRead.bytes();
             if (Arrays.equals(oldBytes, newBytes)) continue;
-            DiffEntry.Change change = oldBytes == null ? DiffEntry.Change.ADDED
-                    : newBytes == null ? DiffEntry.Change.DELETED : DiffEntry.Change.MODIFIED;
             boolean binary = !validText(oldBytes) || !validText(newBytes);
             TextDiff textDiff = binary ? new TextDiff(0, 0, "Binary files differ") : textDiff(oldBytes, newBytes, change);
-            result.add(new DiffEntry(path, change, size(oldBytes), size(newBytes), binary,
+            result.add(new DiffEntry(path, change, oldSize, newSize, binary,
                     textDiff.additions(), textDiff.deletions(), textDiff.patch()));
             if (result.size() >= MAX_ENTRIES) break;
         }
         return List.copyOf(result);
     }
 
-    private Map<String, byte[]> files(Path root) {
-        Map<String, byte[]> result = new HashMap<>();
+    private Map<String, Path> files(Path root) {
+        Map<String, Path> result = new HashMap<>();
         try {
             if (root == null || !Files.isDirectory(root)) {
                 throw new DomainException("DIFF_WORKSPACE_MISSING", "Diff workspace does not exist: " + root);
@@ -74,10 +96,7 @@ public class LocalDiffAdapter implements DiffPort {
                 public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
                     String relative = root.relativize(file).toString().replace('\\', '/');
                     if (isProtected(relative) || Files.isSymbolicLink(file)) return FileVisitResult.CONTINUE;
-                    if (Files.size(file) > MAX_FILE_BYTES) {
-                        throw new DomainException("DIFF_FILE_TOO_LARGE", "Diff file exceeds safe preview limit: " + relative);
-                    }
-                    result.put(relative, Files.readAllBytes(file));
+                    result.put(relative, file);
                     return FileVisitResult.CONTINUE;
                 }
             });
@@ -90,7 +109,9 @@ public class LocalDiffAdapter implements DiffPort {
     private boolean isProtected(String relative) {
         String[] parts = relative.replace('\\', '/').toLowerCase(Locale.ROOT).split("/");
         for (String part : parts) {
-            if (part.equals(".git") || part.equals(".pico")) return true;
+            if (part.equals(".git") || part.equals(".pico") || part.equals("node_modules")
+                    || part.equals("target") || part.equals("build") || part.equals("dist")
+                    || part.equals(".idea") || part.equals(".vscode")) return true;
         }
         String file = parts.length == 0 ? relative : parts[parts.length - 1];
         return file.equals(".env") || file.startsWith(".env.");
@@ -116,27 +137,64 @@ public class LocalDiffAdapter implements DiffPort {
         }
     }
 
-    private long size(byte[] bytes) {
-        return bytes == null ? 0 : bytes.length;
+    private boolean sameContent(Path oldFile, Path newFile) {
+        if (oldFile == null || newFile == null) return false;
+        try {
+            return Files.size(oldFile) == Files.size(newFile) && Files.mismatch(oldFile, newFile) == -1;
+        } catch (IOException error) {
+            throw new DomainException("DIFF_READ_FAILED", "Unable to compare workspace files");
+        }
+    }
+
+    private BoundedRead readBounded(Path file) {
+        if (file == null) return new BoundedRead(null, 0, false, false);
+        try {
+            BasicFileAttributes before = Files.readAttributes(file, BasicFileAttributes.class,
+                    LinkOption.NOFOLLOW_LINKS);
+            if (before.isSymbolicLink()) {
+                throw new DomainException("DIFF_SYMLINK_BLOCKED", "Symlink file in experiment workspace");
+            }
+            if (before.size() > MAX_FILE_BYTES) {
+                return new BoundedRead(null, before.size(), true, false);
+            }
+            byte[] bytes;
+            try (InputStream input = Files.newInputStream(file, LinkOption.NOFOLLOW_LINKS)) {
+                bytes = input.readNBytes((int) MAX_FILE_BYTES + 1);
+            }
+            BasicFileAttributes after = Files.readAttributes(file, BasicFileAttributes.class,
+                    LinkOption.NOFOLLOW_LINKS);
+            boolean exceeded = bytes.length > MAX_FILE_BYTES || after.size() > MAX_FILE_BYTES;
+            boolean unstable = before.size() != after.size()
+                    || !before.lastModifiedTime().equals(after.lastModifiedTime())
+                    || !java.util.Objects.equals(before.fileKey(), after.fileKey())
+                    || bytes.length != after.size();
+            return new BoundedRead(exceeded || unstable ? null : bytes, after.size(), exceeded, unstable);
+        } catch (IOException error) {
+            throw new DomainException("DIFF_READ_FAILED", "Unable to read workspace file");
+        }
     }
 
     private TextDiff textDiff(byte[] oldBytes, byte[] newBytes, DiffEntry.Change change) {
         try {
-            List<String> oldLines = lines(oldBytes);
-            List<String> newLines = lines(newBytes);
-            if (change == DiffEntry.Change.ADDED) return new TextDiff(newLines.size(), 0, patch(List.of(), newLines));
-            if (change == DiffEntry.Change.DELETED) return new TextDiff(0, oldLines.size(), patch(oldLines, List.of()));
-            return modifiedDiff(oldLines, newLines);
+            ParsedLines oldLines = lines(oldBytes);
+            ParsedLines newLines = lines(newBytes);
+            if (change == DiffEntry.Change.ADDED) {
+                return new TextDiff(newLines.count(), 0, patch(oldLines, newLines));
+            }
+            if (change == DiffEntry.Change.DELETED) {
+                return new TextDiff(0, oldLines.count(), patch(oldLines, newLines));
+            }
+            long cells = (long) oldLines.count() * newLines.count();
+            if (oldLines.count() > MAX_LCS_LINES || newLines.count() > MAX_LCS_LINES || cells > 1_000_000L) {
+                return new TextDiff(newLines.count(), oldLines.count(), patch(oldLines, newLines));
+            }
+            return modifiedDiff(oldLines.preview(), newLines.preview());
         } catch (CharacterCodingException error) {
             return new TextDiff(0, 0, "Binary or invalid UTF-8 files differ");
         }
     }
 
     private TextDiff modifiedDiff(List<String> oldLines, List<String> newLines) {
-        long cells = (long) oldLines.size() * newLines.size();
-        if (cells > 1_000_000L) {
-            return new TextDiff(newLines.size(), oldLines.size(), patch(oldLines, newLines));
-        }
         int[][] lcs = new int[oldLines.size() + 1][newLines.size() + 1];
         for (int oldIndex = oldLines.size() - 1; oldIndex >= 0; oldIndex--) {
             for (int newIndex = newLines.size() - 1; newIndex >= 0; newIndex--) {
@@ -167,32 +225,76 @@ public class LocalDiffAdapter implements DiffPort {
         return new TextDiff(additions, deletions, formatPatch(patchLines));
     }
 
-    private List<String> lines(byte[] bytes) throws CharacterCodingException {
-        if (bytes == null || bytes.length == 0) return List.of();
+    private ParsedLines lines(byte[] bytes) throws CharacterCodingException {
+        if (bytes == null || bytes.length == 0) return new ParsedLines(0, List.of());
         String value = StandardCharsets.UTF_8.newDecoder()
                 .onMalformedInput(CodingErrorAction.REPORT)
                 .onUnmappableCharacter(CodingErrorAction.REPORT)
                 .decode(ByteBuffer.wrap(bytes)).toString();
-        String[] split = value.split("\\R", -1);
-        if (split.length > 1 && split[split.length - 1].isEmpty()) split = java.util.Arrays.copyOf(split, split.length - 1);
-        return List.of(split);
+        List<String> preview = new ArrayList<>(Math.min(MAX_PATCH_LINES, value.length()));
+        int count = 0;
+        int lineStart = 0;
+        int index = 0;
+        while (index < value.length()) {
+            int separatorLength = lineSeparatorLength(value, index);
+            if (separatorLength == 0) {
+                index++;
+                continue;
+            }
+            if (preview.size() < MAX_PATCH_LINES) preview.add(value.substring(lineStart, index));
+            count++;
+            index += separatorLength;
+            lineStart = index;
+        }
+        if (lineStart < value.length()) {
+            if (preview.size() < MAX_PATCH_LINES) preview.add(value.substring(lineStart));
+            count++;
+        }
+        return new ParsedLines(count, List.copyOf(preview));
     }
 
-    private String patch(List<String> oldLines, List<String> newLines) {
-        List<String> lines = new ArrayList<>();
-        oldLines.forEach(line -> lines.add("-" + line));
-        newLines.forEach(line -> lines.add("+" + line));
-        return formatPatch(lines);
+    private int lineSeparatorLength(String value, int index) {
+        char current = value.charAt(index);
+        if (current == '\r') {
+            return index + 1 < value.length() && value.charAt(index + 1) == '\n' ? 2 : 1;
+        }
+        return current == '\n' || current == '\u000B' || current == '\f' || current == '\u0085'
+                || current == '\u2028' || current == '\u2029' ? 1 : 0;
+    }
+
+    private String patch(ParsedLines oldLines, ParsedLines newLines) {
+        StringBuilder patch = new StringBuilder("--- base\n+++ result\n@@\n");
+        int emitted = 0;
+        for (String line : oldLines.preview()) {
+            if (emitted >= MAX_PATCH_LINES) break;
+            patch.append('-').append(line).append('\n');
+            emitted++;
+        }
+        for (String line : newLines.preview()) {
+            if (emitted >= MAX_PATCH_LINES) break;
+            patch.append('+').append(line).append('\n');
+            emitted++;
+        }
+        if ((long) oldLines.count() + newLines.count() > emitted) {
+            patch.append("... [diff truncated]\n");
+        }
+        return patch.toString();
     }
 
     private String formatPatch(List<String> lines) {
         StringBuilder patch = new StringBuilder("--- base\n+++ result\n@@\n");
-        int limit = Math.min(lines.size(), 2000);
+        int limit = Math.min(lines.size(), MAX_PATCH_LINES);
         for (int index = 0; index < limit; index++) patch.append(lines.get(index)).append('\n');
         if (limit < lines.size()) patch.append("... [diff truncated]\n");
         return patch.toString();
     }
 
     private record TextDiff(int additions, int deletions, String patch) {
+    }
+
+    private record ParsedLines(int count, List<String> preview) {
+    }
+
+    private record BoundedRead(byte[] bytes, long size, boolean exceeded, boolean unstable) {
     }
 }

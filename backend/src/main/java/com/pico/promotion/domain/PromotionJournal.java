@@ -115,4 +115,21 @@ public record PromotionJournal(
                 phase, Objects.requireNonNull(newOwnerId, "newOwnerId"),
                 newLeaseUntil, createdAt, now, resultingFingerprint, failureReason, version + 1);
     }
+
+    /**
+     * Closes a manually inspected recovery journal without reusing the expired
+     * worker lease. The caller must independently prove canonical state first.
+     */
+    public PromotionJournal reconciled(PromotionPhase outcome,
+                                       Instant now,
+                                       String result,
+                                       String failure) {
+        if (phase != PromotionPhase.RECOVERY_REQUIRED
+                || (outcome != PromotionPhase.COMMITTED && outcome != PromotionPhase.ABORTED)) {
+            throw new IllegalStateException("Recovery journal can only reconcile to COMMITTED or ABORTED");
+        }
+        return new PromotionJournal(promotionId, experimentId, projectId, baseFingerprint,
+                candidateFingerprint, candidatePath, touchedFiles, preimageHashes, postimageHashes,
+                outcome, ownerId, leaseUntil, createdAt, now, result, failure, version + 1);
+    }
 }

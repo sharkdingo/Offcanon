@@ -1,6 +1,7 @@
 package com.pico.web;
 
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
 
 import java.time.Instant;
 import java.util.List;
@@ -11,18 +12,20 @@ public final class ApiDtos {
     }
 
     public record CreateProjectRequest(
-            @NotBlank String name,
-            @NotBlank String canonicalPath,
-            List<String> verificationCommands) {
+            @NotBlank @Size(max = 200) String name,
+            @NotBlank @Size(max = 4_096) String canonicalPath,
+            @Size(min = 1, max = 20) List<@NotBlank @Size(max = 1_000) String> verificationCommands) {
         public CreateProjectRequest {
             verificationCommands = verificationCommands == null ? List.of() : List.copyOf(verificationCommands);
         }
     }
 
-    public record CreateExperimentRequest(UUID sessionId, String sessionTitle, @NotBlank String task) {
+    public record CreateExperimentRequest(UUID sessionId,
+                                          @Size(max = 200) String sessionTitle,
+                                          @NotBlank @Size(max = 20_000) String task) {
     }
 
-    public record CreateSessionRequest(@NotBlank String title) {
+    public record CreateSessionRequest(@NotBlank @Size(max = 200) String title) {
     }
 
     public record ProjectResponse(UUID id, String name, String canonicalPath, List<String> verificationCommands, Instant createdAt) {
@@ -82,6 +85,14 @@ public final class ApiDtos {
             boolean conflict,
             String blockingReason,
             boolean promotable) {
+    }
+
+    public record PromotionReconcileResponse(
+            UUID promotionId,
+            String experimentStatus,
+            String journalPhase,
+            String fingerprint,
+            String detail) {
     }
 
     public record DiffEntryResponse(String path,
