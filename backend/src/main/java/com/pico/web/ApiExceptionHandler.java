@@ -2,14 +2,18 @@ package com.pico.web;
 
 import com.pico.shared.domain.DomainException;
 import com.pico.shared.web.NotFoundException;
+import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
+import org.springframework.web.context.request.async.AsyncRequestTimeoutException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.util.Map;
 import java.util.UUID;
 
@@ -41,6 +45,17 @@ public class ApiExceptionHandler {
     @ExceptionHandler(IllegalArgumentException.class)
     public ProblemDetail invalidArgument(IllegalArgumentException error) {
         return problem(HttpStatus.BAD_REQUEST, "INVALID_ARGUMENT", error.getMessage(), Map.of());
+    }
+
+    @ExceptionHandler({AsyncRequestTimeoutException.class, AsyncRequestNotUsableException.class})
+    public void responseStreamEnded() {
+        // The response stream is already unusable, so no error body can be written.
+    }
+
+    @ExceptionHandler(IOException.class)
+    public ProblemDetail io(IOException error, HttpServletResponse response) {
+        if (response.isCommitted()) return null;
+        return unexpected(error);
     }
 
     @ExceptionHandler(Exception.class)

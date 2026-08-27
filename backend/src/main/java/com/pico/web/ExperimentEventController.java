@@ -12,6 +12,8 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.List;
@@ -19,24 +21,30 @@ import java.util.UUID;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 @RestController
 @RequestMapping("/api/experiments")
 public class ExperimentEventController {
+    private static final Logger log = LoggerFactory.getLogger(ExperimentEventController.class);
     private final ExperimentApplicationService experimentService;
     private final EventSink events;
     private final ScheduledExecutorService executor;
     private final long pollIntervalMillis;
+    private final long heartbeatIntervalNanos;
 
     public ExperimentEventController(ExperimentApplicationService experimentService,
                                      EventSink events,
                                      ScheduledExecutorService eventStreamExecutor,
-                                     @Value("${pico.events.poll-interval-ms:500}") long pollIntervalMillis) {
+                                     @Value("${pico.events.poll-interval-ms:500}") long pollIntervalMillis,
+                                     @Value("${pico.events.heartbeat-interval-ms:15000}") long heartbeatIntervalMillis) {
         this.experimentService = experimentService;
         this.events = events;
         this.executor = eventStreamExecutor;
         this.pollIntervalMillis = Math.max(250, pollIntervalMillis);
+        this.heartbeatIntervalNanos = TimeUnit.MILLISECONDS.toNanos(Math.max(1_000, heartbeatIntervalMillis));
     }
 
     @GetMapping(value = "/{experimentId}/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
@@ -44,23 +52,46 @@ public class ExperimentEventController {
                              @RequestParam(defaultValue = "0") long after,
                              @RequestHeader(value = "Last-Event-ID", required = false) String lastEventId) {
         experimentService.get(experimentId);
-        SseEmitter emitter = new SseEmitter(30_000L);
+        SseEmitter emitter = new SseEmitter(0L);
         long reconnectCursor = parseCursor(lastEventId);
         AtomicLong cursor = new AtomicLong(Math.max(0, Math.max(after, reconnectCursor)));
+        AtomicLong lastWrite = new AtomicLong(System.nanoTime());
+        AtomicBoolean terminal = new AtomicBoolean();
+        AtomicReference<ScheduledFuture<?>> pollerRef = new AtomicReference<>();
+        Runnable stopPolling = () -> {
+            terminal.set(true);
+            ScheduledFuture<?> poller = pollerRef.get();
+            if (poller != null) poller.cancel(false);
+        };
         ScheduledFuture<?> poller = executor.scheduleAtFixedRate(() -> {
+            if (terminal.get()) return;
             try {
                 List<RunEvent> pending = events.after(experimentId, cursor.get());
                 for (RunEvent event : pending) {
                     emitter.send(SseEmitter.event().id(Long.toString(event.sequence())).data(event));
                     cursor.set(event.sequence());
+                    lastWrite.set(System.nanoTime());
                 }
-            } catch (IOException | RuntimeException error) {
-                emitter.completeWithError(error);
+                long now = System.nanoTime();
+                if (pending.isEmpty() && now - lastWrite.get() >= heartbeatIntervalNanos) {
+                    emitter.send(SseEmitter.event().comment("keepalive"));
+                    lastWrite.set(now);
+                }
+            } catch (IOException error) {
+                // Spring dispatches the async error; only stop our polling task here.
+                stopPolling.run();
+            } catch (RuntimeException error) {
+                log.warn("Closing event stream for experiment {} after event read failure: {}",
+                        experimentId, error.toString());
+                stopPolling.run();
+                emitter.complete();
             }
         }, 0, pollIntervalMillis, TimeUnit.MILLISECONDS);
-        emitter.onCompletion(() -> poller.cancel(false));
-        emitter.onTimeout(() -> poller.cancel(false));
-        emitter.onError(error -> poller.cancel(false));
+        pollerRef.set(poller);
+        if (terminal.get()) poller.cancel(false);
+        emitter.onCompletion(stopPolling);
+        emitter.onTimeout(stopPolling);
+        emitter.onError(error -> stopPolling.run());
         return emitter;
     }
 

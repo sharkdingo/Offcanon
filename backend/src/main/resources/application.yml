@@ -23,3 +23,4 @@ pico:
   events:
     in-memory-retention: ${PICO_EVENT_RETENTION:2000}
     poll-interval-ms: ${PICO_EVENT_POLL_INTERVAL_MS:500}
+    heartbeat-interval-ms: ${PICO_EVENT_HEARTBEAT_INTERVAL_MS:15000}
