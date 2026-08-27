@@ -81,11 +81,22 @@ public final class Experiment {
     public void markStale(String reason) {
         if (status != ExperimentStatus.READY_TO_RUN
                 && status != ExperimentStatus.AGENT_COMPLETED
-                && status != ExperimentStatus.VERIFIED) {
+                && status != ExperimentStatus.VERIFIED
+                && status != ExperimentStatus.PREPARING_PROMOTION
+                && status != ExperimentStatus.PROMOTING) {
             throw new DomainException("INVALID_STALE_TRANSITION", "Experiment cannot become stale from " + status);
         }
         failureReason = reason;
         status = ExperimentStatus.STALE;
+        version++;
+    }
+
+    public void markRecoveryRequired(String reason) {
+        if (status != ExperimentStatus.PROMOTING) {
+            throw new DomainException("INVALID_RECOVERY_TRANSITION", "Recovery is only required during promotion");
+        }
+        failureReason = Objects.requireNonNull(reason, "reason");
+        status = ExperimentStatus.FAILED;
         version++;
     }
 

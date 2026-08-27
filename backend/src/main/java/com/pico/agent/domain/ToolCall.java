@@ -1,0 +1,12 @@
+package com.pico.agent.domain;
+
+import java.util.Map;
+import java.util.Objects;
+
+public record ToolCall(String id, String name, Map<String, Object> arguments) {
+    public ToolCall {
+        Objects.requireNonNull(id, "id");
+        Objects.requireNonNull(name, "name");
+        arguments = Map.copyOf(arguments);
+    }
+}

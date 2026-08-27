@@ -38,4 +38,29 @@ public final class ApiDtos {
             Instant createdAt,
             long version) {
     }
+
+    public record EvidenceResponse(
+            UUID id,
+            UUID experimentId,
+            UUID snapshotId,
+            String kind,
+            String command,
+            String cwd,
+            int exitCode,
+            String stdout,
+            String stderr,
+            Instant startedAt,
+            Instant completedAt,
+            long durationMillis,
+            boolean timedOut,
+            boolean trusted) {
+    }
+
+    public record PromotionResponse(
+            boolean promoted,
+            String status,
+            String detail,
+            List<String> changedFiles,
+            String fingerprint) {
+    }
 }

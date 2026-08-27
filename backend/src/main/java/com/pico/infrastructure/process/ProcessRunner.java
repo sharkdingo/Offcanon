@@ -7,6 +7,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -17,7 +19,15 @@ public class ProcessRunner {
         Process process = null;
         try {
             ProcessBuilder builder = new ProcessBuilder(command).directory(cwd.toFile());
-            builder.environment().putAll(environment);
+            Map<String, String> safeEnvironment = new HashMap<>(builder.environment());
+            safeEnvironment.keySet().removeIf(name -> {
+                String upper = name.toUpperCase(Locale.ROOT);
+                return upper.contains("API_KEY") || upper.contains("AUTH_TOKEN") || upper.contains("PASSWORD")
+                        || upper.contains("SECRET") || upper.contains("CREDENTIAL");
+            });
+            safeEnvironment.putAll(environment);
+            builder.environment().clear();
+            builder.environment().putAll(safeEnvironment);
             process = builder.start();
 
             CompletableFuture<String> stdout = readAsync(process.getInputStream());
