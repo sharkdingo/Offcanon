@@ -14,6 +14,7 @@ import java.security.MessageDigest;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Base64;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -140,6 +141,7 @@ class AuthApplicationServiceTest {
         assertEquals("https://models.example/v1", status.effectiveEndpoint());
         assertEquals("demo-model", status.effectiveModel());
         assertEquals(1, status.allowedEndpointCount());
+        assertEquals(List.of("https://models.example:443/v1"), status.allowedEndpoints());
     }
 
     @Test

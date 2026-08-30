@@ -94,8 +94,9 @@ class AgentSettingsIntegrationTest {
             return null;
         }).when(executor).execute(any(Runnable.class));
 
+        InMemoryEventSink events = new InMemoryEventSink();
         AgentApplicationService service = new AgentApplicationService(experiments, projects, snapshots, snapshotPort,
-                loop, verification, executor, new InMemoryEventSink(), new InMemorySessionRunLease(), workspaces, settings, null, null);
+                loop, verification, executor, events, new InMemorySessionRunLease(), workspaces, settings, null, null);
 
         service.start(experiment.id());
 
@@ -106,5 +107,17 @@ class AgentSettingsIntegrationTest {
         assertEquals("https://runtime.example/v1", captured.get().modelEndpoint());
         assertEquals("runtime-model", captured.get().modelName());
         assertEquals(ExperimentStatus.VERIFIED, experiments.findById(experiment.id()).orElseThrow().status());
+        var configEvent = events.after(experiment.id(), 0).stream()
+                .filter(event -> event.type().equals("RUN_CONFIGURATION_RESOLVED"))
+                .findFirst().orElseThrow();
+        assertEquals("ACCOUNT_SETTINGS", configEvent.payload().get("source"));
+        assertEquals(7, configEvent.payload().get("maxSteps"));
+        assertEquals(120L, configEvent.payload().get("runTimeoutSeconds"));
+        assertEquals(12_000, configEvent.payload().get("contextLimitChars"));
+        assertEquals("https://runtime.example/v1", configEvent.payload().get("modelEndpoint"));
+        assertEquals("runtime-model", configEvent.payload().get("modelName"));
+        assertEquals("ACCOUNT_SETTINGS", configEvent.payload().get("modelEndpointSource"));
+        assertEquals("ACCOUNT_SETTINGS", configEvent.payload().get("modelNameSource"));
+        assertEquals(true, configEvent.payload().get("effective"));
     }
 }

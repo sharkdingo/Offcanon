@@ -407,7 +407,12 @@ public class ExperimentApplicationService {
 
     private boolean canSettleFailure(ExperimentStatus status) {
         return status == ExperimentStatus.CREATED
-                || status == ExperimentStatus.SNAPSHOTTING;
+                || status == ExperimentStatus.SNAPSHOTTING
+                // The creator still owns the session lease while the final
+                // READY_TO_RUN attachment is being persisted.  If that write
+                // reports an ambiguous failure after committing, leave no
+                // invisible runnable row behind for the next user request.
+                || status == ExperimentStatus.READY_TO_RUN;
     }
 
     private record ContinuationSeed(Snapshot snapshot, boolean temporary) {

@@ -42,7 +42,8 @@ public class SettingsController {
         return new ModelStatusResponse(status.apiKeyConfigured(), status.defaultEndpointConfigured(),
                 status.defaultModelConfigured(), status.effectiveEndpointConfigured(),
                 status.effectiveModelConfigured(), status.effectiveEndpointAllowed(),
-                status.effectiveEndpoint(), status.effectiveModel(), status.allowedEndpointCount());
+                status.effectiveEndpoint(), status.effectiveModel(), status.allowedEndpointCount(),
+                status.allowedEndpoints());
     }
 
     /** Deployment ceilings are safe to show because they contain no secrets. */
@@ -101,7 +102,8 @@ public class SettingsController {
                                       boolean effectiveEndpointAllowed,
                                       String effectiveEndpoint,
                                       String effectiveModel,
-                                      int allowedEndpointCount) {
+                                      int allowedEndpointCount,
+                                      java.util.List<String> allowedEndpoints) {
     }
 
     public record RuntimePolicyResponse(int defaultMaxSteps,

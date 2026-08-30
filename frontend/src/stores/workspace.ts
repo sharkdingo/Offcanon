@@ -9,6 +9,7 @@ import {
   type PromotionOutcome,
   type PromotionPreview,
   type PromotionReconcile,
+  type ProjectPromotionRecovery,
   type Session,
 } from '../api'
 import { localizedText } from '../i18n'
@@ -28,16 +29,19 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   const evidenceError = ref<string | null>(null)
   const diffError = ref<string | null>(null)
   const promotionPreviewError = ref<string | null>(null)
+  const promotionRecoveryError = ref<string | null>(null)
   const error = ref<string | null>(null)
   const evidence = ref<Evidence[]>([])
   const diff = ref<DiffEntry[]>([])
   const promotionOutcome = ref<PromotionOutcome | null>(null)
   const promotionReconcile = ref<PromotionReconcile | null>(null)
   const promotionPreview = ref<PromotionPreview | null>(null)
+  const promotionRecovery = ref<ProjectPromotionRecovery | null>(null)
   let detailRequest = 0
   let detailExperimentId: string | null = null
   let projectRequest = 0
   let projectsRequest = 0
+  let recoveryRequest = 0
   let stateGeneration = 0
 
   function isCurrent(generation: number) {
@@ -102,6 +106,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     promotionOutcome.value = null
     promotionReconcile.value = null
     promotionPreview.value = null
+    promotionRecovery.value = null
+    promotionRecoveryError.value = null
     if (projectChanged) {
       sessions.value = []
       experiments.value = []
@@ -123,6 +129,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         // Do not make a successful project load depend on a diff endpoint.
         void loadExperimentDetails(selectedExperimentId.value)
       }
+      void loadPromotionRecovery(projectId, generation)
     } catch (cause) {
       if (!isCurrent(generation) || requestId !== projectRequest || selectedProjectId.value !== projectId) return
       error.value = cause instanceof Error ? cause.message : localizedText('无法加载实验。', 'Unable to load experiments')
@@ -212,16 +219,34 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     detailLoading.value = false
   }
 
+  async function loadPromotionRecovery(projectId: string, generation = stateGeneration) {
+    const requestId = ++recoveryRequest
+    try {
+      const status = await api.promotionRecovery(projectId)
+      if (!isCurrent(generation) || requestId !== recoveryRequest || selectedProjectId.value !== projectId) return
+      promotionRecovery.value = status
+      promotionRecoveryError.value = null
+    } catch {
+      // Recovery is a write-safety boundary. Keep the project visible, but do
+      // not present an unknown state as if no recovery were pending.
+      if (isCurrent(generation) && requestId === recoveryRequest && selectedProjectId.value === projectId) {
+        promotionRecovery.value = null
+        promotionRecoveryError.value = localizedText('无法确认项目写回状态，请刷新后重试。', 'Unable to confirm project write-back state; refresh and try again.')
+      }
+    }
+  }
+
   async function createProject(body: { name: string; canonicalPath: string; verificationCommands: string[] }) {
     const generation = stateGeneration
-    let project: Project
+    let registration: Awaited<ReturnType<typeof api.createProject>>
     try {
-      project = await api.createProject(body)
+      registration = await api.createProject(body)
     } catch (cause) {
       if (!isCurrent(generation)) return undefined
       throw cause
     }
     if (!isCurrent(generation)) return undefined
+    const project: Project = registration
     const existingIndex = projects.value.findIndex((existing) => existing.id === project.id)
     if (existingIndex >= 0) projects.value[existingIndex] = project
     else projects.value.push(project)
@@ -229,7 +254,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     // asynchronously and should not turn a successful create into an error.
     void selectProject(project.id)
     if (!isCurrent(generation)) return undefined
-    return project
+    return { project, reopened: registration.reopened }
   }
 
   async function updateProject(body: { name: string; canonicalPath: string; verificationCommands: string[] }) {
@@ -390,6 +415,17 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     if (projectId && selectedProjectId.value === projectId) await reloadSelectedProject()
   }
 
+  async function reconcileProjectRecovery() {
+    const generation = stateGeneration
+    const projectId = selectedProjectId.value
+    if (!projectId) return
+    const outcome = await api.reconcileProjectPromotion(projectId)
+    if (!isCurrent(generation) || selectedProjectId.value !== projectId) return
+    promotionReconcile.value = outcome
+    await loadPromotionRecovery(projectId, generation)
+    await reloadSelectedProject()
+  }
+
   async function reloadSelectedProject() {
     if (!selectedProjectId.value) return
     const generation = stateGeneration
@@ -420,6 +456,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       resetDetailState()
       detailLoading.value = false
     }
+    void loadPromotionRecovery(projectId, generation)
   }
 
   function clearSelection() {
@@ -427,6 +464,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     ++projectRequest
     ++detailRequest
     ++projectsRequest
+    ++recoveryRequest
     detailExperimentId = null
     selectedProjectId.value = null
     selectedSessionId.value = null
@@ -436,6 +474,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     resetDetailState()
     promotionOutcome.value = null
     promotionReconcile.value = null
+    promotionRecovery.value = null
+    promotionRecoveryError.value = null
     detailLoading.value = false
     loading.value = false
   }
@@ -501,6 +541,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     promotionOutcome,
     promotionReconcile,
     promotionPreview,
+    promotionRecovery,
+    promotionRecoveryError,
     loadProjects,
     selectProject,
     selectExperiment,
@@ -513,6 +555,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     promoteExperiment,
     confirmExperimentStale,
     reconcilePromotion,
+    reconcileProjectRecovery,
     selectSession,
     reloadSelectedProject,
     clearSelection,

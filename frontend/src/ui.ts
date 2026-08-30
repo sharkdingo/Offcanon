@@ -63,7 +63,12 @@ export function shortFingerprint(value: string | null | undefined) {
 }
 
 export function formatDate(value: string) {
-  return new Intl.DateTimeFormat(undefined, {
+  // Dates are part of the app's language surface, not the browser profile.
+  // Auth settings keep document.lang in sync with the selected locale.
+  const locale = typeof document !== 'undefined' && document.documentElement.lang
+    ? document.documentElement.lang
+    : undefined
+  return new Intl.DateTimeFormat(locale, {
     month: 'short',
     day: 'numeric',
     hour: '2-digit',

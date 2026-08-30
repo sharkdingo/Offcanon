@@ -9,6 +9,7 @@ defineProps<{
   experiment: Experiment
   preview: PromotionPreview
   changedFileCount: number
+  deletedFileCount: number
   busy: boolean
 }>()
 const emit = defineEmits<{ close: []; confirm: [] }>()
@@ -37,7 +38,7 @@ const canConfirm = (preview: PromotionPreview) => !preview.recoveryRequired && (
           ? text('上一笔应用操作尚未完成。请关闭此窗口，在审阅面板中完成恢复。', 'An earlier application is unfinished. Close this dialog and reconcile it in the review panel.')
           : preview.conflict
           ? text('主线已经偏离这个实验的基线。确认后只会保留主线并将实验标记为已过期。', 'Canonical no longer matches this experiment base. Confirming will keep canonical unchanged and mark the experiment out of date.')
-          : text('Offcanon 会先确认主线没有变化，再应用这个已验证的实验结果。', 'Offcanon will confirm canonical has not changed before applying this verified experiment result.') }}
+          : text('Offcanon 会先确认主线没有变化，再把这个已验证结果写回当前项目工作区。不会自动创建 Git 提交。', 'Offcanon will confirm canonical has not changed, then write this verified result to the current project workspace. No Git commit is created automatically.') }}
       </p>
       <div
         class="promotion-route"
@@ -52,7 +53,7 @@ const canConfirm = (preview: PromotionPreview) => !preview.recoveryRequired && (
         <ArrowRight v-else :size="18" />
         <div>
           <span>{{ text('主线', 'Canonical') }}</span>
-          <strong>{{ preview.recoveryRequired ? text('暂不修改', 'no change yet') : preview.conflict ? text('保留当前状态', 'kept unchanged') : `${changedFileCount} ${text('个文件变更', 'changed files')}` }}</strong>
+          <strong>{{ preview.recoveryRequired ? text('暂不修改', 'no change yet') : preview.conflict ? text('保留当前状态', 'kept unchanged') : `${changedFileCount} ${text('个文件变更', 'changed files')}${deletedFileCount ? `（含 ${deletedFileCount} 个删除）` : ''}` }}</strong>
           <code>{{ shortFingerprint(preview.currentFingerprint) }}</code>
         </div>
       </div>
@@ -63,7 +64,7 @@ const canConfirm = (preview: PromotionPreview) => !preview.recoveryRequired && (
           ? text('请先在审阅面板恢复项目状态。', 'Reconcile the project state in the review panel first.')
           : preview.conflict
           ? text('不会覆盖主线中的新改动。', 'New canonical changes will not be overwritten.')
-          : text('该实验结果已通过可信验证。', 'Trusted verification passed for this experiment result.') }}</span>
+          : text('该实验结果已通过验收证据检查；写回后请自行检查并提交 Git。', 'Acceptance evidence passed; inspect the written files and create a Git commit yourself.') }}</span>
       </div>
       <footer class="dialog-actions">
         <button type="button" class="button secondary" @click="emit('close')">{{ text('保持隔离', 'Keep isolated') }}</button>

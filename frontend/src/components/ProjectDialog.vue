@@ -5,7 +5,7 @@ import { api, type DirectoryBrowse, type DirectoryLocation, type Project } from 
 import { useLocale } from '../i18n'
 import BaseDialog from './BaseDialog.vue'
 
-const props = defineProps<{ busy: boolean; project?: Project | null }>()
+const props = defineProps<{ busy: boolean; project?: Project | null; error?: string | null }>()
 const emit = defineEmits<{
   close: []
   submit: [value: { name: string; canonicalPath: string; verificationCommands: string[] }]
@@ -41,8 +41,8 @@ function submit() {
     validationError.value = text('请输入运行 Offcanon 的这台机器上的绝对路径。', 'Use an absolute path on the machine running Offcanon.')
     return
   }
-  if (commands.value.length === 0) {
-    validationError.value = text('至少添加一条可信验证命令。', 'Add at least one trusted verification command.')
+  if (commands.value.length === 0 && props.project) {
+    validationError.value = text('至少添加一条项目验收命令。', 'Add at least one project acceptance command.')
     return
   }
   emit('submit', {
@@ -123,7 +123,7 @@ function isAbsolutePath(value: string) {
         </div>
         <button type="button" class="icon-button" :aria-label="text('关闭对话框', 'Close dialog')" :title="text('关闭', 'Close')" @click="emit('close')"><X :size="17" /></button>
       </header>
-      <p id="project-dialog-description" class="dialog-description">{{ props.project ? text('更新项目名称和项目验收命令；项目根路径保持不变。', 'Update the project name and project acceptance commands; the project root stays fixed.') : text('选择要交给 Offcanon 的本地 Git 项目。', 'Choose the local Git project to open in Offcanon.') }}</p>
+      <p id="project-dialog-description" class="dialog-description">{{ props.project ? text('更新项目名称和项目验收命令；项目根路径保持不变。', 'Update the project name and project acceptance commands; the project root stays fixed.') : text('选择要交给 Offcanon 的本地 Git 项目。若该仓库已在当前账户打开，将沿用已有名称和验收命令。', 'Choose the local Git project to open in Offcanon. If this repository is already open in your account, its existing name and acceptance commands are kept.') }}</p>
       <label for="canonical-path">{{ text('项目目录', 'Project directory') }}</label>
       <div class="path-input-row">
         <input id="canonical-path" v-model="canonicalPath" :readonly="!!props.project" :aria-readonly="props.project ? 'true' : 'false'" :autofocus="!props.project" required autocomplete="off" spellcheck="false" aria-describedby="canonical-path-help" placeholder="D:\code\example" />
@@ -133,7 +133,7 @@ function isAbsolutePath(value: string) {
           {{ text('浏览目录', 'Browse') }}
         </button>
       </div>
-      <p id="canonical-path-help" class="field-help">{{ props.project ? text('已注册项目的根路径不可修改；如需更换仓库，请打开一个新项目。', 'A registered project root cannot be changed; open a new project to use another repository.') : text('选择目录后，Offcanon 会识别 Git 仓库根目录。也可以直接粘贴绝对路径。', 'Offcanon detects the Git repository root after you choose a directory. You can also paste an absolute path.') }}</p>
+      <p id="canonical-path-help" class="field-help">{{ props.project ? text('已注册项目的根路径不可修改；如需更换仓库，请打开一个新项目。路径指向运行 Offcanon 服务的那台机器。', 'A registered project root cannot be changed; open a new project to use another repository. The path is on the machine running the Offcanon service.') : text('选择目录后，Offcanon 会识别 Git 仓库根目录。路径必须位于运行 Offcanon 服务的这台机器，也可以直接粘贴绝对路径。', 'Offcanon detects the Git repository root after you choose a directory. The path must be on the machine running the Offcanon service; you can also paste an absolute path.') }}</p>
       <section v-if="browserOpen" class="directory-picker" :aria-label="text('选择项目目录', 'Choose project directory')">
         <header class="directory-picker-header">
           <div>
@@ -172,9 +172,11 @@ function isAbsolutePath(value: string) {
       <label for="project-name">{{ text('项目名称', 'Project name') }}</label>
       <input id="project-name" v-model="name" :autofocus="!!props.project" required autocomplete="off" :placeholder="text('选择目录后自动填写', 'Filled after choosing a directory')" />
       <label for="verification-commands">{{ text('项目验收命令', 'Project acceptance commands') }} <span>{{ text('每行一条', 'one per line') }}</span></label>
-      <textarea id="verification-commands" v-model="verificationCommandsText" required rows="4" placeholder="mvn test"></textarea>
-      <div class="policy-note"><ShieldCheck :size="15" /><span>{{ text('代理停止编辑后，会在一次性工作区执行；通过结果才可作为应用依据。命令由你负责确认其安全性。', 'Runs in a disposable workspace after the agent stops editing; only passing results can support an application. You are responsible for confirming command safety.') }}</span></div>
+      <textarea id="verification-commands" v-model="verificationCommandsText" :required="!!props.project" rows="4" placeholder="mvn test"></textarea>
+      <p v-if="!props.project" class="field-help">{{ text('新项目至少需要一条；重复打开当前账户中的仓库时可以留空，以沿用已有命令。', 'A new project needs at least one command. Leave this blank only when reopening a repository already in this account, to keep its saved commands.') }}</p>
+      <div class="policy-note"><ShieldCheck :size="15" /><span>{{ text('代理停止编辑后，会在一次性工作区执行；通过结果才可作为应用依据。这里不是操作系统安全沙箱，命令由你负责确认其安全性。', 'Runs in a disposable workspace after the agent stops editing; only passing results can support an application. This is not an operating-system security sandbox; you are responsible for confirming command safety.') }}</span></div>
       <p v-if="validationError" class="field-error" role="alert">{{ validationError }}</p>
+      <p v-else-if="props.error" class="field-error" role="alert">{{ props.error }}</p>
       <footer class="dialog-actions">
         <button type="button" class="button secondary" @click="emit('close')">{{ text('取消', 'Cancel') }}</button>
         <button class="button primary" :disabled="busy">

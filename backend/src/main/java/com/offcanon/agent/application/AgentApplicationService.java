@@ -25,6 +25,7 @@ import com.offcanon.memory.application.TaskMemoryApplicationService;
 import com.offcanon.memory.domain.MemoryPatch;
 import com.offcanon.memory.domain.TaskMemoryKind;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.UUID;
@@ -59,6 +60,11 @@ public class AgentApplicationService {
     private final UserSettingsRepository userSettings;
     private final EvidenceRepository evidenceRepository;
     private final TaskMemoryApplicationService taskMemory;
+    private final int deploymentDefaultMaxSteps;
+    private final long deploymentDefaultRunTimeoutSeconds;
+    private final int deploymentDefaultContextLimitChars;
+    private final String deploymentDefaultModelEndpoint;
+    private final String deploymentDefaultModelName;
     private final ConcurrentHashMap<UUID, AtomicBoolean> cancellations = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<UUID, Future<?>> runs = new ConcurrentHashMap<>();
 
@@ -75,7 +81,12 @@ public class AgentApplicationService {
                                    WorkspacePort workspaces,
                                    UserSettingsRepository userSettings,
                                    EvidenceRepository evidenceRepository,
-                                   TaskMemoryApplicationService taskMemory) {
+                                   TaskMemoryApplicationService taskMemory,
+                                   @Value("${offcanon.agent.max-steps:20}") int deploymentDefaultMaxSteps,
+                                   @Value("${offcanon.agent.run-timeout-seconds:600}") long deploymentDefaultRunTimeoutSeconds,
+                                   @Value("${offcanon.agent.context-limit-chars:80000}") int deploymentDefaultContextLimitChars,
+                                   @Value("${offcanon.model.base-url:}") String deploymentDefaultModelEndpoint,
+                                   @Value("${offcanon.model.name:}") String deploymentDefaultModelName) {
         this.experimentRepository = experimentRepository;
         this.projectRepository = projectRepository;
         this.snapshotRepository = snapshotRepository;
@@ -89,6 +100,33 @@ public class AgentApplicationService {
         this.userSettings = userSettings;
         this.evidenceRepository = evidenceRepository;
         this.taskMemory = taskMemory;
+        this.deploymentDefaultMaxSteps = deploymentDefaultMaxSteps;
+        this.deploymentDefaultRunTimeoutSeconds = deploymentDefaultRunTimeoutSeconds;
+        this.deploymentDefaultContextLimitChars = deploymentDefaultContextLimitChars;
+        this.deploymentDefaultModelEndpoint = deploymentDefaultModelEndpoint == null
+                ? "" : deploymentDefaultModelEndpoint.trim();
+        this.deploymentDefaultModelName = deploymentDefaultModelName == null
+                ? "" : deploymentDefaultModelName.trim();
+    }
+
+    /** Compatibility constructor for embedded callers and focused tests. */
+    public AgentApplicationService(ExperimentRepository experimentRepository,
+                                   ProjectRepository projectRepository,
+                                   SnapshotRepository snapshotRepository,
+                                   SnapshotPort snapshotPort,
+                                   AgentLoopPort agentLoop,
+                                   VerificationPort verification,
+                                   ExecutorService agentExecutor,
+                                   EventSink events,
+                                   SessionRunLeasePort sessionRunLease,
+                                   WorkspacePort workspaces,
+                                   UserSettingsRepository userSettings,
+                                   EvidenceRepository evidenceRepository,
+                                   TaskMemoryApplicationService taskMemory) {
+        this(experimentRepository, projectRepository, snapshotRepository, snapshotPort,
+                agentLoop, verification, agentExecutor, events, sessionRunLease, workspaces,
+                userSettings, evidenceRepository, taskMemory,
+                20, 600, 80_000, "", "");
     }
 
     public Experiment start(UUID experimentId) {
@@ -210,8 +248,14 @@ public class AgentApplicationService {
             Optional<AgentRunSettings> settings = userSettings == null || project == null
                     ? Optional.empty()
                     : userSettings.findByUserId(project.ownerId()).map(AgentRunSettings::from);
-            publishRunConfiguration(experiment, project, settings);
-            AgentRunResult result = agentLoop.run(experiment, runControl, sessionContext(experiment), settings);
+            // Resolve defaults once at the application boundary.  The exact
+            // values written to the audit event must be the values forwarded
+            // to the AgentLoop; otherwise blank account provider fields could
+            // make the audit trail disagree with the request actually sent.
+            AgentRunSettings effectiveSettings = effectiveRunSettings(settings);
+            publishRunConfiguration(experiment, project, settings, effectiveSettings);
+            AgentRunResult result = agentLoop.run(experiment, runControl, sessionContext(experiment),
+                    Optional.of(effectiveSettings));
             lease.assertHeld();
             experiment.markAgentCompleted(result.summary());
             lease.assertHeld();
@@ -540,19 +584,63 @@ public class AgentApplicationService {
      */
     private void publishRunConfiguration(Experiment experiment,
                                          Project project,
-                                         Optional<AgentRunSettings> settings) {
+                                         Optional<AgentRunSettings> settings,
+                                         AgentRunSettings effective) {
         java.util.Map<String, Object> payload = new java.util.LinkedHashMap<>();
-        payload.put("source", settings.isPresent() ? "USER_SETTINGS" : "DEPLOYMENT_DEFAULT");
-        settings.ifPresent(value -> {
-            payload.put("maxSteps", value.maxSteps());
-            payload.put("runTimeoutSeconds", value.runTimeoutSeconds());
-            payload.put("contextLimitChars", value.contextLimitChars());
-            payload.put("modelEndpoint", value.modelEndpoint());
-            payload.put("modelName", value.modelName());
-        });
+        // Record the values the Agent boundary will actually receive.  A
+        // blank account endpoint/model is an intentional request to use the
+        // deployment default; recording the raw blank value made the audit
+        // event look as if the run had no provider configuration at all.
+        payload.put("source", settings.isPresent() ? "ACCOUNT_SETTINGS" : "DEPLOYMENT_DEFAULT");
+        payload.put("maxSteps", effective.maxSteps());
+        payload.put("runTimeoutSeconds", effective.runTimeoutSeconds());
+        payload.put("contextLimitChars", effective.contextLimitChars());
+        payload.put("modelEndpoint", effective.modelEndpoint());
+        payload.put("modelName", effective.modelName());
+        payload.put("modelEndpointSource", hasText(settings, true) ? "ACCOUNT_SETTINGS" : "DEPLOYMENT_DEFAULT");
+        payload.put("modelNameSource", hasText(settings, false) ? "ACCOUNT_SETTINGS" : "DEPLOYMENT_DEFAULT");
+        payload.put("effective", true);
         if (project != null) {
             payload.put("verificationCommands", project.verificationCommands());
         }
         publishBestEffort(experiment.id(), "RUN_CONFIGURATION_RESOLVED", payload);
+    }
+
+    private AgentRunSettings effectiveRunSettings(Optional<AgentRunSettings> settings) {
+        AgentRunSettings requested = settings.orElseGet(() -> new AgentRunSettings(
+                deploymentDefaultMaxSteps,
+                deploymentDefaultRunTimeoutSeconds,
+                deploymentDefaultContextLimitChars,
+                "", ""));
+        String endpoint = firstNonBlank(requested.modelEndpoint(), deploymentDefaultModelEndpoint,
+                environmentModelBaseUrl());
+        String model = firstNonBlank(requested.modelName(), deploymentDefaultModelName,
+                environmentModelName());
+        return new AgentRunSettings(requested.maxSteps(), requested.runTimeoutSeconds(),
+                requested.contextLimitChars(), endpoint == null ? "" : endpoint,
+                model == null ? "" : model);
+    }
+
+    private boolean hasText(Optional<AgentRunSettings> settings, boolean endpoint) {
+        return settings.isPresent() && (endpoint
+                ? settings.get().modelEndpoint() != null && !settings.get().modelEndpoint().isBlank()
+                : settings.get().modelName() != null && !settings.get().modelName().isBlank());
+    }
+
+    private String firstNonBlank(String... values) {
+        for (String value : values) {
+            if (value != null && !value.isBlank()) return value.trim();
+        }
+        return "";
+    }
+
+    private String environmentModelBaseUrl() {
+        String value = System.getenv("OFFCANON_MODEL_BASE_URL");
+        return value == null ? "" : value.trim();
+    }
+
+    private String environmentModelName() {
+        String value = System.getenv("OFFCANON_MODEL_NAME");
+        return value == null ? "" : value.trim();
     }
 }

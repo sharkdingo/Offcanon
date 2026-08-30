@@ -8,6 +8,10 @@ export type Project = {
   createdAt: string
 }
 
+export type ProjectRegistration = Project & {
+  reopened: boolean
+}
+
 export type DirectoryEntry = {
   name: string
   path: string
@@ -174,6 +178,8 @@ export type ModelConfigurationStatus = {
   effectiveEndpoint: string | null
   effectiveModel: string | null
   allowedEndpointCount: number
+  /** Added by newer servers; older local servers may omit the advisory list. */
+  allowedEndpoints?: string[]
 }
 
 export type ModelTestResponse = {
@@ -251,7 +257,7 @@ export const api = {
     return request<DirectoryBrowse>(`/api/local-directories${query}`)
   },
   createProject: (body: { name: string; canonicalPath: string; verificationCommands: string[] }) =>
-    request<Project>('/api/projects', { method: 'POST', body: JSON.stringify(body) }),
+    request<ProjectRegistration>('/api/projects', { method: 'POST', body: JSON.stringify(body) }),
   updateProject: (projectId: string, body: { name: string; canonicalPath: string; verificationCommands: string[] }) =>
     request<Project>(`/api/projects/${projectId}`, { method: 'PUT', body: JSON.stringify(body) }),
   experiments: (projectId: string) => request<Experiment[]>(`/api/projects/${projectId}/experiments`),

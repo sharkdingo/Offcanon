@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { AlertTriangle, ArrowLeft, Check, CircleUserRound, KeyRound, Languages, LoaderCircle, LogOut, Moon, RefreshCw, RotateCcw, Save, ShieldCheck, Sun, SlidersHorizontal } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { api, type ModelConfigurationStatus, type ModelTestResponse, type RuntimeSettingsPolicy, type UserSettings } from '../api'
 import { useAuthStore, type ThemeMode } from '../stores/auth'
 
 const router = useRouter()
+const route = useRoute()
 const auth = useAuthStore()
 const isZh = computed(() => auth.locale === 'zh-CN')
 const initials = computed(() => auth.session?.displayName.slice(0, 2).toUpperCase() ?? 'O')
@@ -197,6 +198,18 @@ function toggleLocale() {
   setLocale(isZh.value ? 'en-US' : 'zh-CN')
 }
 
+function backToWorkspace() {
+  const projectId = typeof route.query.projectId === 'string' ? route.query.projectId : ''
+  const experimentId = typeof route.query.experimentId === 'string' ? route.query.experimentId : ''
+  if (projectId && experimentId) {
+    void router.push({ name: 'experiment', params: { projectId, experimentId } })
+  } else if (projectId) {
+    void router.push({ name: 'project', params: { projectId } })
+  } else {
+    void router.push({ name: 'home' })
+  }
+}
+
 onMounted(() => void load())
 
 onBeforeUnmount(() => {
@@ -213,13 +226,13 @@ onBeforeUnmount(() => {
 <template>
   <div class="settings-shell">
     <header class="settings-topbar">
-      <button class="brand-lockup" :aria-label="isZh ? '打开项目列表' : 'Open project list'" :title="isZh ? '打开项目列表' : 'Open project list'" @click="router.push({ name: 'home' })">
+        <button class="brand-lockup" :aria-label="isZh ? '返回工作区' : 'Back to workspace'" :title="isZh ? '返回工作区' : 'Back to workspace'" @click="backToWorkspace">
         <span class="brand-mark">O</span>
         <span><strong>Offcanon</strong><small>{{ isZh ? '项目列表' : 'project list' }}</small></span>
       </button>
       <div class="settings-topbar-actions">
         <button class="icon-button" :aria-label="isZh ? '切换语言' : 'Switch language'" :title="isZh ? 'English' : '中文'" @click="toggleLocale"><Languages :size="16" /></button>
-        <button class="icon-button" :aria-label="isZh ? '返回项目列表' : 'Back to project list'" :title="isZh ? '返回项目列表' : 'Back to project list'" @click="router.push({ name: 'home' })"><ArrowLeft :size="17" /></button>
+        <button class="icon-button" :aria-label="isZh ? '返回工作区' : 'Back to workspace'" :title="isZh ? '返回工作区' : 'Back to workspace'" @click="backToWorkspace"><ArrowLeft :size="17" /></button>
       </div>
     </header>
 
@@ -277,8 +290,13 @@ onBeforeUnmount(() => {
       <section class="settings-section" aria-labelledby="model-heading">
         <div class="settings-section-heading"><KeyRound :size="17" /><div><h2 id="model-heading">{{ isZh ? '模型连接偏好' : 'Model connection preference' }}</h2><p>{{ isZh ? 'Endpoint 和模型名是账户级选择；API key、allowlist 和请求策略只由服务端管理。' : 'Endpoint and model are account-level choices; the API key, allowlist, and request policy are server-managed.' }}</p></div></div>
         <div class="settings-form-grid model-grid">
-          <label><span>Endpoint</span><input v-model.trim="form.modelEndpoint" type="url" autocomplete="url" placeholder="https://provider.example/v1" /></label>
-          <label><span>Model</span><input v-model.trim="form.modelName" autocomplete="off" placeholder="provider-model-id" maxlength="200" /></label>
+          <label><span>Endpoint <small>{{ isZh ? '模型服务地址' : 'model service address' }}</small></span><input v-model.trim="form.modelEndpoint" type="url" autocomplete="url" placeholder="https://provider.example/v1" /></label>
+          <label><span>Model <small>{{ isZh ? '要使用的模型标识' : 'model identifier to use' }}</small></span><input v-model.trim="form.modelName" autocomplete="off" placeholder="provider-model-id" maxlength="200" /></label>
+        </div>
+        <p class="field-help model-input-help">{{ isZh ? '留空表示使用服务端默认值；自定义地址必须在服务端允许列表中。API key 始终由服务端保管。' : 'Leave a field blank to use the deployment default; a custom endpoint must be on the server allowlist. The API key is always kept by the server.' }}</p>
+        <div v-if="modelStatus?.allowedEndpoints?.length" class="allowed-endpoint-list" :aria-label="isZh ? '服务端允许的模型地址' : 'Server-allowed model endpoints'">
+          <span>{{ isZh ? '允许使用' : 'Allowed' }}</span>
+          <button v-for="endpoint in modelStatus.allowedEndpoints" :key="endpoint" type="button" :title="endpoint" @click="form.modelEndpoint = endpoint">{{ endpoint }}</button>
         </div>
         <dl v-if="modelStatus" class="settings-details model-effective-details">
           <div><dt>{{ isZh ? '当前生效 Endpoint' : 'Effective endpoint' }}</dt><dd><code>{{ modelStatus.effectiveEndpoint || (isZh ? '未配置' : 'Not configured') }}</code></dd></div>

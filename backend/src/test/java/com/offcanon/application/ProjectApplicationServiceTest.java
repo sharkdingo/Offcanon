@@ -69,6 +69,17 @@ class ProjectApplicationServiceTest {
     }
 
     @Test
+    void reportsWhetherRegistrationReopenedAnExistingProject() {
+        Project registered = register("first", repository);
+
+        ProjectApplicationService.RegistrationResult created = service.registerWithOutcome(
+                registered.ownerId(), "duplicate", repository.toString(), List.of());
+
+        assertTrue(created.reopened());
+        assertEquals(registered.id(), created.project().id());
+    }
+
+    @Test
     void updatesMetadataWithoutChangingCanonicalIdentity() {
         Project registered = register("first", repository);
 
@@ -125,7 +136,9 @@ class ProjectApplicationServiceTest {
                 () -> service.register(UUID.randomUUID(), "duplicate", repository.toString(), List.of("mvn test")));
 
         assertEquals("PROJECT_ALREADY_REGISTERED", error.code());
-        assertTrue(error.getMessage().contains(registered.id().toString()));
+        assertTrue(error.getMessage().contains("another account"));
+        assertTrue(!error.getMessage().contains(registered.id().toString()));
+        assertTrue(!error.getMessage().contains(repository.toString()));
         assertEquals(1, projects.findAll().size());
     }
 

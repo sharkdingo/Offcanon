@@ -9,6 +9,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -26,6 +27,7 @@ import static com.offcanon.web.ApiDtos.CreateProjectRequest;
 import static com.offcanon.web.ApiDtos.UpdateProjectRequest;
 import static com.offcanon.web.ApiDtos.ExperimentResponse;
 import static com.offcanon.web.ApiDtos.ProjectResponse;
+import static com.offcanon.web.ApiDtos.ProjectRegistrationResponse;
 import static com.offcanon.web.ApiDtos.SessionResponse;
 import static com.offcanon.web.ApiDtos.CreateSessionRequest;
 
@@ -51,10 +53,16 @@ public class ProjectController {
     }
 
     @PostMapping
-    @ResponseStatus(HttpStatus.CREATED)
-    public ProjectResponse createProject(@Valid @RequestBody CreateProjectRequest request,
-                                         HttpServletRequest httpRequest) {
-        return toResponse(projectService.register(identity.ownerId(httpRequest), request.name(), request.canonicalPath(), request.verificationCommands()));
+    public ResponseEntity<ProjectRegistrationResponse> createProject(
+            @Valid @RequestBody CreateProjectRequest request,
+            HttpServletRequest httpRequest) {
+        var result = projectService.registerWithOutcome(identity.ownerId(httpRequest), request.name(),
+                request.canonicalPath(), request.verificationCommands());
+        Project project = result.project();
+        var response = new ProjectRegistrationResponse(project.id(), project.name(),
+                project.canonicalPath().toString(), project.verificationCommands(),
+                project.createdAt(), result.reopened());
+        return ResponseEntity.status(result.reopened() ? HttpStatus.OK : HttpStatus.CREATED).body(response);
     }
 
     @PutMapping("/{projectId}")

@@ -14,7 +14,10 @@ public final class ApiDtos {
     public record CreateProjectRequest(
             @NotBlank @Size(max = 200) String name,
             @NotBlank @Size(max = 4_096) String canonicalPath,
-            @Size(min = 1, max = 20) List<@NotBlank @Size(max = 1_000) String> verificationCommands) {
+            // The application service validates the non-empty policy for a
+            // genuinely new project. A repeated open may intentionally omit
+            // commands because the existing project's policy is retained.
+            @Size(max = 20) List<@NotBlank @Size(max = 1_000) String> verificationCommands) {
         public CreateProjectRequest {
             verificationCommands = verificationCommands == null ? List.of() : List.copyOf(verificationCommands);
         }
@@ -41,6 +44,14 @@ public final class ApiDtos {
     }
 
     public record ProjectResponse(UUID id, String name, String canonicalPath, List<String> verificationCommands, Instant createdAt) {
+    }
+
+    public record ProjectRegistrationResponse(UUID id,
+                                              String name,
+                                              String canonicalPath,
+                                              List<String> verificationCommands,
+                                              Instant createdAt,
+                                              boolean reopened) {
     }
 
     public record DirectoryBrowseResponse(String path,

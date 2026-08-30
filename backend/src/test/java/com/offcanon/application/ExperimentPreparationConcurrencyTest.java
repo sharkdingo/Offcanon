@@ -153,6 +153,31 @@ class ExperimentPreparationConcurrencyTest {
     }
 
     @Test
+    void ambiguousReadyToRunSaveSettlesTheGhostBeforeReleasingCreatorLease() {
+        FailingFinalSaveRepository repository = new FailingFinalSaveRepository(FailureMode.AFTER_COMMIT_READY_TO_RUN);
+        Fixture fixture = fixture(repository);
+        Snapshot snapshot = fixture.snapshot("ambiguous-ready");
+        Path workspace = temp.resolve("ambiguous-ready-workspace");
+        SnapshotPort snapshotPort = mock(SnapshotPort.class);
+        when(snapshotPort.capture(fixture.project)).thenReturn(snapshot);
+        WorkspacePort workspaces = mock(WorkspacePort.class);
+        when(workspaces.materialize(eq(snapshot), any(UUID.class))).thenReturn(workspace);
+        ExperimentApplicationService service = fixture.service(snapshotPort, workspaces);
+
+        assertThrows(IllegalStateException.class, () -> service.create(
+                fixture.owner, fixture.project.id(), fixture.session.id(), null, "ambiguous ready state"));
+
+        Experiment failed = repository.findByProjectId(fixture.project.id()).getFirst();
+        assertEquals(ExperimentStatus.FAILED, failed.status());
+        // The ambiguous write may already have durably attached the workspace
+        // and snapshot.  Keep those artifacts so a continuation can salvage
+        // the draft; the lifecycle row is no longer runnable.
+        verify(workspaces, never()).discard(workspace);
+        verify(snapshotPort, never()).discard(snapshot);
+        assertTrue(!repository.hasRunningExperiment(fixture.session.id()));
+    }
+
+    @Test
     void snapshotCaptureRunsInsideTheProjectPromotionLock() {
         Fixture fixture = fixture(new InMemoryExperimentRepository());
         Snapshot snapshot = fixture.snapshot("locked-capture");
@@ -206,7 +231,8 @@ class ExperimentPreparationConcurrencyTest {
 
     private enum FailureMode {
         BEFORE_COMMIT,
-        AFTER_COMMIT_AND_START
+        AFTER_COMMIT_AND_START,
+        AFTER_COMMIT_READY_TO_RUN
     }
 
     private static final class FailingFinalSaveRepository implements ExperimentRepository {
@@ -225,6 +251,9 @@ class ExperimentPreparationConcurrencyTest {
                     throw new IllegalStateException("final save rejected");
                 }
                 delegate.save(experiment);
+                if (mode == FailureMode.AFTER_COMMIT_READY_TO_RUN) {
+                    throw new IllegalStateException("ready state save outcome was ambiguous");
+                }
                 Experiment running = delegate.findById(experiment.id()).orElseThrow();
                 running.start();
                 delegate.save(running);

@@ -51,6 +51,7 @@ const props = defineProps<{
   evidenceError: string | null
   diffError: string | null
   promotionPreviewError: string | null
+  promotionRecoveryError: string | null
 }>()
 const emit = defineEmits<{
   back: []
@@ -58,6 +59,10 @@ const emit = defineEmits<{
   cancel: []
   promote: []
   reconcile: []
+  openSettings: []
+  retry: []
+  reconnect: []
+  continueTask: []
 }>()
 const { text } = useLocale()
 const MAX_DEBUG_EVENT_CHARS = 20_000
@@ -86,6 +91,26 @@ const trustedPromotionEvidence = computed(() => promotionVerificationEvidence.va
 const failedPromotionEvidence = computed(() => promotionVerificationEvidence.value.filter((item) => !item.trusted && !isIntegrityFailure(item)))
 const invalidatedEvidence = computed(() => props.evidence.filter(isIntegrityFailure))
 const observations = computed(() => props.evidence.filter((item) => item.kind === 'AGENT_COMMAND'))
+const resolvedRunConfiguration = computed(() => {
+  const event = [...props.activity].reverse().find((item) => item.type === 'RUN_CONFIGURATION_RESOLVED')
+  if (!event) return null
+  const payload = event.payload
+  const numberValue = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? value : null
+  const textValue = (value: unknown) => typeof value === 'string' && value.trim() ? value : null
+  const commands = Array.isArray(payload.verificationCommands)
+    ? payload.verificationCommands.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    : []
+  return {
+    endpoint: textValue(payload.modelEndpoint),
+    model: textValue(payload.modelName),
+    maxSteps: numberValue(payload.maxSteps),
+    timeoutSeconds: numberValue(payload.runTimeoutSeconds),
+    contextLimit: numberValue(payload.contextLimitChars),
+    endpointSource: textValue(payload.modelEndpointSource),
+    modelSource: textValue(payload.modelNameSource),
+    commands,
+  }
+})
 const passedTrustedEvidence = computed(() => trustedEvidence.value.filter(evidencePassed))
 const passedPromotionEvidence = computed(() => trustedPromotionEvidence.value.filter(evidencePassed))
 const totalAdditions = computed(() => props.diff.reduce((sum, item) => sum + item.additions, 0))
@@ -99,14 +124,14 @@ const recoveryRequired = computed(() => props.promotionPreview?.recoveryRequired
   || props.experiment?.status === 'RECOVERY_REQUIRED')
 const promotionOutcomeDetail = computed(() => props.promotionOutcome?.status.startsWith('STALE')
   ? text(
-      '主线已保留当前改动，这个实验没有写入真实项目。请在下方继续当前任务。',
-      'Canonical kept its current changes and this experiment did not modify your project. Continue this task below.',
+      '主线已保留当前改动，这个实验没有写入真实项目。关闭审阅后可在任务输入框继续。',
+      'Canonical kept its current changes and this experiment did not modify your project. Close the review, then continue in the task composer.',
     )
   : props.promotionOutcome?.detail)
 type FailurePresentation = { title: string; detail: string }
 
 function failureCode(reason: string) {
-  return reason.match(/^\s*([A-Z][A-Z0-9_]{2,})(?=\s*:|\s|$)/)?.[1] ?? null
+  return reason.match(/^\s*([A-Z][A-Z0-9_]{2,})(?=\s*:|\s|$)/)?.[1] ?? ''
 }
 
 const failurePresentation = computed<FailurePresentation | null>(() => {
@@ -115,12 +140,30 @@ const failurePresentation = computed<FailurePresentation | null>(() => {
   if (!experiment || !['FAILED', 'REJECTED'].includes(experiment.status)) return null
 
   const code = failureCode(reason)
+  if (code === 'MODEL_NOT_CONFIGURED') {
+    return {
+      title: text('尚未配置模型服务', 'Model service is not configured'),
+      detail: text(
+        '本次实验没有修改真实项目。请先在设置中配置并测试模型连接，再返回这里重试。',
+        'This experiment did not modify your canonical project. Configure and test the model connection in Settings, then return here and retry.',
+      ),
+    }
+  }
+  if (code === 'MODEL_ENDPOINT_NOT_ALLOWED' || code === 'MODEL_ENDPOINT_INVALID' || code === 'MODEL_REQUEST_FAILED') {
+    return {
+      title: text('模型连接设置不可用', 'Model connection settings are not usable'),
+      detail: text(
+        '真实项目未被修改。请在设置中检查 Endpoint、模型名和服务端 API key 状态，并先运行连接测试。',
+        'Your canonical project was not modified. Check the endpoint, model, and server API key status in Settings, then run the connection test.',
+      ),
+    }
+  }
   if (code === 'MODEL_TRANSIENT_FAILURE') {
     return {
       title: text('模型服务暂时不可用', 'Model service temporarily unavailable'),
       detail: text(
-        '本次实验未完成，真实项目未被修改。请在下方继续当前任务并稍后重试；如果问题持续，请检查设置中的模型连接。',
-        'This experiment did not finish, and your canonical project was not modified. Continue this task below and retry later; if it persists, check the model connection in Settings.',
+        '本次实验未完成，真实项目未被修改。可以再次运行；如果问题持续，请检查设置中的模型连接。',
+        'This experiment did not finish, and your canonical project was not modified. Retry the run; if it persists, check the model connection in Settings.',
       ),
     }
   }
@@ -128,8 +171,8 @@ const failurePresentation = computed<FailurePresentation | null>(() => {
     return {
       title: text('实验运行未完成', 'Experiment did not finish'),
       detail: text(
-        '实验运行达到限制，真实项目未被修改。可以缩小任务范围后在下方继续当前任务，或查看“活动”记录。',
-        'The experiment reached its run limit, and your canonical project was not modified. Continue this task below with a smaller scope, or inspect Activity for details.',
+        '实验运行达到限制，真实项目未被修改。可以再次运行，或关闭审阅后在任务输入框缩小范围。',
+        'The experiment reached its run limit, and your canonical project was not modified. Retry, or close the review and narrow the request in the task composer.',
       ),
     }
   }
@@ -137,8 +180,8 @@ const failurePresentation = computed<FailurePresentation | null>(() => {
     return {
       title: text('实验未能完成', 'Experiment could not complete'),
       detail: text(
-        '运行遇到模型、验证或安全限制，真实项目未被修改。请查看“活动”记录，调整要求后在下方继续当前任务。',
-        'The run hit a model, verification, or safety limitation, and your canonical project was not modified. Inspect Activity, adjust the request, and continue this task below.',
+        '运行遇到模型、验证或安全限制，真实项目未被修改。请查看“活动”记录；关闭审阅后可在任务输入框继续。',
+        'The run hit a model, verification, or safety limitation, and your canonical project was not modified. Inspect Activity; close the review to continue in the task composer.',
       ),
     }
   }
@@ -146,19 +189,30 @@ const failurePresentation = computed<FailurePresentation | null>(() => {
     return {
       title: text('结果未应用到项目', 'Result was not applied'),
       detail: text(
-        '本次结果没有进入项目主线，真实项目未被修改。请检查审阅信息，然后在下方继续当前任务进行修复。',
-        'This result did not reach the project canonical, so your project was not modified. Review the recorded result, then continue this task below to fix it.',
+        '本次结果没有进入项目主线，真实项目未被修改。检查审阅信息后，关闭审阅并在任务输入框继续修复。',
+        'This result did not reach the project canonical, so your project was not modified. Review the result, then close this panel and continue in the task composer.',
       ),
     }
   }
   return {
     title: text('实验未完成', 'Experiment did not complete'),
     detail: text(
-      '本次实验未能完成，真实项目未被修改。请查看“活动”记录了解经过，或在下方继续当前任务重试。',
-      'This experiment did not complete, and your canonical project was not modified. Inspect Activity for what happened, or continue this task below to retry.',
+      '本次实验未能完成，真实项目未被修改。请查看“活动”记录；关闭审阅后可在任务输入框继续。',
+      'This experiment did not complete, and your canonical project was not modified. Inspect Activity; close the review to continue in the task composer.',
     ),
   }
 })
+
+const failureRetryable = computed(() => {
+  const code = failureCode(props.experiment?.failureReason?.trim() ?? '')
+  return ['MODEL_TRANSIENT_FAILURE', 'AGENT_TIMEOUT', 'MAX_STEPS_EXCEEDED', 'TOOL_CALL_LIMIT_EXCEEDED'].includes(code)
+})
+const failureNeedsSettings = computed(() => [
+  'MODEL_NOT_CONFIGURED',
+  'MODEL_ENDPOINT_NOT_ALLOWED',
+  'MODEL_ENDPOINT_INVALID',
+  'MODEL_REQUEST_FAILED',
+].includes(failureCode(props.experiment?.failureReason?.trim() ?? '')))
 
 function applicationCondition(reason: string | null) {
   const normalized = reason?.trim().toLowerCase() ?? ''
@@ -192,6 +246,7 @@ function applicationCondition(reason: string | null) {
 const applicationConditionText = computed(() => {
   const preview = props.promotionPreview
   if (!preview) return null
+  if (props.promotionRecoveryError) return props.promotionRecoveryError
   if (recoveryRequired.value) {
     return text('请先恢复项目中的未完成应用操作', 'Reconcile the unresolved project application first')
   }
@@ -342,7 +397,7 @@ function activateWithKeyboard(event: KeyboardEvent, index: number) {
           <span v-else-if="experiment.status === 'VERIFIED'">{{ text(`应用前请审阅 ${diff.length} 个变更文件和 ${trustedEvidence.length} 条可信检查。`, `Review ${diff.length} changed files and ${trustedEvidence.length} trusted checks before applying.`) }}</span>
           <span v-else-if="experiment.status === 'PROMOTED'">{{ text('本次审阅包含应用回执。', 'An application receipt is available in this review.') }}</span>
           <span v-else-if="experiment.status === 'RECOVERY_REQUIRED'">{{ text('检查记录状态，然后执行受保护的恢复操作。', 'Inspect the recorded state, then run the guarded reconciliation.') }}</span>
-          <span v-else-if="experiment.status === 'STALE'">{{ text('真实项目未被这个实验修改；请在下方基于最新主线继续当前任务。', 'This experiment did not modify your project; continue this task below from the latest canonical state.') }}</span>
+          <span v-else-if="experiment.status === 'STALE'">{{ text('真实项目未被这个实验修改；关闭审阅后可基于最新主线继续。', 'This experiment did not modify your project; close the review to continue from the latest canonical state.') }}</span>
           <span v-else-if="experiment.status === 'CREATED' || experiment.status === 'SNAPSHOTTING'">{{ text('正在创建隔离工作区，主线仍受到保护。', 'The isolated workspace is being created; canonical remains protected.') }}</span>
           <span v-else-if="experiment.status === 'AGENT_COMPLETED'">{{ text('正在锁定实验结果，然后开始可信验证。', 'The experiment result is being sealed before trusted verification starts.') }}</span>
           <span v-else-if="experiment.status === 'PREPARING_PROMOTION'">{{ text('主线仍受到保护，正在准备受保护的应用。', 'Canonical remains protected while the guarded application is prepared.') }}</span>
@@ -352,13 +407,16 @@ function activateWithKeyboard(event: KeyboardEvent, index: number) {
         </div>
         <div class="decision-actions">
           <button v-if="experiment.status === 'READY_TO_RUN'" class="button primary" :disabled="actionBusy" @click="emit('start')"><LoaderCircle :class="{ spin: actionBusy }" :size="16" /> {{ text('启动代理', 'Start agent') }}</button>
-           <button v-if="experiment.status === 'VERIFIED'" class="button" :class="canonicalChanged ? 'warning' : promotionPreview?.promotable ? 'success' : 'secondary'" :disabled="actionBusy || recoveryRequired || !!promotionPreviewError || (!promotionPreview?.promotable && !promotionPreview?.conflict)" @click="emit('promote')">
+           <button v-if="experiment.status === 'VERIFIED'" class="button" :class="canonicalChanged ? 'warning' : promotionPreview?.promotable ? 'success' : 'secondary'" :disabled="actionBusy || recoveryRequired || !!promotionPreviewError || !!promotionRecoveryError || (!promotionPreview?.promotable && !promotionPreview?.conflict)" @click="emit('promote')">
             <AlertTriangle v-if="canonicalChanged" :size="16" />
             <GitCommitHorizontal v-else :size="16" />
             {{ canonicalChanged ? text('处理主线变化', 'Resolve canonical change') : text('审阅并应用', 'Review and apply') }}
           </button>
            <button v-if="recoveryRequired" class="button warning" :disabled="actionBusy" @click="emit('reconcile')"><RotateCcw :class="{ spin: actionBusy }" :size="16" /> {{ text('恢复状态', 'Reconcile state') }}</button>
           <button v-if="canCancel" class="button danger-ghost" :disabled="actionBusy" @click="emit('cancel')"><Ban :size="16" /> {{ text('取消', 'Cancel') }}</button>
+          <button v-if="failureNeedsSettings" class="button secondary" :disabled="actionBusy" @click="emit('openSettings')"><ShieldCheck :size="16" /> {{ text('打开设置', 'Open Settings') }}</button>
+          <button v-else-if="failureRetryable" class="button secondary" :disabled="actionBusy" @click="emit('retry')"><RotateCcw :size="16" /> {{ text('再次运行', 'Retry run') }}</button>
+          <button v-else-if="['FAILED', 'REJECTED', 'STALE', 'CANCELLED'].includes(experiment.status)" class="button secondary" :disabled="actionBusy" @click="emit('continueTask')"><ArrowLeft :size="16" /> {{ text('继续任务', 'Continue task') }}</button>
         </div>
       </div>
 
@@ -396,7 +454,7 @@ function activateWithKeyboard(event: KeyboardEvent, index: number) {
         </div>
         <div v-if="experiment.status === 'PROMOTED'" class="receipt-band">
           <span class="receipt-icon"><ShieldCheck :size="22" /></span>
-          <div><p class="eyebrow">{{ text('应用回执', 'APPLICATION RECEIPT') }}</p><h3>{{ text('实验结果已进入主线', 'Experiment result applied to canonical') }}</h3><span>{{ receiptFiles }} {{ text('个文件已在可信验证后应用。', receiptFiles === 1 ? 'file applied after trusted verification.' : 'files applied after trusted verification.') }}</span></div>
+          <div><p class="eyebrow">{{ text('应用回执', 'APPLICATION RECEIPT') }}</p><h3>{{ text('实验结果已写回当前项目', 'Experiment result written to the current project') }}</h3><span>{{ receiptFiles }} {{ text('个文件已在验收证据通过后写回；不会自动创建 Git 提交。', receiptFiles === 1 ? 'file was written after acceptance evidence passed; no Git commit was created.' : 'files were written after acceptance evidence passed; no Git commit was created.') }}</span></div>
           <dl><div><dt>{{ text('结果', 'Result') }}</dt><dd><code>{{ shortFingerprint(receiptFingerprint) }}</code></dd></div><div><dt>{{ text('快照', 'Snapshot') }}</dt><dd><code>{{ shortId(experiment.resultSnapshotId, 12) }}</code></dd></div></dl>
         </div>
 
@@ -428,6 +486,17 @@ function activateWithKeyboard(event: KeyboardEvent, index: number) {
               <div><dt>{{ text('源完整性失效', 'Integrity failures') }}</dt><dd :class="{ danger: invalidatedEvidence.length > 0 }">{{ invalidatedEvidence.length }}</dd></div>
               <div><dt>{{ text('代理观察', 'Agent observations') }}</dt><dd>{{ observations.length }}</dd></div>
             </dl>
+          </section>
+
+          <section v-if="resolvedRunConfiguration" class="summary-section resolved-config-section">
+            <p class="section-label">{{ text('本次运行采用的配置', 'CONFIGURATION USED FOR THIS RUN') }}</p>
+            <dl class="metric-list resolved-config-list">
+              <div><dt>{{ text('模型服务', 'Model service') }}</dt><dd><code>{{ resolvedRunConfiguration.endpoint ?? text('未配置', 'not configured') }}</code><span v-if="resolvedRunConfiguration.endpointSource">{{ resolvedRunConfiguration.endpointSource === 'ACCOUNT_SETTINGS' ? text('账户设置', 'account settings') : text('服务端默认', 'deployment default') }}</span></dd></div>
+              <div><dt>{{ text('模型', 'Model') }}</dt><dd><code>{{ resolvedRunConfiguration.model ?? text('未配置', 'not configured') }}</code><span v-if="resolvedRunConfiguration.modelSource">{{ resolvedRunConfiguration.modelSource === 'ACCOUNT_SETTINGS' ? text('账户设置', 'account settings') : text('服务端默认', 'deployment default') }}</span></dd></div>
+              <div><dt>{{ text('运行限制', 'Run limits') }}</dt><dd>{{ resolvedRunConfiguration.maxSteps ?? '—' }} {{ text('步', 'steps') }} / {{ resolvedRunConfiguration.timeoutSeconds ?? '—' }} {{ text('秒', 'seconds') }} / {{ resolvedRunConfiguration.contextLimit ?? '—' }} {{ text('字符', 'chars') }}</dd></div>
+              <div class="resolved-config-commands"><dt>{{ text('验收命令', 'Acceptance commands') }}</dt><dd><code v-for="command in resolvedRunConfiguration.commands" :key="command">{{ command }}</code><span v-if="!resolvedRunConfiguration.commands.length">{{ text('未记录', 'not recorded') }}</span></dd></div>
+            </dl>
+            <p class="field-help">{{ text('这组值在运行开始时固定；之后修改账户设置不会改变本次实验。', 'These values were fixed when the run started; later account changes do not alter this experiment.') }}</p>
           </section>
 
           <section class="summary-section change-locations">
@@ -474,7 +543,7 @@ function activateWithKeyboard(event: KeyboardEvent, index: number) {
       </section>
 
       <section v-show="activeTab === 'evidence'" id="review-panel-evidence" class="review-panel" role="tabpanel" aria-labelledby="review-tab-evidence" tabindex="0">
-        <header class="panel-heading"><div><p class="section-label">{{ text('可信验证', 'TRUSTED VERIFICATION') }}</p><h3>{{ detailLoading ? text('正在加载验证记录', 'Loading verification records') : text(`${passedTrustedEvidence.length} / ${experimentVerificationEvidence.length} 条实验检查通过`, `${passedTrustedEvidence.length} of ${experimentVerificationEvidence.length} experiment checks passed`) }}</h3></div><ShieldCheck :class="experimentVerificationEvidence.length > 0 && passedTrustedEvidence.length === experimentVerificationEvidence.length ? 'text-success' : 'text-muted'" :size="22" /></header>
+         <header class="panel-heading"><div><p class="section-label">{{ text('验收证据（非安全沙箱）', 'ACCEPTANCE EVIDENCE (NOT A SANDBOX)') }}</p><h3>{{ detailLoading ? text('正在加载验证记录', 'Loading verification records') : text(`${passedTrustedEvidence.length} / ${experimentVerificationEvidence.length} 条实验检查通过`, `${passedTrustedEvidence.length} of ${experimentVerificationEvidence.length} experiment checks passed`) }}</h3></div><ShieldCheck :class="experimentVerificationEvidence.length > 0 && passedTrustedEvidence.length === experimentVerificationEvidence.length ? 'text-success' : 'text-muted'" :size="22" /></header>
         <div v-if="evidenceError" class="panel-empty detail-error-panel" role="alert"><ShieldAlert :size="24" /><strong>{{ text('无法加载验证记录', 'Unable to load verification records') }}</strong><span>{{ evidenceError }}</span></div>
         <div v-else-if="detailLoading" class="review-loading compact" role="status"><LoaderCircle class="spin" :size="20" /><strong>{{ text('正在加载证据', 'Loading evidence') }}</strong></div>
         <template v-else>
@@ -532,6 +601,14 @@ function activateWithKeyboard(event: KeyboardEvent, index: number) {
       <section v-show="activeTab === 'activity'" id="review-panel-activity" class="review-panel" role="tabpanel" aria-labelledby="review-tab-activity" tabindex="0">
         <header class="panel-heading"><div><p class="section-label">{{ text('运行活动', 'RUN ACTIVITY') }}</p><h3>{{ text(`${activity.length} 条保留事件`, `${activity.length} retained events`) }}</h3></div><span class="connection-label" :class="streamState"><span class="stream-dot" :class="streamState" />{{ streamLabel(streamState) }}</span></header>
         <p v-if="eventWarning" class="inline-warning" role="status"><AlertTriangle :size="15" />{{ eventWarning }}</p>
+        <div v-if="streamState === 'offline'" class="inline-warning event-offline-notice" role="status">
+          <CircleDot :size="15" />
+          <span>{{ text('实时事件连接已断开；页面数据仍可手动刷新。', 'Live event updates are offline; you can still refresh the page data manually.') }}</span>
+          <button class="button secondary compact" :disabled="actionBusy" @click="emit('reconnect')">{{ text('重新连接', 'Reconnect') }}</button>
+        </div>
+        <div v-else-if="streamState === 'reconnecting'" class="inline-warning event-offline-notice" role="status">
+          <LoaderCircle class="spin" :size="15" /><span>{{ text('实时事件连接正在恢复。', 'Live event connection is recovering.') }}</span>
+        </div>
         <ol v-if="activity.length" class="activity-list">
           <li v-for="event in activity" :key="event.eventId || event.sequence">
             <span class="activity-sequence">{{ String(event.sequence).padStart(3, '0') }}</span>

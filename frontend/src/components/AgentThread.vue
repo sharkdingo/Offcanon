@@ -11,10 +11,12 @@ import {
   Menu,
   Pause,
   Play,
+  RefreshCw,
+  Settings2,
   ShieldCheck,
   Wrench,
 } from 'lucide-vue-next'
-import type { Experiment, Project, PromotionPreview, RunEvent, Session } from '../api'
+import { api, type Experiment, type ModelConfigurationStatus, type Project, type PromotionPreview, type RunEvent, type Session } from '../api'
 import { useLocale } from '../i18n'
 import { formatDate, statusLabel, statusTone } from '../ui'
 import MarkdownContent from './MarkdownContent.vue'
@@ -36,6 +38,9 @@ const emit = defineEmits<{
   newTask: []
   select: [experimentId: string]
   review: [experimentId: string]
+  openSettings: []
+  retry: [experimentId: string]
+  reconnect: []
   start: [experimentId: string]
   cancel: [experimentId: string]
   openNavigation: []
@@ -44,6 +49,38 @@ const emit = defineEmits<{
 const { text } = useLocale()
 const draft = ref('')
 const composer = ref<HTMLTextAreaElement | null>(null)
+const submittedForProject = ref<string | null>(null)
+const modelStatus = ref<ModelConfigurationStatus | null>(null)
+const modelStatusLoading = ref(false)
+const modelStatusError = ref<string | null>(null)
+let modelStatusRequest = 0
+
+function draftStorageKey(projectId: string | null | undefined) {
+  return projectId ? `offcanon.task-draft.${projectId}` : null
+}
+
+function readDraft(projectId: string | null | undefined) {
+  const key = draftStorageKey(projectId)
+  if (!key) return ''
+  try { return window.sessionStorage.getItem(key) ?? '' } catch { return '' }
+}
+
+function saveDraft(projectId: string | null | undefined, value: string) {
+  const key = draftStorageKey(projectId)
+  if (!key) return
+  try {
+    if (value.trim()) window.sessionStorage.setItem(key, value.slice(0, 20_000))
+    else window.sessionStorage.removeItem(key)
+  } catch {
+    // The in-memory draft remains authoritative when storage is unavailable.
+  }
+}
+
+function clearSavedDraft(projectId: string | null | undefined) {
+  const key = draftStorageKey(projectId)
+  if (!key) return
+  try { window.sessionStorage.removeItem(key) } catch { /* best effort */ }
+}
 
 const latest = computed(() => props.experiments.at(-1) ?? null)
 const continuableStatuses = new Set(['VERIFIED', 'REJECTED', 'STALE', 'PROMOTED', 'FAILED', 'CANCELLED'])
@@ -60,7 +97,36 @@ const workingStatuses = new Set([
 // while it is running. Keep the conversation controls in sync with that API.
 const cancellableStatuses = new Set(['READY_TO_RUN', 'RUNNING', 'AGENT_COMPLETED', 'VERIFYING'])
 const composerAvailable = computed(() => !latest.value || continuableStatuses.has(latest.value.status))
-const canSubmit = computed(() => !!props.project && composerAvailable.value && draft.value.trim().length > 0 && !props.actionBusy)
+const modelReady = computed(() => Boolean(modelStatus.value?.apiKeyConfigured
+  && modelStatus.value.effectiveEndpointConfigured
+  && modelStatus.value.effectiveModelConfigured
+  && modelStatus.value.effectiveEndpointAllowed))
+const canSubmit = computed(() => !!props.project && modelReady.value && composerAvailable.value && draft.value.trim().length > 0 && !props.actionBusy)
+
+const modelGateCopy = computed(() => {
+  const status = modelStatus.value
+  if (modelStatusLoading.value) return {
+    title: text('正在检查模型配置', 'Checking model configuration'),
+    detail: text('确认 Agent 是否可以开始新实验。', 'Confirming that the agent can start a new experiment.'),
+  }
+  if (modelStatusError.value) return {
+    title: text('无法确认模型配置', 'Unable to check model configuration'),
+    detail: text('无法确认服务端运行条件。请重新检查；如果持续失败，请联系运行 Offcanon 的管理员。', 'The server run requirements could not be confirmed. Check again; if it persists, contact the Offcanon administrator.'),
+  }
+  if (!status?.apiKeyConfigured) return {
+    title: text('开始前需要配置模型 API Key', 'A model API key is required before starting'),
+    detail: text('API Key 由运行 Offcanon 的服务端保管，不会发送到浏览器。', 'The API key is held by the Offcanon server and never sent to the browser.'),
+  }
+  if (!status.effectiveEndpointConfigured || !status.effectiveModelConfigured) return {
+    title: text('请选择模型服务和模型', 'Choose a model service and model'),
+    detail: text('在设置中保存 Endpoint 和模型名后即可发送任务。', 'Save an endpoint and model name in Settings before sending a task.'),
+  }
+  if (!status.effectiveEndpointAllowed) return {
+    title: text('当前模型地址未获服务端允许', 'The selected model endpoint is not allowed'),
+    detail: text('请选择服务端信任列表中的 Endpoint，或联系 Offcanon 管理员。', 'Choose an endpoint trusted by the server, or contact the Offcanon administrator.'),
+  }
+  return null
+})
 const placeholder = computed(() => {
   if (!props.project) return text('先打开一个本机项目', 'Open a local project to start')
   if (!latest.value) return text('告诉 Agent 你想完成什么', 'Tell the agent what you want to build')
@@ -84,6 +150,7 @@ function resizeComposer() {
 
 function submit() {
   if (!canSubmit.value) return
+  submittedForProject.value = props.project?.id ?? null
   emit('submit', draft.value.trim())
 }
 
@@ -180,10 +247,29 @@ function statusDetail(experiment: Experiment) {
 
 function failureText(experiment: Experiment) {
   const reason = experiment.failureReason ?? ''
+  if (reason.includes('MODEL_NOT_CONFIGURED')) return text('尚未配置模型服务，请先完成设置', 'Model service is not configured; open Settings first')
+  if (reason.includes('MODEL_ENDPOINT_NOT_ALLOWED') || reason.includes('MODEL_ENDPOINT_INVALID')) return text('当前模型服务地址不可用，请检查设置', 'The model service endpoint is not usable; check Settings')
+  if (reason.includes('MODEL_REQUEST_FAILED')) return text('模型服务拒绝了请求，请测试模型连接', 'The model service rejected the request; test the connection')
   if (reason.includes('MODEL_TRANSIENT_FAILURE')) return text('模型服务暂时不可用', 'The model service was temporarily unavailable')
+  if (reason.includes('AGENT_TIMEOUT')) return text('运行超时，可以再次运行或缩小任务范围', 'The run timed out; retry or narrow the task')
+  if (reason.includes('MAX_STEPS_EXCEEDED')) return text('运行达到步数上限，可以再次运行或缩小任务范围', 'The run reached its step limit; retry or narrow the task')
+  if (reason.includes('TOOL_CALL_LIMIT_EXCEEDED')) return text('工具调用达到上限，可以再次运行或缩小任务范围', 'The tool-call limit was reached; retry or narrow the task')
   if (reason.includes('VERIFICATION')) return text('验证发现需要处理的问题', 'Verification found an issue to address')
   if (reason.includes('STALE')) return text('这个实验基于旧的项目状态', 'This experiment is based on an older project state')
   return reason.split(':')[0] || statusHeadline(experiment)
+}
+
+function failureCode(experiment: Experiment) {
+  return (experiment.failureReason ?? '').match(/^\s*([A-Z][A-Z0-9_]{2,})(?=\s*:|\s|$)/)?.[1] ?? ''
+}
+
+function canRetry(experiment: Experiment) {
+  return ['MODEL_TRANSIENT_FAILURE', 'AGENT_TIMEOUT', 'MAX_STEPS_EXCEEDED', 'TOOL_CALL_LIMIT_EXCEEDED'].includes(failureCode(experiment))
+}
+
+function needsModelSettings(experiment: Experiment) {
+  return ['MODEL_NOT_CONFIGURED', 'MODEL_ENDPOINT_NOT_ALLOWED', 'MODEL_ENDPOINT_INVALID', 'MODEL_REQUEST_FAILED']
+    .includes(failureCode(experiment))
 }
 
 function streamCopy() {
@@ -193,6 +279,24 @@ function streamCopy() {
   return text('连接中', 'Connecting')
 }
 
+async function refreshModelStatus() {
+  const requestId = ++modelStatusRequest
+  modelStatusLoading.value = true
+  modelStatusError.value = null
+  try {
+    const status = await api.modelStatus()
+    if (requestId === modelStatusRequest) modelStatus.value = status
+  } catch (cause) {
+    if (requestId === modelStatusRequest) {
+      modelStatusError.value = cause instanceof Error
+        ? cause.message
+        : text('无法读取模型配置。', 'Unable to read model configuration.')
+    }
+  } finally {
+    if (requestId === modelStatusRequest) modelStatusLoading.value = false
+  }
+}
+
 async function focusComposer() {
   await nextTick()
   composer.value?.focus()
@@ -200,9 +304,21 @@ async function focusComposer() {
 
 watch(() => latest.value?.id, (next, previous) => {
   if (!next || next === previous) return
-  draft.value = ''
-  if (composer.value) composer.value.style.height = '48px'
+  if (submittedForProject.value === props.project?.id) {
+    clearSavedDraft(props.project?.id)
+    draft.value = ''
+    submittedForProject.value = null
+    if (composer.value) composer.value.style.height = '48px'
+  }
 })
+
+watch(() => props.project?.id, (next, previous) => {
+  if (next !== previous) submittedForProject.value = null
+  if (next !== previous) draft.value = readDraft(next)
+  if (next && next !== previous) void refreshModelStatus()
+}, { immediate: true })
+
+watch(draft, (value) => saveDraft(props.project?.id, value))
 
 defineExpose({ focusComposer })
 </script>
@@ -221,6 +337,15 @@ defineExpose({ focusComposer })
         <button class="button secondary compact" @click="emit('newTask')"><Wrench :size="14" />{{ text('新任务', 'New task') }}</button>
       </div>
     </header>
+
+    <div v-if="project && streamState === 'offline'" class="thread-stream-notice" role="status">
+      <AlertTriangle :size="14" />
+      <span>{{ text('实时活动连接已断开；任务状态仍可通过刷新获取。', 'Live activity is offline; refresh to retrieve the latest task state.') }}</span>
+      <button class="button secondary compact" @click="emit('reconnect')"><RefreshCw :size="14" />{{ text('重新连接', 'Reconnect') }}</button>
+    </div>
+    <div v-else-if="project && streamState === 'reconnecting'" class="thread-stream-notice reconnecting" role="status">
+      <LoaderCircle class="spin" :size="14" /><span>{{ text('实时活动连接正在恢复。', 'Live activity connection is recovering.') }}</span>
+    </div>
 
     <section v-if="!project" class="thread-welcome">
       <div class="welcome-mark"><FlaskConical :size="24" /></div>
@@ -258,10 +383,16 @@ defineExpose({ focusComposer })
             </div>
             <div v-else-if="experiment.status === 'PROMOTED'" class="turn-applied"><Check :size="15" /><span>{{ text('已应用到真实项目', 'Applied to the real project') }}</span><button class="text-button" @click.stop="emit('review', experiment.id)">{{ text('查看记录', 'View record') }}</button></div>
             <div v-else-if="experiment.status === 'READY_TO_RUN'" class="turn-actions">
-              <button class="button primary compact" :disabled="actionBusy" @click.stop="emit('start', experiment.id)"><Play :size="14" />{{ text('开始', 'Start') }}</button>
+              <button class="button primary compact" :disabled="actionBusy || !modelReady" @click.stop="emit('start', experiment.id)"><Play :size="14" />{{ text('开始', 'Start') }}</button>
               <button class="button danger-ghost compact" :disabled="actionBusy" @click.stop="emit('cancel', experiment.id)"><Pause :size="14" />{{ text('取消', 'Cancel') }}</button>
             </div>
-            <div v-else-if="['FAILED', 'REJECTED', 'STALE', 'CANCELLED', 'RECOVERY_REQUIRED'].includes(experiment.status)" class="turn-recovery"><AlertTriangle :size="15" /><span>{{ statusDetail(experiment) }}</span><button class="button secondary compact" :disabled="actionBusy" @click.stop="emit('review', experiment.id)">{{ text('查看原因', 'See why') }}</button></div>
+            <div v-else-if="['FAILED', 'REJECTED', 'STALE', 'CANCELLED', 'RECOVERY_REQUIRED'].includes(experiment.status)" class="turn-recovery">
+              <AlertTriangle :size="15" />
+              <span>{{ failureText(experiment) }}</span>
+              <button v-if="needsModelSettings(experiment)" class="button secondary compact" :disabled="actionBusy" @click.stop="emit('openSettings')">{{ text('去设置', 'Open Settings') }}</button>
+              <button v-else-if="canRetry(experiment)" class="button secondary compact" :disabled="actionBusy" @click.stop="emit('retry', experiment.id)">{{ text('再次运行', 'Retry') }}</button>
+              <button class="button secondary compact" :disabled="actionBusy" @click.stop="emit('review', experiment.id)">{{ text('查看原因', 'See why') }}</button>
+            </div>
             <div v-else-if="workingStatuses.has(experiment.status)" class="turn-actions">
               <button v-if="cancellableStatuses.has(experiment.status)" class="button danger-ghost compact" :disabled="actionBusy" @click.stop="emit('cancel', experiment.id)"><Pause :size="14" />{{ text('停止', 'Stop') }}</button>
               <span v-else class="muted-copy">{{ statusDetail(experiment) }}</span>
@@ -275,6 +406,14 @@ defineExpose({ focusComposer })
     <section v-else class="thread-empty">
       <div class="empty-line"><FlaskConical :size="18" /><span>{{ text('还没有任务', 'No tasks yet') }}</span></div>
     </section>
+
+    <div v-if="project && modelGateCopy" class="agent-model-gate" role="status">
+      <LoaderCircle v-if="modelStatusLoading" class="spin" :size="16" />
+      <AlertTriangle v-else :size="16" />
+      <div><strong>{{ modelGateCopy.title }}</strong><span>{{ modelGateCopy.detail }}</span></div>
+      <button class="button secondary compact" @click="emit('openSettings')"><Settings2 :size="14" />{{ text('打开设置', 'Open Settings') }}</button>
+      <button class="icon-button small" :aria-label="text('重新检查模型配置', 'Refresh model configuration')" :title="text('重新检查', 'Refresh check')" @click="refreshModelStatus"><RefreshCw :size="14" /></button>
+    </div>
 
     <footer class="composer-wrap">
       <form class="agent-composer" @submit.prevent="submit">

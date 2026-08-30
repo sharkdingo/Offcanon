@@ -29,7 +29,10 @@ function latestFor(sessionId: string) {
 
 function taskTitle(session: Session) {
   const latest = latestFor(session.id)
-  return latest?.task || session.title
+  // A session is the user's conversation thread. Keep its sidebar title
+  // stable while continuations add experiments; otherwise the same thread
+  // appears to be renamed after every follow-up request.
+  return session.title || latest?.task || text('未命名任务', 'Untitled task')
 }
 </script>
 

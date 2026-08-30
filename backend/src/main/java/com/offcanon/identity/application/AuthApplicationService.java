@@ -231,7 +231,9 @@ public class AuthApplicationService {
                 selectedEndpointAllowed,
                 selectedEndpoint,
                 selectedModel,
-                allowedEndpointCount);
+                allowedEndpointCount,
+                ModelEndpointPolicy.allowedEndpoints(configuredModelBaseUrl,
+                        configuredModelAllowedBaseUrls, environmentEndpoint).stream().toList());
     }
 
     /** Validates a user-selected endpoint without changing persisted settings. */
@@ -320,6 +322,7 @@ public class AuthApplicationService {
                                            boolean effectiveEndpointAllowed,
                                            String effectiveEndpoint,
                                            String effectiveModel,
-                                           int allowedEndpointCount) {
+                                           int allowedEndpointCount,
+                                           java.util.List<String> allowedEndpoints) {
     }
 }

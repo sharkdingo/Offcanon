@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ArrowRight, Bot, FileCheck2, FolderGit2 } from 'lucide-vue-next'
+import { ArrowRight, Bot, FileCheck2, FolderGit2, KeyRound } from 'lucide-vue-next'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import { computed } from 'vue'
@@ -29,21 +29,32 @@ async function enterWorkspace() {
 
       <ol class="onboarding-steps">
         <li>
-          <span class="onboarding-icon canonical"><FolderGit2 :size="18" /></span>
-          <div><strong>{{ isZh ? '打开本机项目' : 'Open a local project' }}</strong><span>{{ isZh ? '选择这台机器上的 Git 仓库。' : 'Choose a Git repository on this machine.' }}</span></div>
+          <span class="onboarding-icon settings"><KeyRound :size="18" /></span>
+          <div><strong>{{ isZh ? '先确认运行条件' : 'Check run readiness' }}</strong><span>{{ isZh ? '任务开始前需要服务端 API key，以及可用的 Endpoint 和模型（账户选择或服务端默认值）。' : 'A server-side API key plus an available endpoint and model, from account settings or deployment defaults, are required before a task can run.' }}</span></div>
           <small>01</small>
+        </li>
+        <li>
+          <span class="onboarding-icon canonical"><FolderGit2 :size="18" /></span>
+          <div><strong>{{ isZh ? '打开本机项目' : 'Open a local project' }}</strong><span>{{ isZh ? '选择这台机器上的 Git 仓库，并设置项目验收命令。' : 'Choose a Git repository on this machine and set its acceptance commands.' }}</span></div>
+          <small>02</small>
         </li>
         <li>
           <span class="onboarding-icon experiment"><Bot :size="18" /></span>
           <div><strong>{{ isZh ? '描述编程任务' : 'Describe a coding task' }}</strong><span>{{ isZh ? 'Agent 在独立实验中探索、修改并运行代码。' : 'The agent explores, edits, and runs code in a separate experiment.' }}</span></div>
-          <small>02</small>
+          <small>03</small>
         </li>
         <li>
           <span class="onboarding-icon verified"><FileCheck2 :size="18" /></span>
-          <div><strong>{{ isZh ? '审阅并应用' : 'Review and apply' }}</strong><span>{{ isZh ? '查看代码改动和验证结果，再决定是否更新项目。' : 'Review the changes and checks, then decide whether to update your project.' }}</span></div>
-          <small>03</small>
+          <div><strong>{{ isZh ? '审阅并应用' : 'Review and apply' }}</strong><span>{{ isZh ? '查看代码改动和验收证据，再决定是否更新项目。' : 'Review the changes and acceptance evidence, then decide whether to update your project.' }}</span></div>
+          <small>04</small>
         </li>
       </ol>
+
+      <div class="onboarding-boundary">
+        <strong>{{ isZh ? '这是受信本机工作台' : 'This is a trusted local workbench' }}</strong>
+        <span>{{ isZh ? '项目路径和验收命令在运行 Offcanon 的这台机器上执行；验收证据不是操作系统安全沙箱。' : 'Project paths and acceptance commands run on the machine hosting Offcanon; acceptance evidence is not an operating-system sandbox.' }}</span>
+        <span>{{ isZh ? '当前默认开发模式使用内存存储，重启服务后账户、项目和任务会清空；需要长期保存时请配置 MySQL/Redis。' : 'The default development mode stores account, project, and task data in memory; a restart clears it. Configure MySQL/Redis for durable storage.' }}</span>
+      </div>
 
       <footer class="onboarding-actions">
         <button class="button primary" @click="enterWorkspace">{{ isZh ? '打开项目列表' : 'Open project list' }} <ArrowRight :size="15" /></button>

@@ -44,20 +44,35 @@ public class ProjectApplicationService {
     }
 
     public Project register(UUID ownerId, String name, String canonicalPath, List<String> verificationCommands) {
+        return registerWithOutcome(ownerId, name, canonicalPath, verificationCommands).project();
+    }
+
+    /**
+     * Registers a project or reopens the already registered project owned by
+     * this account. The explicit outcome lets the HTTP layer explain a reopen
+     * without making clients infer it from a possibly stale project list.
+     */
+    public RegistrationResult registerWithOutcome(UUID ownerId,
+                                                   String name,
+                                                   String canonicalPath,
+                                                   List<String> verificationCommands) {
         if (ownerId == null) throw new DomainException("OWNER_REQUIRED", "Project owner is required");
-        List<String> policy = normalizeVerificationCommands(verificationCommands);
         Path root = snapshots.resolveProjectRoot(Path.of(canonicalPath));
         var existing = projectRepository.findByCanonicalPath(root);
         if (existing.isPresent()) {
-            return reopenForOwner(root, ownerId, existing.get());
+            return new RegistrationResult(reopenForOwner(root, ownerId, existing.get()), true);
         }
+        // A repeated open reuses the stored policy, so validate commands only
+        // after confirming this is a genuinely new project registration.
+        List<String> policy = normalizeVerificationCommands(verificationCommands);
         try {
-            return projectRepository.save(Project.create(ownerId, name, root, policy, Instant.now()));
+            Project created = projectRepository.save(Project.create(ownerId, name, root, policy, Instant.now()));
+            return new RegistrationResult(created, false);
         } catch (DomainException error) {
             if (!"PROJECT_ALREADY_REGISTERED".equals(error.code())) throw error;
             return projectRepository.findByCanonicalPath(root)
-                    .map(project -> reopenForOwner(root, ownerId, project))
-                    .orElseThrow(() -> error);
+                    .map(project -> new RegistrationResult(reopenForOwner(root, ownerId, project), true))
+                    .orElseThrow(() -> duplicateProject(root));
         }
     }
 
@@ -143,12 +158,24 @@ public class ProjectApplicationService {
     }
 
     private DomainException duplicateProject(Path canonicalPath, Project existing) {
+        return duplicateProject(canonicalPath);
+    }
+
+    private DomainException duplicateProject(Path canonicalPath) {
+        // A repository may belong to another local account.  Do not expose its
+        // internal project id or canonical path in an API error: the caller
+        // only needs an actionable ownership explanation, and the path can be
+        // sensitive on a shared machine.
         return new DomainException("PROJECT_ALREADY_REGISTERED",
-                "Canonical Git repository is already registered as project " + existing.id() + ": " + canonicalPath);
+                "This Git repository is already registered by another account. "
+                        + "Use that account or choose a different repository.");
     }
 
     private Project reopenForOwner(Path canonicalPath, UUID ownerId, Project existing) {
         if (existing.ownerId().equals(ownerId)) return existing;
         throw duplicateProject(canonicalPath, existing);
+    }
+
+    public record RegistrationResult(Project project, boolean reopened) {
     }
 }

@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { CircleDot, Edit3, RefreshCw, Settings, ShieldCheck, X } from 'lucide-vue-next'
+import { AlertTriangle, CircleDot, Edit3, RefreshCw, Settings, ShieldCheck, X } from 'lucide-vue-next'
 import { useRoute, useRouter } from 'vue-router'
-import type { Project, RunEvent } from '../api'
+import { ApiError, type Project, type RunEvent } from '../api'
 import AgentThread from '../components/AgentThread.vue'
 import ProjectDialog from '../components/ProjectDialog.vue'
 import PromotionDialog from '../components/PromotionDialog.vue'
@@ -35,6 +35,16 @@ let eventSource: EventSource | null = null
 let eventExperimentId: string | null = null
 let refreshTimer: number | null = null
 let routeSyncVersion = 0
+
+function projectSaveError(cause: unknown) {
+  if (cause instanceof ApiError && cause.code === 'PROJECT_ALREADY_REGISTERED') {
+    return text('这个 Git 仓库已由其他账户打开。请切换到账户，或选择另一个仓库。', 'This Git repository is already registered by another account. Switch accounts or choose another repository.')
+  }
+  if (cause instanceof ApiError && cause.code === 'VERIFICATION_POLICY_MISSING') {
+    return text('新项目至少需要一条项目验收命令。', 'A new project needs at least one project acceptance command.')
+  }
+  return cause instanceof Error ? cause.message : text('无法保存项目。', 'Unable to save project')
+}
 
 const projectParam = computed(() => typeof route.params.projectId === 'string' ? route.params.projectId : null)
 const experimentParam = computed(() => typeof route.params.experimentId === 'string' ? route.params.experimentId : null)
@@ -87,10 +97,10 @@ function scheduleProjectRefresh(experimentId: string) {
   }, 300)
 }
 
-function connectEvents(experimentId: string | null) {
+function connectEvents(experimentId: string | null, force = false) {
   // Route changes can run more than once while the project payload is loading.
   // Keep a healthy stream alive, but allow a closed stream to be recreated.
-  if (eventSource && eventExperimentId === experimentId && eventSource.readyState !== EventSource.CLOSED) return
+  if (!force && eventSource && eventExperimentId === experimentId && eventSource.readyState !== EventSource.CLOSED) return
   eventSource?.close()
   eventSource = null
   eventExperimentId = experimentId
@@ -102,7 +112,10 @@ function connectEvents(experimentId: string | null) {
   streamState.value = experimentId ? 'connecting' : 'idle'
   if (!experimentId) return
 
-  const source = new EventSource(`/api/experiments/${experimentId}/events`)
+  // EventSource does not expose arbitrary headers. Explicit credentials keep
+  // the HttpOnly session cookie attached when the frontend is served through a
+  // development/reverse-proxy origin.
+  const source = new EventSource(`/api/experiments/${experimentId}/events`, { withCredentials: true })
   eventSource = source
   source.onopen = () => { if (eventSource === source) streamState.value = 'live' }
   source.onerror = () => {
@@ -223,6 +236,11 @@ async function closeReview() {
   if (store.selectedProjectId) await router.push({ name: 'project', params: { projectId: store.selectedProjectId } })
 }
 
+async function continueFromReview() {
+  await closeReview()
+  await threadRef.value?.focusComposer()
+}
+
 async function submitProject(value: { name: string; canonicalPath: string; verificationCommands: string[] }) {
   submitting.value = true
   store.error = null
@@ -231,21 +249,28 @@ async function submitProject(value: { name: string; canonicalPath: string; verif
       ? await store.updateProject(value)
       : await store.createProject(value)
     if (!project) return
+    const reopened = 'project' in project && project.reopened
+    const selected = 'project' in project ? project.project : project
     editingProject.value = null
     showProjectDialog.value = false
-    await router.push({ name: 'project', params: { projectId: project.id } })
+    await router.push({ name: 'project', params: { projectId: selected.id } })
+    if (reopened) {
+      store.error = text('已打开这个账户中的现有项目；名称和验收命令沿用原设置，可通过顶部编辑按钮修改。', 'Opened the existing project in this account. Its saved name and acceptance commands were kept; use the edit button in the header to change them.')
+    }
   } catch (cause) {
-    store.error = cause instanceof Error ? cause.message : text('无法保存项目。', 'Unable to save project')
+    store.error = projectSaveError(cause)
   } finally { submitting.value = false }
 }
 
 function openProjectDialog() {
+  store.error = null
   editingProject.value = null
   showProjectDialog.value = true
 }
 
 function editSelectedProject() {
   if (!store.selectedProject) return
+  store.error = null
   editingProject.value = store.selectedProject
   showProjectDialog.value = true
 }
@@ -282,6 +307,35 @@ async function submitTask(task: string, newTask = false) {
   } finally { submitting.value = false }
 }
 
+async function retryExperiment(experimentId: string) {
+  if (submitting.value || actionBusy.value) return
+  const source = store.experiments.find((item) => item.id === experimentId)
+  if (!source || !store.selectedProjectId) return
+  submitting.value = true
+  store.error = null
+  try {
+    const successor = await store.continueExperiment(experimentId, source.task)
+    if (successor?.status === 'READY_TO_RUN') await store.startExperiment(successor.id)
+    if (successor) {
+      showReview.value = false
+      await router.push({ name: 'project', params: { projectId: successor.projectId } })
+    }
+  } catch (cause) {
+    store.error = cause instanceof Error ? cause.message : text('无法重试任务。', 'Unable to retry the task')
+  } finally {
+    submitting.value = false
+  }
+}
+
+function openSettings() {
+  showReview.value = false
+  showPromotionDialog.value = false
+  const query: Record<string, string> = {}
+  if (store.selectedProjectId) query.projectId = store.selectedProjectId
+  if (store.selectedExperimentId) query.experimentId = store.selectedExperimentId
+  void router.push({ name: 'settings', query })
+}
+
 async function startNewTask() {
   forceNewTask.value = true
   mobileNavOpen.value = false
@@ -305,6 +359,10 @@ async function reconcileSelected() {
   const experiment = store.selectedExperiment
   if (!experiment) return
   await runAction(() => store.reconcilePromotion(experiment.id))
+}
+
+async function reconcileProject() {
+  await runAction(() => store.reconcileProjectRecovery())
 }
 
 async function runAction(action: () => Promise<void>, closePromotion = false) {
@@ -348,7 +406,7 @@ function handleGlobalKeydown(event: KeyboardEvent) {
 }
 
 watch(() => route.fullPath, () => void syncRoute())
-watch(() => store.selectedExperimentId, connectEvents)
+watch(() => store.selectedExperimentId, (next) => connectEvents(next))
 watch(() => store.selectedExperimentId, () => {
   // A promotion confirmation belongs to one experiment. Never leave it open
   // while the user navigates to another historical turn.
@@ -389,12 +447,29 @@ onUnmounted(() => {
       <div class="topbar-context">
         <span v-if="store.selectedExperimentId" class="connection-state" :class="streamState"><span class="stream-dot" :class="streamState" />{{ connectionLabel }}</span>
         <button class="icon-button" :aria-label="text('刷新', 'Refresh')" :title="text('刷新', 'Refresh')" :disabled="store.loading" @click="refresh"><RefreshCw :class="{ spin: store.loading }" :size="16" /></button>
-        <button class="account-button" :aria-label="text('打开设置', 'Open settings')" :title="text('设置', 'Settings')" @click="router.push({ name: 'settings' })"><span>{{ accountInitials }}</span><Settings :size="14" /></button>
+        <button class="account-button" :aria-label="text('打开设置', 'Open settings')" :title="text('设置', 'Settings')" @click="openSettings"><span>{{ accountInitials }}</span><Settings :size="14" /></button>
       </div>
     </header>
 
     <div v-if="store.error" class="global-alert" role="alert">
       <CircleDot :size="16" /><span>{{ store.error }}</span><button class="icon-button small" :aria-label="text('关闭错误', 'Dismiss error')" :title="text('关闭', 'Dismiss')" @click="store.error = null"><X :size="15" /></button>
+    </div>
+
+    <div v-if="store.selectedProject && store.promotionRecovery?.recoveryRequired" class="project-recovery-banner" role="alert">
+      <AlertTriangle :size="17" />
+      <div>
+        <strong>{{ text('项目需要恢复', 'Project recovery required') }}</strong>
+        <span>{{ text('上一笔应用操作尚未完成，新的应用会被阻止。请先确认当前项目状态。', 'An earlier project update is unresolved, so new applications are blocked. Reconcile the current project state first.') }}</span>
+      </div>
+      <button class="button warning compact" :disabled="actionBusy" @click="reconcileProject"><RefreshCw :class="{ spin: actionBusy }" :size="14" />{{ text('恢复项目', 'Reconcile project') }}</button>
+    </div>
+    <div v-else-if="store.selectedProject && store.promotionRecoveryError" class="project-recovery-banner error" role="alert">
+      <AlertTriangle :size="17" />
+      <div>
+        <strong>{{ text('无法确认项目写回状态', 'Project write-back state is unknown') }}</strong>
+        <span>{{ store.promotionRecoveryError }}</span>
+      </div>
+      <button class="button secondary compact" :disabled="store.loading" @click="refresh"><RefreshCw :class="{ spin: store.loading }" :size="14" />{{ text('重新检查', 'Check again') }}</button>
     </div>
 
     <div class="agent-frame" :class="{ 'nav-open': mobileNavOpen, 'no-project': !store.selectedProject }">
@@ -429,6 +504,9 @@ onUnmounted(() => {
         @new-task="startNewTask"
         @select="selectExperiment"
         @review="openReview"
+        @open-settings="openSettings"
+        @retry="retryExperiment"
+        @reconnect="store.selectedExperimentId && connectEvents(store.selectedExperimentId, true)"
         @start="startExperiment"
         @cancel="cancelExperiment"
       />
@@ -459,22 +537,28 @@ onUnmounted(() => {
             :evidence-error="store.evidenceError"
             :diff-error="store.diffError"
             :promotion-preview-error="store.promotionPreviewError"
+            :promotion-recovery-error="store.promotionRecoveryError"
             @back="closeReview"
             @start="store.selectedExperiment && startExperiment(store.selectedExperiment.id)"
             @cancel="store.selectedExperiment && cancelExperiment(store.selectedExperiment.id)"
             @promote="showPromotionDialog = true"
             @reconcile="reconcileSelected"
+            @open-settings="openSettings"
+            @retry="store.selectedExperiment && retryExperiment(store.selectedExperiment.id)"
+            @reconnect="store.selectedExperimentId && connectEvents(store.selectedExperimentId, true)"
+            @continue-task="continueFromReview"
           />
         </aside>
       </div>
     </Transition>
 
-    <ProjectDialog v-if="showProjectDialog" :project="editingProject" :busy="submitting" @close="showProjectDialog = false; editingProject = null" @submit="submitProject" />
+    <ProjectDialog v-if="showProjectDialog" :project="editingProject" :busy="submitting" :error="store.error" @close="showProjectDialog = false; editingProject = null" @submit="submitProject" />
     <PromotionDialog
       v-if="showPromotionDialog && store.selectedExperiment && store.promotionPreview"
       :experiment="store.selectedExperiment"
       :preview="store.promotionPreview"
       :changed-file-count="store.diff.length"
+      :deleted-file-count="store.diff.filter((item) => item.change === 'DELETED').length"
       :busy="actionBusy"
       @close="showPromotionDialog = false"
       @confirm="confirmPromotionDecision"
