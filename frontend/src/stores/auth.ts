@@ -1,7 +1,7 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { api, type AuthUser, type UserSettings } from '../api'
-import { AUTH_UNAUTHORIZED_EVENT, getAuthToken, setAuthToken } from '../authToken'
+import { AUTH_UNAUTHORIZED_EVENT } from '../authToken'
 
 export type AuthMode = 'api'
 export type ThemeMode = 'dark' | 'light' | 'system'
@@ -12,12 +12,11 @@ export type AuthSession = {
   displayName: string
   mode: AuthMode
   signedInAt: string
-  token: string
   expiresAt: string
   user: AuthUser
 }
 
-const AUTH_STORAGE_KEY = 'offcanon.auth.v2'
+const AUTH_STORAGE_KEY = 'offcanon.auth.v3'
 const ONBOARDING_STORAGE_PREFIX = 'offcanon.onboarding.v2.'
 const THEME_STORAGE_KEY = 'offcanon.theme.v2'
 const LOCALE_STORAGE_KEY = 'offcanon.locale.v1'
@@ -104,9 +103,8 @@ export const useAuthStore = defineStore('auth', () => {
       unauthorizedListenerInstalled = true
     }
     hydrateLocalPreferences()
-    const stored = readJson<AuthSession>(AUTH_STORAGE_KEY)
-    if (stored?.token && stored.user?.id && stored.user.username) {
-        setAuthToken(stored.token)
+    const stored = readJson<Pick<AuthSession, 'subject' | 'displayName' | 'mode' | 'signedInAt' | 'expiresAt' | 'user'>>(AUTH_STORAGE_KEY)
+    if (stored?.user?.id && stored.user.username) {
       try {
         const user = await api.me()
         session.value = { ...stored, user, subject: user.id, displayName: user.username }
@@ -115,7 +113,6 @@ export const useAuthStore = defineStore('auth', () => {
         const onboarding = savedValue(onboardingKey())
         onboardingComplete.value = onboarding === 'complete'
       } catch {
-        setAuthToken(null)
         removeValue(AUTH_STORAGE_KEY)
       }
     }
@@ -123,11 +120,6 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   function handleUnauthorized(event: Event) {
-    const failedToken = event instanceof CustomEvent && typeof event.detail === 'string' ? event.detail : null
-    // A request started under an older session may finish after a new login.
-    // Only invalidate the session that the server actually rejected.
-    if (!failedToken || getAuthToken() !== failedToken) return
-    setAuthToken(null)
     session.value = null
     onboardingComplete.value = false
     removeValue(AUTH_STORAGE_KEY)
@@ -139,13 +131,11 @@ export const useAuthStore = defineStore('auth', () => {
     const response = register
       ? await api.register({ username: normalizedUsername, password })
       : await api.login({ username: normalizedUsername, password })
-    setAuthToken(response.token)
     session.value = {
       subject: response.user.id,
       displayName: response.user.username,
       mode: 'api',
       signedInAt: new Date().toISOString(),
-      token: response.token,
       expiresAt: response.expiresAt,
       user: response.user,
     }
@@ -171,7 +161,6 @@ export const useAuthStore = defineStore('auth', () => {
 
   async function signOut() {
     try { if (session.value) await api.logout() } catch { /* token is cleared locally even if the server is unavailable */ }
-    setAuthToken(null)
     session.value = null
     onboardingComplete.value = false
     applyTheme('system', false)
@@ -182,6 +171,12 @@ export const useAuthStore = defineStore('auth', () => {
   function applySettings(settings: UserSettings, persist = true) {
     applyTheme(settings.theme, persist)
     applyLocale(settings.locale, persist)
+  }
+
+  function updateSessionExpiry(expiresAt: string) {
+    if (!session.value) return
+    session.value.expiresAt = expiresAt
+    saveValue(AUTH_STORAGE_KEY, JSON.stringify(session.value))
   }
 
   async function hydrateAccountSettings() {
@@ -210,6 +205,7 @@ export const useAuthStore = defineStore('auth', () => {
     applyTheme,
     applyLocale,
     applySettings,
+    updateSessionExpiry,
     hydrateAccountSettings,
   }
 })

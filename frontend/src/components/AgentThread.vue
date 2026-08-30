@@ -18,7 +18,7 @@ import {
 } from 'lucide-vue-next'
 import { api, type Experiment, type ModelConfigurationStatus, type Project, type PromotionPreview, type RunEvent, type Session } from '../api'
 import { useLocale } from '../i18n'
-import { formatDate, statusLabel, statusTone } from '../ui'
+import { formatDate, formatError, statusLabel, statusTone } from '../ui'
 import MarkdownContent from './MarkdownContent.vue'
 
 const props = defineProps<{
@@ -31,6 +31,7 @@ const props = defineProps<{
   actionBusy: boolean
   detailLoading: boolean
   promotionPreview: PromotionPreview | null
+  navigationOpen?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -248,7 +249,7 @@ function statusDetail(experiment: Experiment) {
 function failureText(experiment: Experiment) {
   const reason = experiment.failureReason ?? ''
   if (reason.includes('MODEL_NOT_CONFIGURED')) return text('尚未配置模型服务，请先完成设置', 'Model service is not configured; open Settings first')
-  if (reason.includes('MODEL_ENDPOINT_NOT_ALLOWED') || reason.includes('MODEL_ENDPOINT_INVALID')) return text('当前模型服务地址不可用，请检查设置', 'The model service endpoint is not usable; check Settings')
+  if (reason.includes('MODEL_ENDPOINT_INVALID')) return text('当前模型服务地址不可用，请检查设置', 'The model service endpoint is not usable; check Settings')
   if (reason.includes('MODEL_REQUEST_FAILED')) return text('模型服务拒绝了请求，请测试模型连接', 'The model service rejected the request; test the connection')
   if (reason.includes('MODEL_TRANSIENT_FAILURE')) return text('模型服务暂时不可用', 'The model service was temporarily unavailable')
   if (reason.includes('AGENT_TIMEOUT')) return text('运行超时，可以再次运行或缩小任务范围', 'The run timed out; retry or narrow the task')
@@ -256,7 +257,7 @@ function failureText(experiment: Experiment) {
   if (reason.includes('TOOL_CALL_LIMIT_EXCEEDED')) return text('工具调用达到上限，可以再次运行或缩小任务范围', 'The tool-call limit was reached; retry or narrow the task')
   if (reason.includes('VERIFICATION')) return text('验证发现需要处理的问题', 'Verification found an issue to address')
   if (reason.includes('STALE')) return text('这个实验基于旧的项目状态', 'This experiment is based on an older project state')
-  return reason.split(':')[0] || statusHeadline(experiment)
+  return statusHeadline(experiment)
 }
 
 function failureCode(experiment: Experiment) {
@@ -268,7 +269,7 @@ function canRetry(experiment: Experiment) {
 }
 
 function needsModelSettings(experiment: Experiment) {
-  return ['MODEL_NOT_CONFIGURED', 'MODEL_ENDPOINT_NOT_ALLOWED', 'MODEL_ENDPOINT_INVALID', 'MODEL_REQUEST_FAILED']
+  return ['MODEL_NOT_CONFIGURED', 'MODEL_ENDPOINT_INVALID', 'MODEL_REQUEST_FAILED']
     .includes(failureCode(experiment))
 }
 
@@ -288,9 +289,7 @@ async function refreshModelStatus() {
     if (requestId === modelStatusRequest) modelStatus.value = status
   } catch (cause) {
     if (requestId === modelStatusRequest) {
-      modelStatusError.value = cause instanceof Error
-        ? cause.message
-        : text('无法读取模型配置。', 'Unable to read model configuration.')
+      modelStatusError.value = formatError(cause, '无法读取模型配置。', 'Unable to read model configuration.')
     }
   } finally {
     if (requestId === modelStatusRequest) modelStatusLoading.value = false
@@ -326,7 +325,7 @@ defineExpose({ focusComposer })
 <template>
   <main class="agent-thread" :aria-label="text('Coding Agent 工作区', 'Coding Agent workspace')">
     <header class="thread-header">
-      <button class="icon-button thread-nav-button" :aria-label="text('打开任务导航', 'Open task navigation')" :title="text('任务', 'Tasks')" @click="emit('openNavigation')"><Menu :size="18" /></button>
+      <button class="icon-button thread-nav-button" :aria-label="text('打开任务导航', 'Open task navigation')" :title="text('任务', 'Tasks')" :aria-expanded="props.navigationOpen ? 'true' : 'false'" aria-controls="offcanon-task-navigation" @click="emit('openNavigation')"><Menu :size="18" /></button>
       <div class="thread-heading">
         <span class="thread-kicker"><span class="live-pip" />{{ project ? text('Coding Agent', 'Coding Agent') : text('开始协作', 'Start collaborating') }}</span>
         <h1>{{ session?.title || (project ? text('新任务', 'New task') : text('打开一个项目', 'Open a project')) }}</h1>

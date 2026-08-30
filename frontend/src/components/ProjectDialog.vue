@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { ArrowRight, ArrowUp, Check, Folder, FolderGit2, FolderOpen, LoaderCircle, ShieldCheck, X } from 'lucide-vue-next'
 import { api, type DirectoryBrowse, type DirectoryLocation, type Project } from '../api'
 import { useLocale } from '../i18n'
+import { formatError } from '../ui'
 import BaseDialog from './BaseDialog.vue'
 
 const props = defineProps<{ busy: boolean; project?: Project | null; error?: string | null }>()
@@ -73,9 +74,7 @@ async function browse(path?: string) {
   } catch (cause) {
     if (requestId === browserRequest) {
       browser.value = null
-      browserError.value = cause instanceof Error
-        ? cause.message
-        : text('无法读取这个目录。', 'Unable to read this directory.')
+      browserError.value = formatError(cause, '无法读取这个目录。', 'Unable to read this directory.')
     }
   } finally {
     if (requestId === browserRequest) browserBusy.value = false

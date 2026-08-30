@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { AlertTriangle, CircleDot, Edit3, RefreshCw, Settings, ShieldCheck, X } from 'lucide-vue-next'
 import { useRoute, useRouter } from 'vue-router'
 import { ApiError, type Project, type RunEvent } from '../api'
@@ -10,6 +10,7 @@ import TaskSidebar from '../components/TaskSidebar.vue'
 import ExperimentReview from '../components/ExperimentReview.vue'
 import { useLocale } from '../i18n'
 import { useWorkspaceStore } from '../stores/workspace'
+import { formatError } from '../ui'
 
 type StreamState = 'idle' | 'connecting' | 'live' | 'reconnecting' | 'offline'
 
@@ -23,6 +24,11 @@ const editingProject = ref<Project | null>(null)
 const showReview = ref(false)
 const showPromotionDialog = ref(false)
 const mobileNavOpen = ref(false)
+const isMobile = ref(false)
+const reviewDrawer = ref<HTMLElement | null>(null)
+const reviewClose = ref<HTMLElement | null>(null)
+const reviewReturnFocus = ref<HTMLElement | null>(null)
+const workspaceContent = ref<HTMLElement | null>(null)
 const submitting = ref(false)
 const actionBusy = ref(false)
 const forceNewTask = ref(false)
@@ -43,7 +49,7 @@ function projectSaveError(cause: unknown) {
   if (cause instanceof ApiError && cause.code === 'VERIFICATION_POLICY_MISSING') {
     return text('新项目至少需要一条项目验收命令。', 'A new project needs at least one project acceptance command.')
   }
-  return cause instanceof Error ? cause.message : text('无法保存项目。', 'Unable to save project')
+  return formatError(cause, '无法保存项目。', 'Unable to save project')
 }
 
 const projectParam = computed(() => typeof route.params.projectId === 'string' ? route.params.projectId : null)
@@ -92,7 +98,7 @@ function scheduleProjectRefresh(experimentId: string) {
     try {
       await store.reloadSelectedProject()
     } catch (cause) {
-      store.error = cause instanceof Error ? cause.message : text('无法刷新任务状态。', 'Unable to refresh task state')
+      store.error = formatError(cause, '无法刷新任务状态。', 'Unable to refresh task state')
     }
   }, 300)
 }
@@ -198,13 +204,13 @@ async function syncRoute() {
 }
 
 async function openProject(projectId: string) {
-  mobileNavOpen.value = false
+  closeMobileNav()
   forceNewTask.value = false
   await router.push({ name: 'project', params: { projectId } })
 }
 
 async function selectSession(sessionId: string) {
-  mobileNavOpen.value = false
+  closeMobileNav()
   forceNewTask.value = false
   await store.selectSession(sessionId)
   if (!store.selectedProjectId) return
@@ -214,7 +220,8 @@ async function selectSession(sessionId: string) {
 }
 
 async function openReview(experimentId: string) {
-  mobileNavOpen.value = false
+  closeMobileNav()
+  reviewReturnFocus.value = document.activeElement instanceof HTMLElement ? document.activeElement : null
   await store.selectExperiment(experimentId)
   showReview.value = true
   if (store.selectedProjectId) {
@@ -233,6 +240,9 @@ async function selectExperiment(experimentId: string) {
 
 async function closeReview() {
   showReview.value = false
+  await nextTick()
+  reviewReturnFocus.value?.focus()
+  reviewReturnFocus.value = null
   if (store.selectedProjectId) await router.push({ name: 'project', params: { projectId: store.selectedProjectId } })
 }
 
@@ -303,7 +313,7 @@ async function submitTask(task: string, newTask = false) {
       await router.push({ name: 'project', params: { projectId: experiment.projectId } })
     }
   } catch (cause) {
-    store.error = cause instanceof Error ? cause.message : text('无法开始任务。', 'Unable to start the task')
+    store.error = formatError(cause, '无法开始任务。', 'Unable to start the task')
   } finally { submitting.value = false }
 }
 
@@ -321,7 +331,7 @@ async function retryExperiment(experimentId: string) {
       await router.push({ name: 'project', params: { projectId: successor.projectId } })
     }
   } catch (cause) {
-    store.error = cause instanceof Error ? cause.message : text('无法重试任务。', 'Unable to retry the task')
+    store.error = formatError(cause, '无法重试任务。', 'Unable to retry the task')
   } finally {
     submitting.value = false
   }
@@ -373,7 +383,7 @@ async function runAction(action: () => Promise<void>, closePromotion = false) {
     await action()
     if (closePromotion) showPromotionDialog.value = false
   } catch (cause) {
-    store.error = cause instanceof Error ? cause.message : text('任务操作失败。', 'Task action failed')
+    store.error = formatError(cause, '任务操作失败。', 'Task action failed')
   } finally { actionBusy.value = false }
 }
 
@@ -393,17 +403,60 @@ async function refresh() {
   await syncRoute()
   if (projectBeforeRefresh && store.selectedProjectId === projectBeforeRefresh) {
     try { await store.reloadSelectedProject() } catch (cause) {
-      store.error = cause instanceof Error ? cause.message : text('无法刷新。', 'Unable to refresh')
+      store.error = formatError(cause, '无法刷新。', 'Unable to refresh')
     }
   }
 }
 
 function handleGlobalKeydown(event: KeyboardEvent) {
+  if (showReview.value && event.key === 'Tab') {
+    const root = reviewDrawer.value
+    if (!root) return
+    const focusable = Array.from(root.querySelectorAll<HTMLElement>('button, a[href], input, textarea, select, [tabindex]:not([tabindex="-1"])'))
+      .filter((item) => !item.hasAttribute('disabled') && item.offsetParent !== null)
+    if (focusable.length) {
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); return }
+      if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); return }
+    }
+    return
+  }
   if (event.key !== 'Escape') return
   if (showPromotionDialog.value) showPromotionDialog.value = false
   else if (showReview.value) void closeReview()
-  else mobileNavOpen.value = false
+  else closeMobileNav()
 }
+
+function updateMobileState() {
+  isMobile.value = window.matchMedia('(max-width: 860px)').matches
+  if (!isMobile.value) mobileNavOpen.value = false
+}
+
+function openMobileNav() {
+  mobileNavOpen.value = true
+  void nextTick(() => document.querySelector<HTMLElement>('#offcanon-task-navigation .sidebar-close')?.focus())
+}
+
+function closeMobileNav() {
+  mobileNavOpen.value = false
+  void nextTick(() => {
+    const button = document.querySelector<HTMLElement>('.thread-nav-button')
+    if (button && button.offsetParent !== null) button.focus()
+  })
+}
+
+watch(showReview, (open) => {
+  if (open) {
+    if (isMobile.value) workspaceContent.value?.setAttribute('inert', '')
+    void nextTick(() => reviewClose.value?.focus())
+  } else {
+    workspaceContent.value?.removeAttribute('inert')
+  }
+})
+watch(mobileNavOpen, (open) => {
+  if (open) void nextTick(() => document.querySelector<HTMLElement>('#offcanon-task-navigation .sidebar-close')?.focus())
+})
 
 watch(() => route.fullPath, () => void syncRoute())
 watch(() => store.selectedExperimentId, (next) => connectEvents(next))
@@ -424,6 +477,8 @@ onMounted(async () => {
   // not. Reconnect explicitly when returning from Settings or another route.
   connectEvents(store.selectedExperimentId)
   window.addEventListener('keydown', handleGlobalKeydown)
+  updateMobileState()
+  window.addEventListener('resize', updateMobileState)
 })
 
 onUnmounted(() => {
@@ -432,6 +487,7 @@ onUnmounted(() => {
   eventExperimentId = null
   if (refreshTimer !== null) window.clearTimeout(refreshTimer)
   window.removeEventListener('keydown', handleGlobalKeydown)
+  window.removeEventListener('resize', updateMobileState)
   store.clearSelection()
 })
 </script>
@@ -472,9 +528,12 @@ onUnmounted(() => {
       <button class="button secondary compact" :disabled="store.loading" @click="refresh"><RefreshCw :class="{ spin: store.loading }" :size="14" />{{ text('重新检查', 'Check again') }}</button>
     </div>
 
-    <div class="agent-frame" :class="{ 'nav-open': mobileNavOpen, 'no-project': !store.selectedProject }">
-      <button v-if="mobileNavOpen && store.selectedProject" class="agent-nav-scrim" :aria-label="text('关闭任务导航', 'Close task navigation')" @click="mobileNavOpen = false" />
+    <div ref="workspaceContent" class="agent-frame" :class="{ 'nav-open': mobileNavOpen, 'no-project': !store.selectedProject }" :inert="showReview ? true : undefined" :aria-hidden="showReview ? 'true' : undefined">
+      <button v-if="mobileNavOpen && store.selectedProject" class="agent-nav-scrim" :aria-label="text('关闭任务导航', 'Close task navigation')" @click="closeMobileNav" />
       <TaskSidebar
+        id="offcanon-task-navigation"
+        :aria-hidden="isMobile && !!store.selectedProject && !mobileNavOpen ? 'true' : undefined"
+        :inert="isMobile && !!store.selectedProject && !mobileNavOpen ? true : undefined"
         :projects="store.projects"
         :sessions="store.sessions"
         :experiments="store.experiments"
@@ -485,11 +544,13 @@ onUnmounted(() => {
         @select-project="openProject"
         @select-session="selectSession"
         @new-task="startNewTask"
-        @close="mobileNavOpen = false"
+        @close="closeMobileNav"
       />
 
       <AgentThread
         ref="threadRef"
+        :aria-hidden="isMobile && mobileNavOpen ? 'true' : undefined"
+        :inert="isMobile && mobileNavOpen ? true : undefined"
         :project="store.selectedProject"
         :session="store.activeSession"
         :experiments="activeExperiments"
@@ -499,7 +560,8 @@ onUnmounted(() => {
         :action-busy="actionBusy || submitting"
         :detail-loading="store.detailLoading"
         :promotion-preview="store.promotionPreview"
-        @open-navigation="mobileNavOpen = true"
+        :navigation-open="mobileNavOpen"
+        @open-navigation="openMobileNav"
         @submit="submitTask"
         @new-task="startNewTask"
         @select="selectExperiment"
@@ -515,10 +577,10 @@ onUnmounted(() => {
     <Transition name="drawer">
       <div v-if="showReview && store.selectedExperiment" class="review-overlay">
         <button class="review-overlay-scrim" :aria-label="text('关闭审阅', 'Close review')" @click="closeReview" />
-        <aside class="review-drawer" role="dialog" aria-modal="true" :aria-label="text('任务审阅', 'Task review')">
+        <aside ref="reviewDrawer" class="review-drawer" role="dialog" aria-modal="true" aria-labelledby="review-drawer-title">
           <header class="review-drawer-header">
-            <div><span>{{ text('任务审阅', 'TASK REVIEW') }}</span><strong>EXP-{{ store.selectedExperiment.id.slice(0, 8).toUpperCase() }}</strong></div>
-            <button class="icon-button" :aria-label="text('关闭审阅', 'Close review')" :title="text('关闭', 'Close')" @click="closeReview"><X :size="17" /></button>
+            <div><span id="review-drawer-title">{{ text('任务审阅', 'TASK REVIEW') }}</span><strong>EXP-{{ store.selectedExperiment.id.slice(0, 8).toUpperCase() }}</strong></div>
+            <button ref="reviewClose" class="icon-button" :aria-label="text('关闭审阅', 'Close review')" :title="text('关闭', 'Close')" @click="closeReview"><X :size="17" /></button>
           </header>
           <ExperimentReview
             :project="store.selectedProject"

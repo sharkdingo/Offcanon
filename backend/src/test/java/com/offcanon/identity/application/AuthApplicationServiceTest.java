@@ -80,6 +80,28 @@ class AuthApplicationServiceTest {
     }
 
     @Test
+    void changingPasswordRequiresCurrentPasswordAndRotatesSessions() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        InMemoryUserRepository users = new InMemoryUserRepository();
+        InMemoryUserSettingsRepository settings = new InMemoryUserSettingsRepository();
+        InMemoryAuthSessionRepository sessions = new InMemoryAuthSessionRepository();
+        AuthApplicationService auth = service(users, settings, sessions, clock, Duration.ofHours(2));
+
+        AuthApplicationService.AuthResult registered = auth.register("alice", "old password");
+        AuthApplicationService.AuthResult secondDevice = auth.login("alice", "old password");
+        assertThrows(UnauthorizedException.class, () -> auth.changePassword(registered.user(), "wrong password", "new password"));
+        assertEquals(registered.user().id(), auth.authenticate("Bearer " + registered.token()).id());
+
+        AuthApplicationService.AuthResult rotated = auth.changePassword(registered.user(), "old password", "new password");
+        assertNotEquals(registered.token(), rotated.token());
+        assertThrows(UnauthorizedException.class, () -> auth.authenticate("Bearer " + registered.token()));
+        assertThrows(UnauthorizedException.class, () -> auth.authenticate("Bearer " + secondDevice.token()));
+        assertEquals(registered.user().id(), auth.authenticate("Bearer " + rotated.token()).id());
+        assertTrue(new Pbkdf2PasswordHasher().matches("new password", users.findById(registered.user().id()).orElseThrow().passwordHash()));
+        assertNotEquals("new password", users.findById(registered.user().id()).orElseThrow().passwordHash());
+    }
+
+    @Test
     void rejectsAmbiguousModelEndpointsBeforeTheyCanBePersisted() {
         Instant now = Instant.parse("2026-01-01T00:00:00Z");
         assertThrows(IllegalArgumentException.class, () -> new UserSettings(

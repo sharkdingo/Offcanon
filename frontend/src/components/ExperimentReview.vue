@@ -149,7 +149,7 @@ const failurePresentation = computed<FailurePresentation | null>(() => {
       ),
     }
   }
-  if (code === 'MODEL_ENDPOINT_NOT_ALLOWED' || code === 'MODEL_ENDPOINT_INVALID' || code === 'MODEL_REQUEST_FAILED') {
+  if (code === 'MODEL_ENDPOINT_INVALID' || code === 'MODEL_REQUEST_FAILED') {
     return {
       title: text('模型连接设置不可用', 'Model connection settings are not usable'),
       detail: text(
@@ -209,7 +209,6 @@ const failureRetryable = computed(() => {
 })
 const failureNeedsSettings = computed(() => [
   'MODEL_NOT_CONFIGURED',
-  'MODEL_ENDPOINT_NOT_ALLOWED',
   'MODEL_ENDPOINT_INVALID',
   'MODEL_REQUEST_FAILED',
 ].includes(failureCode(props.experiment?.failureReason?.trim() ?? '')))

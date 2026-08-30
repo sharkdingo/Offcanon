@@ -16,7 +16,7 @@ public final class ModelEndpointPolicy {
     }
 
     /**
-     * Returns a stable allowlist key, or {@code null} when the value is not a
+     * Returns a stable canonical key, or {@code null} when the value is not a
      * valid HTTP(S) endpoint. A trailing {@code /chat/completions} is accepted
      * and normalized back to the provider base URL.
      */

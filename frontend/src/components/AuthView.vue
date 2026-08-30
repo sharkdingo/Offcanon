@@ -2,6 +2,7 @@
 import { ArrowRight, Languages, LockKeyhole, LoaderCircle } from 'lucide-vue-next'
 import { computed, ref } from 'vue'
 import { useAuthStore } from '../stores/auth'
+import { formatError } from '../ui'
 
 const auth = useAuthStore()
 const username = ref('')
@@ -25,7 +26,7 @@ async function submit() {
   try {
     await auth.signIn(username.value, password.value, register.value)
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : (isZh.value ? '无法登录。' : 'Unable to sign in.')
+    error.value = formatError(cause, '无法登录。', 'Unable to sign in.')
   } finally {
     submitting.value = false
   }
@@ -43,18 +44,18 @@ async function submit() {
       <h1 id="auth-title">{{ isZh ? '让改动清晰可见。' : 'Make the change legible.' }}</h1>
       <p class="auth-lede">{{ isZh ? '隔离改动、可信验证，再清晰地回到主线。' : 'A quiet workspace for isolated changes, trusted checks, and a clear return to canonical.' }}</p>
 
-      <div class="auth-tabs" role="tablist" :aria-label="isZh ? '账户操作' : 'Account action'">
-        <button type="button" role="tab" :aria-selected="!register" @click="register = false">{{ isZh ? '登录' : 'Sign in' }}</button>
-        <button type="button" role="tab" :aria-selected="register" @click="register = true">{{ isZh ? '创建账户' : 'Create account' }}</button>
+      <div class="auth-tabs" role="group" :aria-label="isZh ? '账户操作' : 'Account action'">
+        <button type="button" :aria-pressed="!register" @click="register = false">{{ isZh ? '登录' : 'Sign in' }}</button>
+        <button type="button" :aria-pressed="register" @click="register = true">{{ isZh ? '创建账户' : 'Create account' }}</button>
       </div>
 
-      <form class="auth-form" @submit.prevent="submit">
+      <form id="auth-form" class="auth-form" @submit.prevent="submit">
         <label for="auth-username">{{ isZh ? '用户名' : 'Username' }}</label>
-        <input id="auth-username" v-model="username" autofocus autocomplete="username" :placeholder="isZh ? '例如：alex' : 'e.g. alex'" minlength="3" maxlength="64" required />
+        <input id="auth-username" v-model="username" autofocus autocomplete="username" :placeholder="isZh ? '例如：alex' : 'e.g. alex'" minlength="3" maxlength="64" required :aria-invalid="error ? 'true' : 'false'" :aria-describedby="error ? 'auth-error' : undefined" />
         <label for="auth-password">{{ isZh ? '密码' : 'Password' }}</label>
-        <input id="auth-password" v-model="password" type="password" :autocomplete="register ? 'new-password' : 'current-password'" :placeholder="isZh ? '至少 8 位' : 'At least 8 characters'" minlength="8" maxlength="256" required />
-        <p v-if="error" class="field-error" role="alert">{{ error }}</p>
-        <button class="button primary auth-submit" :disabled="submitting">
+        <input id="auth-password" v-model="password" type="password" :autocomplete="register ? 'new-password' : 'current-password'" :placeholder="isZh ? '至少 8 位' : 'At least 8 characters'" minlength="8" maxlength="256" required :aria-invalid="error ? 'true' : 'false'" :aria-describedby="error ? 'auth-error' : undefined" />
+        <p v-if="error" id="auth-error" class="field-error" role="alert">{{ error }}</p>
+        <button type="submit" class="button primary auth-submit" :disabled="submitting" form="auth-form">
           <LoaderCircle v-if="submitting" class="spin" :size="16" />
           <LockKeyhole v-else :size="16" />
           {{ register ? (isZh ? '创建账户' : 'Create account') : (isZh ? '登录' : 'Sign in') }}

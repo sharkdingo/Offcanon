@@ -1,4 +1,4 @@
-import { getAuthToken, notifyUnauthorized } from './authToken'
+import { notifyUnauthorized } from './authToken'
 
 export type Project = {
   id: string
@@ -150,7 +150,6 @@ export type AuthUser = {
 }
 
 export type AuthResponse = {
-  token: string
   expiresAt: string
   user: AuthUser
 }
@@ -193,6 +192,16 @@ export type RuntimeSettingsPolicy = {
   contextLimitCharsCeiling: number
 }
 
+export type StorageSummary = {
+  projects: number
+  sessions: number
+  experiments: number
+  evidence: number
+  events: number
+  memoryRevisions: number
+  snapshots: number
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -207,13 +216,11 @@ export class ApiError extends Error {
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const token = getAuthToken()
   const headers = new Headers(init?.headers)
   if (!headers.has('Content-Type') && init?.body) headers.set('Content-Type', 'application/json')
-  if (token) headers.set('Authorization', `Bearer ${token}`)
-  const response = await fetch(url, { ...init, headers })
+  const response = await fetch(url, { ...init, headers, credentials: 'same-origin' })
   if (!response.ok) {
-    if (response.status === 401) notifyUnauthorized(token)
+    if (response.status === 401) notifyUnauthorized()
     const detail = await response.json().catch(() => ({ detail: response.statusText })) as {
       detail?: string
       message?: string
@@ -249,6 +256,11 @@ export const api = {
     request<UserSettings>('/api/settings/model-credential', { method: 'DELETE' }),
   testModel: (body: { modelEndpoint: string; modelName: string; apiKey?: string }) =>
     request<ModelTestResponse>('/api/settings/model-test', { method: 'POST', body: JSON.stringify(body) }),
+  changePassword: (body: { currentPassword: string; newPassword: string }) =>
+    request<{ expiresAt: string; user: AuthUser }>('/api/auth/password', { method: 'PUT', body: JSON.stringify(body) }),
+  storageSummary: () => request<StorageSummary>('/api/settings/storage'),
+  cleanupRuntime: () => request<{ removed: number }>('/api/settings/storage/runtime', { method: 'POST' }),
+  exportData: () => request<Record<string, unknown>>('/api/settings/storage/export'),
   projects: () => request<Project[]>('/api/projects'),
   browseDirectories: (path?: string) => {
     const query = path ? `?path=${encodeURIComponent(path)}` : ''

@@ -27,8 +27,6 @@ public class IdentityContext {
     }
 
     private String authorization(HttpServletRequest request) {
-        String header = request.getHeader("Authorization");
-        if (header != null && !header.isBlank()) return header;
         if (request.getCookies() != null) {
             for (var cookie : request.getCookies()) {
                 if ("OFFCANON_SESSION".equals(cookie.getName()) && cookie.getValue() != null && !cookie.getValue().isBlank()) {

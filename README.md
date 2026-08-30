@@ -28,8 +28,9 @@ Everything a normal user needs is available in the Settings screen:
 - model Endpoint and model name;
 - model API key, encrypted at rest and never returned to the browser;
 - theme, language, and bounded run defaults.
+ - password rotation, non-secret history export, and cleanup of rebuildable runtime files.
 
-The server validates the Endpoint as an HTTP(S) URL and sends the account's key only to that saved Endpoint. Data-directory and database-engine details are application-owned so a user does not need to install or administer infrastructure.
+The server validates the Endpoint as an HTTP(S) base URL for OpenAI-compatible Chat Completions and appends `/chat/completions`; it sends the account's key only to that saved Endpoint. Data-directory and database-engine details are application-owned so a user does not need to install or administer infrastructure.
 
 ## Run Locally
 

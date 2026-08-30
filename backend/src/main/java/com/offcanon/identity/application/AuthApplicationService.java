@@ -111,6 +111,21 @@ public class AuthApplicationService {
         return issue(user);
     }
 
+    /** Changes a password only after proving the current password. */
+    @Transactional
+    public AuthResult changePassword(User user, String currentPassword, String nextPassword) {
+        if (user == null || !passwords.matches(currentPassword, user.passwordHash())) {
+            throw new UnauthorizedException("Current password is incorrect");
+        }
+        String nextHash = passwords.hash(nextPassword);
+        User current = users.findById(user.id()).orElseThrow(() -> new UnauthorizedException("Session is invalid or expired"));
+        User updated = new User(current.id(), current.username(), nextHash, current.createdAt(), current.version() + 1);
+        users.save(updated);
+        // Revoke all sessions and issue a fresh one for the current browser.
+        sessions.deleteByUserId(user.id());
+        return issue(updated);
+    }
+
     public User authenticate(String authorizationHeader) {
         return authenticateToken(bearerToken(authorizationHeader));
     }
@@ -228,7 +243,7 @@ public class AuthApplicationService {
     private String bearerToken(String value) {
         if (value == null || value.isBlank()) return null;
         if (!value.regionMatches(true, 0, "Bearer ", 0, 7)) {
-            throw new UnauthorizedException("Use an Authorization: Bearer <token> header");
+            throw new UnauthorizedException("Authentication is required");
         }
         String token = value.substring(7).trim();
         if (token.isBlank() || token.length() > 256) throw new UnauthorizedException("Session is invalid or expired");

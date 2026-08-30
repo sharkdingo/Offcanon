@@ -6,6 +6,7 @@ import com.offcanon.port.AuthSessionRepository;
 import java.time.Instant;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.UUID;
 import com.offcanon.shared.domain.DomainException;
 public class InMemoryAuthSessionRepository implements AuthSessionRepository {
     private final ConcurrentHashMap<String, AuthSession> sessions = new ConcurrentHashMap<>();
@@ -33,5 +34,10 @@ public class InMemoryAuthSessionRepository implements AuthSessionRepository {
     @Override
     public void deleteExpired(Instant now) {
         sessions.entrySet().removeIf(entry -> entry.getValue().expiredAt(now));
+    }
+
+    @Override
+    public void deleteByUserId(UUID userId) {
+        sessions.entrySet().removeIf(entry -> entry.getValue().userId().equals(userId));
     }
 }

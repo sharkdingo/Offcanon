@@ -13,6 +13,7 @@ import {
   type Session,
 } from '../api'
 import { localizedText } from '../i18n'
+import { formatError } from '../ui'
 
 export const useWorkspaceStore = defineStore('workspace', () => {
   const projects = ref<Project[]>([])
@@ -49,7 +50,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   }
 
   function causeMessage(cause: unknown, fallback: string) {
-    return cause instanceof Error ? cause.message : fallback
+    return formatError(cause, fallback, fallback)
   }
 
   function resetDetailState(clearData = true) {
@@ -86,7 +87,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       projects.value = loadedProjects
     } catch (cause) {
       if (!isCurrent(generation) || requestId !== projectsRequest) return
-      error.value = cause instanceof Error ? cause.message : localizedText('无法加载项目。', 'Unable to load projects')
+      error.value = formatError(cause, '无法加载项目。', 'Unable to load projects')
     } finally {
       if (isCurrent(generation) && requestId === projectsRequest) loading.value = false
     }
@@ -132,7 +133,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       void loadPromotionRecovery(projectId, generation)
     } catch (cause) {
       if (!isCurrent(generation) || requestId !== projectRequest || selectedProjectId.value !== projectId) return
-      error.value = cause instanceof Error ? cause.message : localizedText('无法加载实验。', 'Unable to load experiments')
+      error.value = formatError(cause, '无法加载实验。', 'Unable to load experiments')
     }
   }
 

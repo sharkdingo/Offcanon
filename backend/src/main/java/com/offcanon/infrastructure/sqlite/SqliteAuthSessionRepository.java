@@ -12,6 +12,7 @@ import java.sql.SQLException;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Optional;
+import java.util.UUID;
 
 @Repository
 
@@ -61,6 +62,11 @@ public class SqliteAuthSessionRepository implements AuthSessionRepository {
     @Override
     public void deleteExpired(Instant now) {
         jdbc.update("DELETE FROM auth_sessions WHERE expires_at<=?", SqliteValues.epochMicros(now));
+    }
+
+    @Override
+    public void deleteByUserId(UUID userId) {
+        jdbc.update("DELETE FROM auth_sessions WHERE user_id=?", userId.toString());
     }
 
     private AuthSession map(ResultSet result, int row) throws SQLException {

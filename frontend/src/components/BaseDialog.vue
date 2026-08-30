@@ -34,6 +34,17 @@ function handleBackdrop(event: MouseEvent) {
   if (outside) close()
 }
 
+function trapFocus(event: KeyboardEvent) {
+  if (event.key !== 'Tab' || !dialog.value) return
+  const focusable = Array.from(dialog.value.querySelectorAll<HTMLElement>('button, a[href], input, textarea, select, [tabindex]:not([tabindex="-1"])'))
+    .filter((item) => !item.hasAttribute('disabled') && item.offsetParent !== null)
+  if (!focusable.length) return
+  const first = focusable[0]
+  const last = focusable[focusable.length - 1]
+  if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
+  else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
+}
+
 onMounted(() => {
   dialog.value?.showModal()
   window.setTimeout(() => {
@@ -61,6 +72,7 @@ defineExpose({ close })
     @keydown.esc.prevent.stop="close"
     @close="handleClose"
     @click="handleBackdrop"
+    @keydown="trapFocus"
   >
     <slot :close="close" />
   </dialog>
