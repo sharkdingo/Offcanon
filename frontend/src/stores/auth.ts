@@ -160,7 +160,7 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   async function signOut() {
-    try { if (session.value) await api.logout() } catch { /* token is cleared locally even if the server is unavailable */ }
+    try { if (session.value) await api.logout() } catch { /* local state is cleared even if the server is unavailable */ }
     session.value = null
     onboardingComplete.value = false
     applyTheme('system', false)

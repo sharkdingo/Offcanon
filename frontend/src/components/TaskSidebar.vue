@@ -42,7 +42,7 @@ function taskTitle(session: Session) {
       <div class="sidebar-section-label">{{ text('项目', 'Projects') }}</div>
       <div class="sidebar-heading-actions">
         <button class="icon-button small" :aria-label="text('打开项目', 'Open project')" :title="text('打开项目', 'Open project')" @click="emit('addProject')"><Plus :size="15" /></button>
-        <button class="icon-button small sidebar-close" :aria-label="text('关闭任务导航', 'Close task navigation')" :title="text('关闭', 'Close')" @click="emit('close')"><PanelLeftClose :size="15" /></button>
+        <button v-if="selectedProjectId" class="icon-button small sidebar-close" :aria-label="text('关闭任务导航', 'Close task navigation')" :title="text('关闭', 'Close')" @click="emit('close')"><PanelLeftClose :size="15" /></button>
       </div>
     </div>
 

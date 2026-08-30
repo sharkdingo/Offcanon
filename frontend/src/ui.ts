@@ -98,6 +98,7 @@ export function formatError(cause: unknown, zhFallback: string, enFallback: stri
     MODEL_REQUEST_FAILED: ['模型服务拒绝了请求，请检查连接设置。', 'The model service rejected the request. Check the connection settings.'],
     MODEL_TRANSIENT_FAILURE: ['模型服务暂时不可用，请稍后重试。', 'The model service is temporarily unavailable. Try again later.'],
     MODEL_CONNECTION_FAILED: ['无法连接模型服务，请检查 Endpoint、模型名和 API key。', 'Could not connect to the model service. Check the endpoint, model, and API key.'],
+    DIFF_UNAVAILABLE: ['这个实验的临时工作区已清理，变更详情不可用。', 'This experiment workspace was cleaned up, so its change details are unavailable.'],
     PROJECT_NOT_FOUND: ['项目已不存在，请刷新项目列表。', 'The project is no longer available. Refresh the project list.'],
     PROJECT_PATH_IMMUTABLE: ['项目路径不能修改；请重新打开正确的仓库。', 'A project path cannot be changed; reopen the correct repository.'],
     VERIFICATION_POLICY_LOCKED: ['项目已有实验后不能修改验收命令。', 'Acceptance commands cannot change after experiments exist.'],
