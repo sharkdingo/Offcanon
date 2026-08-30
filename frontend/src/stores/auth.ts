@@ -17,6 +17,9 @@ export type AuthSession = {
 }
 
 const AUTH_STORAGE_KEY = 'offcanon.auth.v3'
+// Stale browser-only session payloads are removed for security hygiene.
+// They are never parsed or used as an authentication fallback.
+const STALE_AUTH_STORAGE_KEYS = ['offcanon.auth.v2', 'offcanon.auth.v1']
 const ONBOARDING_STORAGE_PREFIX = 'offcanon.onboarding.v2.'
 const THEME_STORAGE_KEY = 'offcanon.theme.v2'
 const LOCALE_STORAGE_KEY = 'offcanon.locale.v1'
@@ -103,6 +106,7 @@ export const useAuthStore = defineStore('auth', () => {
       unauthorizedListenerInstalled = true
     }
     hydrateLocalPreferences()
+    for (const key of STALE_AUTH_STORAGE_KEYS) removeValue(key)
     const stored = readJson<Pick<AuthSession, 'subject' | 'displayName' | 'mode' | 'signedInAt' | 'expiresAt' | 'user'>>(AUTH_STORAGE_KEY)
     if (stored?.user?.id && stored.user.username) {
       try {

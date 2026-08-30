@@ -82,10 +82,10 @@ The local workspace remains application-level isolation rather than an OS securi
 The HTTP surface keeps account state separate from experiment state:
 
 ```text
-POST /api/auth/register  -> create a local user, default settings and a bearer session
-POST /api/auth/login     -> issue another bearer session
-GET  /api/auth/me        -> validate the bearer session
-POST /api/auth/logout    -> revoke the current bearer session
+POST /api/auth/register  -> create a local user, default settings and an HttpOnly session cookie
+POST /api/auth/login     -> issue another HttpOnly session cookie
+GET  /api/auth/me        -> validate the HttpOnly session cookie
+POST /api/auth/logout    -> revoke the current HttpOnly session cookie
 GET/PUT /api/settings    -> read or update account preferences (key status only)
 DELETE /api/settings/model-credential -> explicitly clear the encrypted account model key
 POST /api/settings/model-test -> test saved or draft model credentials without persisting them
