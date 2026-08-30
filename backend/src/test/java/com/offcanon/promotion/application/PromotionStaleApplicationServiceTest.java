@@ -102,7 +102,8 @@ class PromotionStaleApplicationServiceTest {
         experiments.save(experiment);
 
         PromotionStaleApplicationService service = new PromotionStaleApplicationService(experiments, projects, snapshots,
-                new FixedFingerprintSnapshotPort(currentFingerprint), new InMemoryEventSink(), new InMemoryPromotionLock());
+                new FixedFingerprintSnapshotPort(currentFingerprint), new InMemoryEventSink(), new InMemoryPromotionLock(),
+                new InMemoryPromotionJournal());
         return new Fixture(canonicalFile, experiment, experiments, service, projects, snapshots);
     }
 

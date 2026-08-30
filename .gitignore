@@ -15,7 +15,6 @@ backend/.offcanon/
 .offcanon-frontend*.log
 .env
 .env.*
-!.env.example
 
 # Workspace input material
 tmp/

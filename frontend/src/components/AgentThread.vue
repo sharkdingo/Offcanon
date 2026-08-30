@@ -98,9 +98,9 @@ const workingStatuses = new Set([
 const cancellableStatuses = new Set(['READY_TO_RUN', 'RUNNING', 'AGENT_COMPLETED', 'VERIFYING'])
 const composerAvailable = computed(() => !latest.value || continuableStatuses.has(latest.value.status))
 const modelReady = computed(() => Boolean(modelStatus.value?.apiKeyConfigured
-  && modelStatus.value.effectiveEndpointConfigured
-  && modelStatus.value.effectiveModelConfigured
-  && modelStatus.value.effectiveEndpointAllowed))
+  && modelStatus.value.endpointConfigured
+  && modelStatus.value.modelConfigured
+  && modelStatus.value.endpointValid))
 const canSubmit = computed(() => !!props.project && modelReady.value && composerAvailable.value && draft.value.trim().length > 0 && !props.actionBusy)
 
 const modelGateCopy = computed(() => {
@@ -115,15 +115,15 @@ const modelGateCopy = computed(() => {
   }
   if (!status?.apiKeyConfigured) return {
     title: text('开始前需要配置模型 API Key', 'A model API key is required before starting'),
-    detail: text('API Key 由运行 Offcanon 的服务端保管，不会发送到浏览器。', 'The API key is held by the Offcanon server and never sent to the browser.'),
+    detail: text('请在设置中保存当前账户的 API Key。', 'Save an API key for this account in Settings.'),
   }
-  if (!status.effectiveEndpointConfigured || !status.effectiveModelConfigured) return {
+  if (!status.endpointConfigured || !status.modelConfigured) return {
     title: text('请选择模型服务和模型', 'Choose a model service and model'),
     detail: text('在设置中保存 Endpoint 和模型名后即可发送任务。', 'Save an endpoint and model name in Settings before sending a task.'),
   }
-  if (!status.effectiveEndpointAllowed) return {
-    title: text('当前模型地址未获服务端允许', 'The selected model endpoint is not allowed'),
-    detail: text('请选择服务端信任列表中的 Endpoint，或联系 Offcanon 管理员。', 'Choose an endpoint trusted by the server, or contact the Offcanon administrator.'),
+  if (!status.endpointValid) return {
+    title: text('模型地址无效', 'The model endpoint is invalid'),
+    detail: text('请输入不带凭据、查询参数或片段的 HTTP(S) 地址。', 'Enter an HTTP(S) URL without credentials, query parameters, or fragments.'),
   }
   return null
 })

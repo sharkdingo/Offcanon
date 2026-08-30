@@ -33,15 +33,15 @@ public record RuntimeSettingsPolicy(
             throw new IllegalArgumentException("Context limit ceiling must be between 8000 and 1000000 characters");
         }
         if (defaultMaxSteps < MIN_MAX_STEPS || defaultMaxSteps > maxStepsCeiling) {
-            throw new IllegalArgumentException("Default max steps must not exceed the deployment ceiling");
+            throw new IllegalArgumentException("Default max steps must not exceed the application safety limit");
         }
         if (defaultRunTimeoutSeconds < MIN_RUN_TIMEOUT_SECONDS
                 || defaultRunTimeoutSeconds > runTimeoutSecondsCeiling) {
-            throw new IllegalArgumentException("Default run timeout must not exceed the deployment ceiling");
+            throw new IllegalArgumentException("Default run timeout must not exceed the application safety limit");
         }
         if (defaultContextLimitChars < MIN_CONTEXT_LIMIT_CHARS
                 || defaultContextLimitChars > contextLimitCharsCeiling) {
-            throw new IllegalArgumentException("Default context limit must not exceed the deployment ceiling");
+            throw new IllegalArgumentException("Default context limit must not exceed the application safety limit");
         }
     }
 
@@ -54,16 +54,16 @@ public record RuntimeSettingsPolicy(
     public void validate(int maxSteps, long runTimeoutSeconds, int contextLimitChars) {
         if (maxSteps < MIN_MAX_STEPS || maxSteps > maxStepsCeiling) {
             throw new DomainException("AGENT_MAX_STEPS_OUT_OF_POLICY",
-                    "Max steps must be between 1 and the deployment ceiling of " + maxStepsCeiling);
+                    "Max steps must be between 1 and the application safety limit of " + maxStepsCeiling);
         }
         if (runTimeoutSeconds < MIN_RUN_TIMEOUT_SECONDS || runTimeoutSeconds > runTimeoutSecondsCeiling) {
             throw new DomainException("AGENT_TIMEOUT_OUT_OF_POLICY",
-                    "Run timeout must be between 10 and the deployment ceiling of "
+                    "Run timeout must be between 10 and the application safety limit of "
                             + runTimeoutSecondsCeiling + " seconds");
         }
         if (contextLimitChars < MIN_CONTEXT_LIMIT_CHARS || contextLimitChars > contextLimitCharsCeiling) {
             throw new DomainException("AGENT_CONTEXT_OUT_OF_POLICY",
-                    "Context limit must be between 8000 and the deployment ceiling of "
+                    "Context limit must be between 8000 and the application safety limit of "
                             + contextLimitCharsCeiling + " characters");
         }
     }

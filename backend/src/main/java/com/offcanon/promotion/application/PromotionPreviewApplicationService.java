@@ -133,17 +133,5 @@ public class PromotionPreviewApplicationService {
                                    boolean recoveryRequired,
                                    String recoveryJournalPhase,
                                    UUID recoveryPromotionId) {
-        /** Preserve the original constructor for embedded callers and tests. */
-        public PromotionPreview(String baseFingerprint,
-                                String currentFingerprint,
-                                String finalCandidateFingerprint,
-                                String verificationStatus,
-                                boolean trustedVerification,
-                                boolean conflict,
-                                String blockingReason,
-                                boolean promotable) {
-            this(baseFingerprint, currentFingerprint, finalCandidateFingerprint, verificationStatus,
-                    trustedVerification, conflict, blockingReason, promotable, false, null, null);
-        }
     }
 }

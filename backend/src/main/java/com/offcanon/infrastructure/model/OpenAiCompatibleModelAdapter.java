@@ -35,63 +35,30 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.function.Supplier;
 
 @Component
 public class OpenAiCompatibleModelAdapter implements ModelPort {
     private final ObjectMapper mapper;
     private final HttpClient http;
-    private final String configuredBaseUrl;
-    private final String configuredModel;
-    private final String configuredAllowedBaseUrls;
     private final Duration requestTimeout;
-    private final Supplier<String> apiKeySupplier;
     private static final int MAX_RESPONSE_BYTES = 2_000_000;
 
     @Autowired
     public OpenAiCompatibleModelAdapter(ObjectMapper mapper,
-                                        @Value("${offcanon.model.base-url:}") String configuredBaseUrl,
-                                        @Value("${offcanon.model.name:}") String configuredModel,
-                                        @Value("${offcanon.model.allowed-base-urls:${OFFCANON_MODEL_ALLOWED_BASE_URLS:}}") String configuredAllowedBaseUrls,
                                         @Value("${offcanon.model.request-timeout-seconds:120}") long requestTimeoutSeconds) {
         this(mapper, HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(),
-                configuredBaseUrl, configuredModel, configuredAllowedBaseUrls,
-                Duration.ofSeconds(Math.max(5, requestTimeoutSeconds)),
-                OpenAiCompatibleModelAdapter::environmentApiKey);
+                Duration.ofSeconds(Math.max(5, requestTimeoutSeconds)));
     }
 
-    OpenAiCompatibleModelAdapter(ObjectMapper mapper,
-                                 HttpClient http,
-                                 String configuredBaseUrl,
-                                 String configuredModel,
-                                 Duration requestTimeout,
-                                 Supplier<String> apiKeySupplier) {
-        this(mapper, http, configuredBaseUrl, configuredModel, configuredBaseUrl,
-                requestTimeout, apiKeySupplier);
-    }
-
-    OpenAiCompatibleModelAdapter(ObjectMapper mapper,
-                                 HttpClient http,
-                                 String configuredBaseUrl,
-                                 String configuredModel,
-                                 String configuredAllowedBaseUrls,
-                                 Duration requestTimeout,
-                                 Supplier<String> apiKeySupplier) {
+    OpenAiCompatibleModelAdapter(ObjectMapper mapper, HttpClient http, Duration requestTimeout) {
         this.mapper = Objects.requireNonNull(mapper, "mapper");
         this.http = Objects.requireNonNull(http, "http");
-        this.configuredBaseUrl = trimToEmpty(configuredBaseUrl);
-        this.configuredModel = trimToEmpty(configuredModel);
-        this.configuredAllowedBaseUrls = trimToEmpty(configuredAllowedBaseUrls);
-        ModelEndpointPolicy.allowedEndpoints(this.configuredBaseUrl,
-                this.configuredAllowedBaseUrls, "");
         this.requestTimeout = Objects.requireNonNull(requestTimeout, "requestTimeout");
-        this.apiKeySupplier = Objects.requireNonNull(apiKeySupplier, "apiKeySupplier");
     }
 
     @Override
@@ -99,28 +66,21 @@ public class OpenAiCompatibleModelAdapter implements ModelPort {
         if (request == null) {
             throw new DomainException("MODEL_REQUEST_INVALID", "Model request must not be null");
         }
-        String apiKey = firstNonBlank(apiKeySupplier.get());
+        String apiKey = firstNonBlank(request.modelApiKey());
         if (apiKey == null) {
-            throw new DomainException("MODEL_NOT_CONFIGURED", "Set OFFCANON_MODEL_API_KEY before starting an agent run");
+            throw new DomainException("MODEL_NOT_CONFIGURED", "Set a model API key in Settings before starting an agent run");
         }
-        String configuredEnvironmentBaseUrl = firstNonBlank(System.getenv("OFFCANON_MODEL_BASE_URL"));
-        String configuredEndpoint = firstNonBlank(configuredBaseUrl, configuredEnvironmentBaseUrl);
         String requestedEndpoint = firstNonBlank(request.modelEndpoint());
         if (requestedEndpoint != null) {
             if (!ModelEndpointPolicy.isValid(requestedEndpoint)) {
                 throw new DomainException("MODEL_ENDPOINT_INVALID",
                         "The requested model endpoint must be a valid HTTP(S) base URL without credentials, query or fragment");
             }
-            if (!ModelEndpointPolicy.isAllowed(requestedEndpoint, configuredBaseUrl,
-                    configuredAllowedBaseUrls, configuredEnvironmentBaseUrl)) {
-                throw new DomainException("MODEL_ENDPOINT_NOT_ALLOWED",
-                        "The requested model endpoint is not in the server's trusted endpoint allowlist");
-            }
         }
-        String baseUrl = firstNonBlank(requestedEndpoint, configuredEndpoint);
-        String model = firstNonBlank(request.modelName(), configuredModel, System.getenv("OFFCANON_MODEL_NAME"));
+        String baseUrl = requestedEndpoint;
+        String model = firstNonBlank(request.modelName());
         if (baseUrl == null || model == null) {
-            throw new DomainException("MODEL_NOT_CONFIGURED", "Set OFFCANON_MODEL_BASE_URL and OFFCANON_MODEL_NAME before starting an agent run");
+            throw new DomainException("MODEL_NOT_CONFIGURED", "Set a model endpoint and model name in Settings before starting an agent run");
         }
         if (!ModelEndpointPolicy.isValid(baseUrl)) {
             throw new DomainException("MODEL_ENDPOINT_INVALID",
@@ -261,10 +221,6 @@ public class OpenAiCompatibleModelAdapter implements ModelPort {
         String trimmed = baseUrl.trim();
         while (trimmed.endsWith("/")) trimmed = trimmed.substring(0, trimmed.length() - 1);
         return URI.create(trimmed.endsWith("/chat/completions") ? trimmed : trimmed + "/chat/completions");
-    }
-
-    private String trimToEmpty(String value) {
-        return value == null ? "" : value.trim();
     }
 
     private ArrayNode serializeMessages(List<ModelMessage> messages) {
@@ -410,7 +366,4 @@ public class OpenAiCompatibleModelAdapter implements ModelPort {
         return null;
     }
 
-    private static String environmentApiKey() {
-        return System.getenv("OFFCANON_MODEL_API_KEY");
-    }
 }

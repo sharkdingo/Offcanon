@@ -29,7 +29,6 @@ public class PromotionStaleApplicationService {
     private final PromotionLockPort promotionLock;
     private final PromotionJournalPort promotionJournals;
 
-    @org.springframework.beans.factory.annotation.Autowired
     public PromotionStaleApplicationService(ExperimentRepository experiments,
                                              ProjectRepository projects,
                                              SnapshotRepository snapshots,
@@ -46,16 +45,6 @@ public class PromotionStaleApplicationService {
         this.promotionJournals = promotionJournals;
     }
 
-    /** Backward-compatible constructor for embedders that do not persist journals. */
-    public PromotionStaleApplicationService(ExperimentRepository experiments,
-                                             ProjectRepository projects,
-                                             SnapshotRepository snapshots,
-                                             SnapshotPort snapshotPort,
-                                             EventSink events,
-                                             PromotionLockPort promotionLock) {
-        this(experiments, projects, snapshots, snapshotPort, events, promotionLock, null);
-    }
-
     public StaleConfirmation confirm(UUID experimentId) {
         Experiment initial = experiments.findById(experimentId)
                 .orElseThrow(() -> new NotFoundException("Experiment not found: " + experimentId));
@@ -70,14 +59,12 @@ public class PromotionStaleApplicationService {
             if (!project.id().equals(initialProject.id())) {
                 throw new DomainException("PROJECT_CHANGED", "Experiment project changed while confirmation was starting");
             }
-            if (promotionJournals != null) {
-                var unresolved = promotionJournals.findUnresolvedByProject(project.id());
-                if (!unresolved.isEmpty()) {
-                    var blocking = unresolved.getFirst();
-                    throw new DomainException("PROMOTION_RECOVERY_PENDING",
-                            "Promotion " + blocking.promotionId() + " is still "
-                                    + blocking.phase().name() + "; reconcile it before confirming stale state");
-                }
+            var unresolved = promotionJournals.findUnresolvedByProject(project.id());
+            if (!unresolved.isEmpty()) {
+                var blocking = unresolved.getFirst();
+                throw new DomainException("PROMOTION_RECOVERY_PENDING",
+                        "Promotion " + blocking.promotionId() + " is still "
+                                + blocking.phase().name() + "; reconcile it before confirming stale state");
             }
             if (experiment.status() != ExperimentStatus.VERIFIED) {
                 return StaleConfirmation.unchanged("NOT_VERIFIED",

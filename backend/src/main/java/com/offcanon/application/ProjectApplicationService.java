@@ -21,11 +21,6 @@ public class ProjectApplicationService {
     private final ExperimentRepository experiments;
     private final PromotionLockPort promotionLock;
 
-    public ProjectApplicationService(ProjectRepository projectRepository, SnapshotPort snapshots) {
-        this(projectRepository, snapshots, null, null);
-    }
-
-    @org.springframework.beans.factory.annotation.Autowired
     public ProjectApplicationService(ProjectRepository projectRepository,
                                      SnapshotPort snapshots,
                                      ExperimentRepository experiments,
@@ -34,13 +29,6 @@ public class ProjectApplicationService {
         this.snapshots = snapshots;
         this.experiments = experiments;
         this.promotionLock = promotionLock;
-    }
-
-    /** Compatibility constructor for embedded callers that do not need locks. */
-    public ProjectApplicationService(ProjectRepository projectRepository,
-                                     SnapshotPort snapshots,
-                                     ExperimentRepository experiments) {
-        this(projectRepository, snapshots, experiments, null);
     }
 
     public Project register(UUID ownerId, String name, String canonicalPath, List<String> verificationCommands) {
@@ -100,9 +88,6 @@ public class ProjectApplicationService {
                           String name,
                           String canonicalPath,
                           List<String> verificationCommands) {
-        if (promotionLock == null) {
-            return updateUnlocked(ownerId, projectId, name, canonicalPath, verificationCommands);
-        }
         return promotionLock.withProjectLock(projectId,
                 () -> updateUnlocked(ownerId, projectId, name, canonicalPath, verificationCommands));
     }
@@ -121,7 +106,6 @@ public class ProjectApplicationService {
         }
         List<String> policy = normalizeVerificationCommands(verificationCommands);
         if (!current.verificationCommands().equals(policy)
-                && experiments != null
                 && experiments.hasActiveExperimentForProject(projectId)) {
             throw new DomainException("VERIFICATION_POLICY_LOCKED",
                     "Project verification commands cannot change while an experiment or promotion is active");

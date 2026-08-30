@@ -65,7 +65,7 @@ public class AgentRecoveryService {
         applicationReady.set(true);
     }
 
-    /** A Redis lease may still be alive during restart; retry after it expires. */
+    /** Retry periodically when a local worker still held the run lease at startup. */
     @Scheduled(fixedDelayString = "${offcanon.agent.recovery-interval-ms:30000}")
     public void recoverExpiredRuns() {
         if (!applicationReady.get()) return;

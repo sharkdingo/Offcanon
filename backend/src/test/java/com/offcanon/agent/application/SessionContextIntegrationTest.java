@@ -66,7 +66,7 @@ class SessionContextIntegrationTest {
         ExecutorService executor = Executors.newSingleThreadExecutor();
         AgentApplicationService service = new AgentApplicationService(experiments, projects,
                 null, null, loop, null, executor, new InMemoryEventSink(),
-                new InMemorySessionRunLease(), null, null, null, null);
+                new InMemorySessionRunLease(), null, null, null, null, 20, 600, 80_000);
         try {
             service.start(current.id());
             assertTrue(invoked.await(5, TimeUnit.SECONDS));
@@ -122,7 +122,7 @@ class SessionContextIntegrationTest {
         ExecutorService executor = Executors.newSingleThreadExecutor();
         AgentApplicationService service = new AgentApplicationService(experiments, projects,
                 null, null, loop, null, executor, new InMemoryEventSink(),
-                new InMemorySessionRunLease(), null, null, null, null);
+                new InMemorySessionRunLease(), null, null, null, null, 20, 600, 80_000);
         try {
             service.start(current.id());
             assertTrue(invoked.await(5, TimeUnit.SECONDS));

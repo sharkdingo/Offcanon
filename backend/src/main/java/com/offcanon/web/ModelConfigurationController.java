@@ -38,8 +38,8 @@ public class ModelConfigurationController {
 
     /**
      * Sends one no-tools request through the server-side adapter. The endpoint
-     * and model are never persisted by this operation, and the API key is read
-     * only by the backend adapter.
+     * and model are never persisted by this operation. A draft key is accepted
+     * only for this request; when omitted, the saved account key is used.
      */
     @PostMapping("/model-test")
     public ModelTestResponse test(@Valid @RequestBody(required = false) ModelTestRequest body,
@@ -47,11 +47,13 @@ public class ModelConfigurationController {
         var user = identity.requireUser(request);
         String endpoint = body == null || body.modelEndpoint() == null ? "" : body.modelEndpoint().trim();
         String modelName = body == null || body.modelName() == null ? "" : body.modelName().trim();
+        String apiKey = body == null || body.apiKey() == null || body.apiKey().isBlank()
+                ? userSettingsApiKey(user) : body.apiKey().trim();
         try {
             auth.validateModelEndpoint(user, endpoint);
             ModelRequest modelRequest = new ModelRequest(
-                    List.of(ModelMessage.user("Reply with OK only.")), List.of(), TEST_TIMEOUT)
-                    .withProvider(endpoint, modelName);
+                    List.of(ModelMessage.user("Reply with OK only.")), List.of(), TEST_TIMEOUT,
+                    endpoint, modelName, apiKey);
             ModelResponse response = model.complete(modelRequest);
             return new ModelTestResponse(true, "MODEL_CONNECTION_OK",
                     response == null ? "Model responded" : "Model responded successfully");
@@ -63,6 +65,10 @@ public class ModelConfigurationController {
         }
     }
 
+    private String userSettingsApiKey(com.offcanon.identity.domain.User user) {
+        return auth.getSettings(user).modelApiKey();
+    }
+
     private String safeMessage(String value) {
         if (value == null || value.isBlank()) return "The model connection test failed";
         // Do not echo arbitrary provider responses or request URLs into the UI.
@@ -70,7 +76,8 @@ public class ModelConfigurationController {
     }
 
     public record ModelTestRequest(@Size(max = 2_048) String modelEndpoint,
-                                   @Size(max = 200) String modelName) {
+                                   @Size(max = 200) String modelName,
+                                   @Size(max = 4_096) String apiKey) {
     }
 
     public record ModelTestResponse(boolean reachable, String code, String detail) {

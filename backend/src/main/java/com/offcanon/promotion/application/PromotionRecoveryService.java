@@ -121,7 +121,7 @@ public class PromotionRecoveryService {
                     first.phase().name(), first.failureReason(), first.leaseUntil(), unresolved.size());
         }
         // A terminal journal can outlive the lifecycle marker when the two
-        // stores are not transactionally coupled (for example MySQL + Redis).
+        // repository writes and lifecycle markers cannot share one transaction.
         // Surface that mismatch as project recovery as well, so it cannot hide
         // behind an Experiment-only RECOVERY_REQUIRED status.
         try {

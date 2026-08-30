@@ -10,6 +10,7 @@ import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -32,21 +33,18 @@ public class SettingsController {
     }
 
     /**
-     * Exposes only non-secret deployment/model state for the settings UI.  In
+     * Exposes only non-secret account model state for the settings UI. In
      * particular, the API key is reduced to a boolean and is never serialized.
      */
     @GetMapping("/model-status")
     public ModelStatusResponse modelStatus(HttpServletRequest request) {
         AuthApplicationService.ModelConfigurationStatus status =
                 auth.modelConfigurationStatus(identity.requireUser(request));
-        return new ModelStatusResponse(status.apiKeyConfigured(), status.defaultEndpointConfigured(),
-                status.defaultModelConfigured(), status.effectiveEndpointConfigured(),
-                status.effectiveModelConfigured(), status.effectiveEndpointAllowed(),
-                status.effectiveEndpoint(), status.effectiveModel(), status.allowedEndpointCount(),
-                status.allowedEndpoints());
+        return new ModelStatusResponse(status.apiKeyConfigured(), status.endpointConfigured(),
+                status.modelConfigured(), status.endpointValid(), status.endpoint(), status.model());
     }
 
-    /** Deployment ceilings are safe to show because they contain no secrets. */
+    /** Application safety limits are safe to show because they contain no secrets. */
     @GetMapping("/runtime-policy")
     public RuntimePolicyResponse runtimePolicy(HttpServletRequest request) {
         identity.requireUser(request);
@@ -60,12 +58,19 @@ public class SettingsController {
     public SettingsResponse update(@Valid @RequestBody UpdateSettingsRequest body,
                                    HttpServletRequest request) {
         return response(auth.updateSettings(identity.requireUser(request), body.theme(), body.locale(), body.modelEndpoint(),
-                body.modelName(), body.agentMaxSteps(), body.agentRunTimeoutSeconds(), body.contextLimitChars()));
+                body.modelName(), body.modelApiKey(), body.agentMaxSteps(), body.agentRunTimeoutSeconds(),
+                body.contextLimitChars()));
+    }
+
+    @DeleteMapping("/model-credential")
+    public SettingsResponse clearModelCredential(HttpServletRequest request) {
+        return response(auth.clearModelApiKey(identity.requireUser(request)));
     }
 
     private SettingsResponse response(UserSettings value) {
         return new SettingsResponse(value.userId(), value.theme(), value.locale(), value.modelEndpoint(), value.modelName(),
-                value.agentMaxSteps(), value.agentRunTimeoutSeconds(), value.contextLimitChars(), value.updatedAt(), value.version());
+                value.modelApiKey() != null && !value.modelApiKey().isBlank(), value.agentMaxSteps(),
+                value.agentRunTimeoutSeconds(), value.contextLimitChars(), value.updatedAt(), value.version());
     }
 
     public record UpdateSettingsRequest(
@@ -73,12 +78,14 @@ public class SettingsController {
             @NotBlank @Size(max = 32) String locale,
             @Size(max = 2048) String modelEndpoint,
             @Size(max = 200) String modelName,
+            @Size(max = 4096) String modelApiKey,
             @Min(1) @Max(100) int agentMaxSteps,
             @Min(10) @Max(86400) long agentRunTimeoutSeconds,
             @Min(8000) @Max(1000000) int contextLimitChars) {
         public UpdateSettingsRequest {
             modelEndpoint = modelEndpoint == null ? "" : modelEndpoint;
             modelName = modelName == null ? "" : modelName;
+            modelApiKey = modelApiKey == null ? "" : modelApiKey;
         }
     }
 
@@ -87,6 +94,7 @@ public class SettingsController {
                                    String locale,
                                    String modelEndpoint,
                                    String modelName,
+                                   boolean modelApiKeyConfigured,
                                    int agentMaxSteps,
                                    long agentRunTimeoutSeconds,
                                    int contextLimitChars,
@@ -95,15 +103,11 @@ public class SettingsController {
     }
 
     public record ModelStatusResponse(boolean apiKeyConfigured,
-                                      boolean defaultEndpointConfigured,
-                                      boolean defaultModelConfigured,
-                                      boolean effectiveEndpointConfigured,
-                                      boolean effectiveModelConfigured,
-                                      boolean effectiveEndpointAllowed,
-                                      String effectiveEndpoint,
-                                      String effectiveModel,
-                                      int allowedEndpointCount,
-                                      java.util.List<String> allowedEndpoints) {
+                                      boolean endpointConfigured,
+                                      boolean modelConfigured,
+                                      boolean endpointValid,
+                                      String endpoint,
+                                      String model) {
     }
 
     public record RuntimePolicyResponse(int defaultMaxSteps,

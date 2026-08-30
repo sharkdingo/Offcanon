@@ -58,7 +58,7 @@ class AgentLoopTest {
             return new ModelResponse("", List.of(new ToolCall("call-1", "missing_tool", Map.of())), "tool_calls");
         };
         AgentRunSettings settings = new AgentRunSettings(1, 10, 8_000,
-                "https://runtime.example/v1", "runtime-model");
+                "https://runtime.example/v1", "runtime-model", "runtime-key");
 
         DomainException error = assertThrows(DomainException.class, () -> new AgentLoop(model,
                 new ToolRegistryImpl(List.of()), 5, new InMemoryEventSink(), 20_000, 1,

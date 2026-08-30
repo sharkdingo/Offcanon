@@ -447,7 +447,7 @@ public class PromotionApplicationService {
         }
         String current;
         try {
-            // A non-lock apply error can race the Redis renewal thread. Never
+            // A non-lock apply error can race lease renewal. Never
             // classify canonical state, or mutate the lifecycle journal, after
             // ownership has expired: the fingerprint could belong to another
             // writer that entered immediately after our lease ended.

@@ -153,8 +153,8 @@ const failurePresentation = computed<FailurePresentation | null>(() => {
     return {
       title: text('模型连接设置不可用', 'Model connection settings are not usable'),
       detail: text(
-        '真实项目未被修改。请在设置中检查 Endpoint、模型名和服务端 API key 状态，并先运行连接测试。',
-        'Your canonical project was not modified. Check the endpoint, model, and server API key status in Settings, then run the connection test.',
+        '真实项目未被修改。请在设置中检查当前账户的 Endpoint、模型名和 API key，并先运行连接测试。',
+        "Your canonical project was not modified. Check this account's endpoint, model, and API key in Settings, then run the connection test.",
       ),
     }
   }
@@ -491,8 +491,8 @@ function activateWithKeyboard(event: KeyboardEvent, index: number) {
           <section v-if="resolvedRunConfiguration" class="summary-section resolved-config-section">
             <p class="section-label">{{ text('本次运行采用的配置', 'CONFIGURATION USED FOR THIS RUN') }}</p>
             <dl class="metric-list resolved-config-list">
-              <div><dt>{{ text('模型服务', 'Model service') }}</dt><dd><code>{{ resolvedRunConfiguration.endpoint ?? text('未配置', 'not configured') }}</code><span v-if="resolvedRunConfiguration.endpointSource">{{ resolvedRunConfiguration.endpointSource === 'ACCOUNT_SETTINGS' ? text('账户设置', 'account settings') : text('服务端默认', 'deployment default') }}</span></dd></div>
-              <div><dt>{{ text('模型', 'Model') }}</dt><dd><code>{{ resolvedRunConfiguration.model ?? text('未配置', 'not configured') }}</code><span v-if="resolvedRunConfiguration.modelSource">{{ resolvedRunConfiguration.modelSource === 'ACCOUNT_SETTINGS' ? text('账户设置', 'account settings') : text('服务端默认', 'deployment default') }}</span></dd></div>
+              <div><dt>{{ text('模型服务', 'Model service') }}</dt><dd><code>{{ resolvedRunConfiguration.endpoint ?? text('未配置', 'not configured') }}</code><span v-if="resolvedRunConfiguration.endpointSource">{{ resolvedRunConfiguration.endpointSource === 'ACCOUNT_SETTINGS' ? text('账户设置', 'account settings') : text('未配置', 'not configured') }}</span></dd></div>
+              <div><dt>{{ text('模型', 'Model') }}</dt><dd><code>{{ resolvedRunConfiguration.model ?? text('未配置', 'not configured') }}</code><span v-if="resolvedRunConfiguration.modelSource">{{ resolvedRunConfiguration.modelSource === 'ACCOUNT_SETTINGS' ? text('账户设置', 'account settings') : text('未配置', 'not configured') }}</span></dd></div>
               <div><dt>{{ text('运行限制', 'Run limits') }}</dt><dd>{{ resolvedRunConfiguration.maxSteps ?? '—' }} {{ text('步', 'steps') }} / {{ resolvedRunConfiguration.timeoutSeconds ?? '—' }} {{ text('秒', 'seconds') }} / {{ resolvedRunConfiguration.contextLimit ?? '—' }} {{ text('字符', 'chars') }}</dd></div>
               <div class="resolved-config-commands"><dt>{{ text('验收命令', 'Acceptance commands') }}</dt><dd><code v-for="command in resolvedRunConfiguration.commands" :key="command">{{ command }}</code><span v-if="!resolvedRunConfiguration.commands.length">{{ text('未记录', 'not recorded') }}</span></dd></div>
             </dl>

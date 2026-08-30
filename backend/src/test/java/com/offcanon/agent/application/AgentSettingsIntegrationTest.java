@@ -66,7 +66,7 @@ class AgentSettingsIntegrationTest {
         InMemoryUserSettingsRepository settings = new InMemoryUserSettingsRepository();
         settings.save(UserSettings.defaults(owner, now));
         settings.save(UserSettings.defaults(owner, now).updated("dark", "en-US", "https://runtime.example/v1",
-                "runtime-model", 7, 120, 12_000, now.plusSeconds(1)));
+                "runtime-model", "runtime-key", 7, 120, 12_000, now.plusSeconds(1)));
 
         AtomicReference<AgentRunSettings> captured = new AtomicReference<>();
         AgentLoopPort loop = new AgentLoopPort() {
@@ -96,7 +96,8 @@ class AgentSettingsIntegrationTest {
 
         InMemoryEventSink events = new InMemoryEventSink();
         AgentApplicationService service = new AgentApplicationService(experiments, projects, snapshots, snapshotPort,
-                loop, verification, executor, events, new InMemorySessionRunLease(), workspaces, settings, null, null);
+                loop, verification, executor, events, new InMemorySessionRunLease(), workspaces, settings, null, null,
+                20, 600, 80_000);
 
         service.start(experiment.id());
 

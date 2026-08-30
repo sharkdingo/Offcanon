@@ -1,10 +1,7 @@
 package com.offcanon.shared.domain;
 
 import java.net.URI;
-import java.util.Collections;
-import java.util.LinkedHashSet;
 import java.util.Locale;
-import java.util.Set;
 
 /**
  * Canonical validation for credential-bearing model provider endpoints.
@@ -59,44 +56,4 @@ public final class ModelEndpointPolicy {
         return normalize(value) != null;
     }
 
-    /**
-     * Checks whether a user-selected endpoint is one of the explicitly
-     * trusted destinations that may receive the server-side model secret.
-     * The process environment is evaluated at call time so a deployment can
-     * provide its primary endpoint without duplicating it in Spring config.
-     */
-    public static boolean isAllowed(String requested,
-                                    String configuredBaseUrl,
-                                    String configuredAllowedBaseUrls,
-                                    String environmentBaseUrl) {
-        String normalized = normalize(requested);
-        return normalized != null
-                && allowedEndpoints(configuredBaseUrl, configuredAllowedBaseUrls, environmentBaseUrl)
-                .contains(normalized);
-    }
-
-    /** Returns the normalized endpoint set used by both Settings and the model adapter. */
-    public static Set<String> allowedEndpoints(String configuredBaseUrl,
-                                               String configuredAllowedBaseUrls,
-                                               String environmentBaseUrl) {
-        LinkedHashSet<String> endpoints = new LinkedHashSet<>();
-        addEndpoint(endpoints, configuredBaseUrl, "configured model endpoint");
-        addEndpoint(endpoints, environmentBaseUrl, "environment model endpoint");
-        if (configuredAllowedBaseUrls != null) {
-            for (String value : configuredAllowedBaseUrls.split(",")) {
-                addEndpoint(endpoints, value, "model endpoint allowlist entry");
-            }
-        }
-        return Collections.unmodifiableSet(endpoints);
-    }
-
-    private static void addEndpoint(Set<String> endpoints, String value, String label) {
-        if (value == null || value.isBlank()) return;
-        String normalized = normalize(value);
-        if (normalized == null) {
-            throw new IllegalArgumentException(label
-                    + " must be a valid HTTP(S) base URL without credentials, query or fragment");
-        }
-        endpoints.add(normalized);
-    }
 }

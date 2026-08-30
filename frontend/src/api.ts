@@ -161,6 +161,7 @@ export type UserSettings = {
   locale: 'zh-CN' | 'en-US'
   modelEndpoint: string
   modelName: string
+  modelApiKeyConfigured: boolean
   agentMaxSteps: number
   agentRunTimeoutSeconds: number
   contextLimitChars: number
@@ -170,16 +171,11 @@ export type UserSettings = {
 
 export type ModelConfigurationStatus = {
   apiKeyConfigured: boolean
-  defaultEndpointConfigured: boolean
-  defaultModelConfigured: boolean
-  effectiveEndpointConfigured: boolean
-  effectiveModelConfigured: boolean
-  effectiveEndpointAllowed: boolean
-  effectiveEndpoint: string | null
-  effectiveModel: string | null
-  allowedEndpointCount: number
-  /** Added by newer servers; older local servers may omit the advisory list. */
-  allowedEndpoints?: string[]
+  endpointConfigured: boolean
+  modelConfigured: boolean
+  endpointValid: boolean
+  endpoint: string | null
+  model: string | null
 }
 
 export type ModelTestResponse = {
@@ -247,9 +243,11 @@ export const api = {
   settings: () => request<UserSettings>('/api/settings'),
   modelStatus: () => request<ModelConfigurationStatus>('/api/settings/model-status'),
   runtimePolicy: () => request<RuntimeSettingsPolicy>('/api/settings/runtime-policy'),
-  updateSettings: (body: Omit<UserSettings, 'userId' | 'updatedAt' | 'version'>) =>
+  updateSettings: (body: Omit<UserSettings, 'userId' | 'updatedAt' | 'version' | 'modelApiKeyConfigured'> & { modelApiKey?: string }) =>
     request<UserSettings>('/api/settings', { method: 'PUT', body: JSON.stringify(body) }),
-  testModel: (body: { modelEndpoint: string; modelName: string }) =>
+  clearModelCredential: () =>
+    request<UserSettings>('/api/settings/model-credential', { method: 'DELETE' }),
+  testModel: (body: { modelEndpoint: string; modelName: string; apiKey?: string }) =>
     request<ModelTestResponse>('/api/settings/model-test', { method: 'POST', body: JSON.stringify(body) }),
   projects: () => request<Project[]>('/api/projects'),
   browseDirectories: (path?: string) => {

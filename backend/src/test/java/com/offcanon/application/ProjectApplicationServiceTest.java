@@ -48,7 +48,8 @@ class ProjectApplicationServiceTest {
         projects = new InMemoryProjectRepository();
         fixtureOwner = UUID.randomUUID();
         service = new ProjectApplicationService(projects,
-                new GitSnapshotAdapter(new ProcessRunner(), temp.resolve("offcanon-data").toString()));
+                new GitSnapshotAdapter(new ProcessRunner(), temp.resolve("offcanon-data").toString()),
+                new InMemoryExperimentRepository(), new InMemoryPromotionLock());
     }
 
     @AfterEach

@@ -8,25 +8,16 @@ public record ModelRequest(List<ModelMessage> messages,
                            List<ToolDefinition> tools,
                            Duration timeout,
                            String modelEndpoint,
-                           String modelName) {
-    public ModelRequest(List<ModelMessage> messages, List<ToolDefinition> tools) {
-        this(messages, tools, Duration.ofSeconds(120), "", "");
-    }
-
-    public ModelRequest(List<ModelMessage> messages, List<ToolDefinition> tools, Duration timeout) {
-        this(messages, tools, timeout, "", "");
-    }
-
+                           String modelName,
+                           String modelApiKey) {
     public ModelRequest {
         messages = List.copyOf(messages);
         tools = List.copyOf(tools);
         Objects.requireNonNull(timeout, "timeout");
         modelEndpoint = modelEndpoint == null ? "" : modelEndpoint.trim();
         modelName = modelName == null ? "" : modelName.trim();
+        modelApiKey = modelApiKey == null ? "" : modelApiKey.trim();
         if (timeout.isNegative() || timeout.isZero()) timeout = Duration.ofMillis(1);
     }
 
-    public ModelRequest withProvider(String endpoint, String name) {
-        return new ModelRequest(messages, tools, timeout, endpoint, name);
-    }
 }

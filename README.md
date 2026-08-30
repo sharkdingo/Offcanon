@@ -1,12 +1,39 @@
 # Offcanon
 
-Offcanon is an experiment-first coding agent. An agent never receives a writable handle to the canonical project. It works in an isolated experiment workspace, seals an immutable result, and can only be promoted after trusted verification against the current canonical snapshot.
+Offcanon is a local, experiment-first coding agent. It never gives an agent a writable handle to the canonical repository. Work happens in an isolated experiment workspace, the result is sealed, trusted checks run against that result, and only then can the user promote it to the canonical project.
 
-The repository is intentionally being built as a modular monolith with a Java/Spring backend and a Vue/TypeScript workbench. See `docs/architecture.md` for the execution model and invariants.
+## Storage
 
-## Local development
+Offcanon is a single-user desktop service with one application-owned SQLite database. On first start it creates:
 
-Backend (Java 21 target; Java 22 is used by the current workstation):
+```text
+%USERPROFILE%\.offcanon\
+  offcanon.sqlite       durable metadata and audit history
+  secret.key            local AES-GCM key for account model credentials
+  experiments\          disposable experiment workspaces
+  snapshots\            immutable snapshot materializations
+  git-objects\          isolated Git object storage
+  verification-workspaces\
+  promotion-candidates\
+```
+
+SQLite is the only persistence engine; there are no storage profiles, external database services, `.env` files, or user-facing environment-variable configuration. SQLite is opened with WAL mode, foreign-key enforcement, and a busy timeout. Flyway owns the schema version; a new schema change is an explicit migration under `backend/src/main/resources/db/migration`.
+
+The database stores users, sessions, account settings, projects, experiments, evidence, run events, task-memory revisions, snapshots and promotion journals. Snapshot/workspace bytes remain on the local filesystem because they are large, disposable artifacts rather than relational data. The canonical repository remains in the directory selected by the user.
+
+## User Configuration
+
+Everything a normal user needs is available in the Settings screen:
+
+- model Endpoint and model name;
+- model API key, encrypted at rest and never returned to the browser;
+- theme, language, and bounded run defaults.
+
+The server validates the Endpoint as an HTTP(S) URL and sends the account's key only to that saved Endpoint. Data-directory and database-engine details are application-owned so a user does not need to install or administer infrastructure.
+
+## Run Locally
+
+Backend (Java 21 target; Java 22 is supported by the current workstation):
 
 ```powershell
 $env:JAVA_HOME = 'D:\jdk\jdk-22'
@@ -22,23 +49,7 @@ npm install
 npm run dev
 ```
 
-The real model path uses an OpenAI-compatible `/chat/completions` endpoint. Export the server-side API key before starting the backend (the process does not automatically load `.env` files). Authenticated users can edit the endpoint and model name in Settings, and can test the connection from there; a non-empty Settings endpoint must be present in the server allowlist:
-
-```powershell
-# Optional deployment defaults (Settings can override these values).
-$env:OFFCANON_MODEL_BASE_URL = 'https://api.example.com/v1'
-$env:OFFCANON_MODEL_API_KEY = '<local-secret>'
-$env:OFFCANON_MODEL_NAME = '<provider-model-id>'
-# Optional: explicitly allow additional Settings endpoint values.  These
-# endpoints receive the same server-side API key.
-$env:OFFCANON_MODEL_ALLOWED_BASE_URLS = 'https://second-provider.example/v1'
-```
-
-The Settings API intentionally never accepts or returns `OFFCANON_MODEL_API_KEY`. The browser only sees a configured/not-configured status; the backend reads the key from its process environment when it sends a model request. Keep the real values in the process environment or another untracked local configuration; never commit credentials.
-
-Settings follow the ownership boundary used by the product: account Settings contain appearance, language, model endpoint/name references, and bounded run defaults; a Project contains its canonical repository identity and project acceptance commands; an Experiment records the task, snapshots, evidence, and run lifecycle. Deployment secrets, endpoint allowlists, data roots, command/model timeouts, retry/retention settings, and OS/container policy are server-owned and are not editable in the browser. Settings edits are drafts until saved, and a model connection test is explicitly against the current draft. Project acceptance commands cannot change while an experiment or promotion is active, so evidence remains attributable to one policy.
-
-Run the checks with:
+Run checks:
 
 ```powershell
 cd backend
@@ -47,8 +58,6 @@ cd ..\frontend
 npm run build
 ```
 
-The current vertical slice is intentionally explicit: the agent edits an isolated experiment, seals its result snapshot, runs trusted verification in a disposable workspace, then re-verifies a promotion candidate before changing canonical. Agent shell output is recorded as observation, never presented as trusted verification. Session continuation uses an append-only typed memory ledger: agent notes remain proposals, while verified facts carry a source snapshot fingerprint and trusted evidence. A local run can be demonstrated with the built-in scripted tests; a real model run requires `OFFCANON_MODEL_API_KEY` plus either deployment defaults or per-user Settings for the endpoint and model name.
+The current vertical slice is intentionally explicit: the agent edits an isolated experiment, seals an immutable result, runs trusted verification in a disposable workspace, then re-verifies a promotion candidate before changing canonical. Agent shell output is recorded as observation, never presented as trusted verification. Session continuation uses an append-only typed memory ledger: agent notes remain proposals, while verified facts carry source snapshot and evidence provenance.
 
-For durable local deployment, activate the optional `mysql` and `redis` profiles and provide their connection settings through environment variables. MySQL uses a bounded Hikari connection pool; Redis coordinates per-session runs and project promotion locks. The default profile is intentionally self-contained and uses in-memory repositories. Keep `OFFCANON_DATA_ROOT` outside every registered repository.
-
-Offcanon isolates application workspaces and Git objects, but it is not an OS sandbox. Agent commands run with the current user's operating-system permissions; use a container or worker sandbox when prompts or repositories are hostile.
+Offcanon provides application-level isolation, not an operating-system sandbox. Agent commands run with the current user's permissions; use a container or worker sandbox when prompts or repositories are hostile.

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { AlertTriangle, ArrowLeft, Check, CircleUserRound, KeyRound, Languages, LoaderCircle, LogOut, Moon, RefreshCw, RotateCcw, Save, ShieldCheck, Sun, SlidersHorizontal } from 'lucide-vue-next'
+import { AlertTriangle, ArrowLeft, Check, CircleUserRound, KeyRound, Languages, LoaderCircle, LogOut, Moon, RefreshCw, RotateCcw, Save, ShieldCheck, Sun, SlidersHorizontal, Trash2 } from 'lucide-vue-next'
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, type ModelConfigurationStatus, type ModelTestResponse, type RuntimeSettingsPolicy, type UserSettings } from '../api'
@@ -21,6 +21,9 @@ const modelTest = ref<ModelTestResponse | null>(null)
 const testingModel = ref(false)
 const testedModelFingerprint = ref<string | null>(null)
 const savedSettings = ref<Pick<UserSettings, 'theme' | 'locale' | 'modelEndpoint' | 'modelName' | 'agentMaxSteps' | 'agentRunTimeoutSeconds' | 'contextLimitChars'> | null>(null)
+const modelApiKeyDraft = ref('')
+const modelApiKeyConfigured = ref(false)
+const modelApiKeySaving = ref(false)
 const form = reactive({
   theme: 'system' as ThemeMode,
   locale: 'zh-CN' as 'zh-CN' | 'en-US',
@@ -32,7 +35,7 @@ const form = reactive({
 })
 
 function modelFingerprint(endpoint: string, model: string) {
-  return `${endpoint.trim()}\u0000${model.trim()}`
+  return `${endpoint.trim()}\u0000${model.trim()}\u0000${modelApiKeyConfigured.value ? 'configured' : 'missing'}\u0000${modelApiKeyDraft.value ? 'draft' : 'saved'}`
 }
 
 function applyForm(settings: UserSettings, persistAppearance = true) {
@@ -43,6 +46,7 @@ function applyForm(settings: UserSettings, persistAppearance = true) {
   form.agentMaxSteps = settings.agentMaxSteps
   form.agentRunTimeoutSeconds = settings.agentRunTimeoutSeconds
   form.contextLimitChars = settings.contextLimitChars
+  modelApiKeyConfigured.value = settings.modelApiKeyConfigured
   savedSettings.value = {
     theme: settings.theme,
     locale: settings.locale,
@@ -81,7 +85,7 @@ async function loadRuntimePolicy() {
   try {
     runtimePolicy.value = await api.runtimePolicy()
   } catch {
-    // Runtime policy is advisory UI information; server-side validation remains authoritative.
+    // Runtime policy is advisory UI information; backend validation remains authoritative.
     runtimePolicy.value = null
   }
 }
@@ -103,8 +107,9 @@ async function save() {
   saved.value = false
   error.value = null
   try {
-    const settings = await api.updateSettings({ ...form })
+    const settings = await api.updateSettings({ ...form, modelApiKey: modelApiKeyDraft.value.trim() || undefined })
     applyForm(settings)
+    modelApiKeyDraft.value = ''
     saved.value = true
     modelTest.value = null
     testedModelFingerprint.value = null
@@ -121,7 +126,11 @@ async function testModel() {
   modelTest.value = null
   modelStatusError.value = null
   try {
-    modelTest.value = await api.testModel({ modelEndpoint: form.modelEndpoint, modelName: form.modelName })
+    modelTest.value = await api.testModel({
+      modelEndpoint: form.modelEndpoint,
+      modelName: form.modelName,
+      apiKey: modelApiKeyDraft.value.trim() || undefined,
+    })
     testedModelFingerprint.value = modelFingerprint(form.modelEndpoint, form.modelName)
   } catch (cause) {
     modelTest.value = {
@@ -136,14 +145,32 @@ async function testModel() {
   }
 }
 
+async function clearModelApiKey() {
+  if (!modelApiKeyConfigured.value || modelApiKeySaving.value || saving.value) return
+  modelApiKeySaving.value = true
+  error.value = null
+  try {
+    const updated = await api.clearModelCredential()
+    modelApiKeyConfigured.value = updated.modelApiKeyConfigured
+    modelApiKeyDraft.value = ''
+    modelTest.value = null
+    testedModelFingerprint.value = null
+    await loadModelStatus()
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : (isZh.value ? '无法清除模型密钥。' : 'Unable to clear model key.')
+  } finally {
+    modelApiKeySaving.value = false
+  }
+}
+
 const modelReady = computed(() => Boolean(modelStatus.value?.apiKeyConfigured
-  && modelStatus.value.effectiveEndpointConfigured
-  && modelStatus.value.effectiveModelConfigured
-  && modelStatus.value.effectiveEndpointAllowed))
+  && modelStatus.value.endpointConfigured
+  && modelStatus.value.modelConfigured
+  && modelStatus.value.endpointValid))
 
 const settingsDirty = computed(() => {
   const baseline = savedSettings.value
-  if (!baseline) return false
+  if (!baseline) return Boolean(modelApiKeyDraft.value.trim())
   return baseline.theme !== form.theme
     || baseline.locale !== form.locale
     || baseline.modelEndpoint !== form.modelEndpoint
@@ -151,12 +178,13 @@ const settingsDirty = computed(() => {
     || baseline.agentMaxSteps !== form.agentMaxSteps
     || baseline.agentRunTimeoutSeconds !== form.agentRunTimeoutSeconds
     || baseline.contextLimitChars !== form.contextLimitChars
+    || Boolean(modelApiKeyDraft.value.trim())
 })
 
 const modelDraftChanged = computed(() => {
   const baseline = savedSettings.value
-  return !!baseline && modelFingerprint(form.modelEndpoint, form.modelName)
-    !== modelFingerprint(baseline.modelEndpoint, baseline.modelName)
+  return Boolean(modelApiKeyDraft.value.trim()) || (!!baseline
+    && (baseline.modelEndpoint !== form.modelEndpoint || baseline.modelName !== form.modelName))
 })
 
 const modelReadyForDraft = computed(() => modelReady.value && !modelDraftChanged.value)
@@ -173,6 +201,7 @@ function resetDraft() {
   form.agentMaxSteps = baseline.agentMaxSteps
   form.agentRunTimeoutSeconds = baseline.agentRunTimeoutSeconds
   form.contextLimitChars = baseline.contextLimitChars
+  modelApiKeyDraft.value = ''
   auth.applyTheme(form.theme, false)
   auth.applyLocale(form.locale, false)
   modelTest.value = null
@@ -180,7 +209,7 @@ function resetDraft() {
   saved.value = false
 }
 
-watch(() => [form.modelEndpoint, form.modelName], () => {
+watch(() => [form.modelEndpoint, form.modelName, modelApiKeyDraft.value], () => {
   if (!modelTestIsCurrent.value) modelTest.value = null
 })
 
@@ -278,30 +307,30 @@ onBeforeUnmount(() => {
       </section>
 
       <section class="settings-section" aria-labelledby="runtime-heading">
-        <div class="settings-section-heading"><SlidersHorizontal :size="17" /><div><h2 id="runtime-heading">{{ isZh ? '运行默认值' : 'Run defaults' }}</h2><p>{{ isZh ? '用于新实验；服务端资源上限始终优先。' : 'Applied to new experiments; deployment ceilings always take precedence.' }}</p></div></div>
+        <div class="settings-section-heading"><SlidersHorizontal :size="17" /><div><h2 id="runtime-heading">{{ isZh ? '运行默认值' : 'Run defaults' }}</h2><p>{{ isZh ? '用于新实验；应用安全上限始终优先。' : 'Applied to new experiments; application safety limits always take precedence.' }}</p></div></div>
         <div class="settings-form-grid">
           <label><span>{{ isZh ? '最大步数' : 'Max steps' }}</span><input v-model.number="form.agentMaxSteps" type="number" min="1" :max="runtimePolicy?.maxStepsCeiling ?? 100" required /></label>
           <label><span>{{ isZh ? '运行超时（秒）' : 'Run timeout (seconds)' }}</span><input v-model.number="form.agentRunTimeoutSeconds" type="number" min="10" :max="runtimePolicy?.runTimeoutSecondsCeiling ?? 86400" required /></label>
           <label><span>{{ isZh ? '上下文上限（字符）' : 'Context limit (characters)' }}</span><input v-model.number="form.contextLimitChars" type="number" min="8000" :max="runtimePolicy?.contextLimitCharsCeiling ?? 1000000" required /></label>
         </div>
-        <p v-if="runtimePolicy" class="field-help runtime-policy-help">{{ isZh ? `服务端上限：${runtimePolicy.maxStepsCeiling} 步 / ${runtimePolicy.runTimeoutSecondsCeiling} 秒 / ${runtimePolicy.contextLimitCharsCeiling} 字符。` : `Deployment ceilings: ${runtimePolicy.maxStepsCeiling} steps / ${runtimePolicy.runTimeoutSecondsCeiling}s / ${runtimePolicy.contextLimitCharsCeiling} chars.` }}</p>
+        <p v-if="runtimePolicy" class="field-help runtime-policy-help">{{ isZh ? `应用安全上限：${runtimePolicy.maxStepsCeiling} 步 / ${runtimePolicy.runTimeoutSecondsCeiling} 秒 / ${runtimePolicy.contextLimitCharsCeiling} 字符。` : `Application safety limits: ${runtimePolicy.maxStepsCeiling} steps / ${runtimePolicy.runTimeoutSecondsCeiling}s / ${runtimePolicy.contextLimitCharsCeiling} chars.` }}</p>
       </section>
 
       <section class="settings-section" aria-labelledby="model-heading">
-        <div class="settings-section-heading"><KeyRound :size="17" /><div><h2 id="model-heading">{{ isZh ? '模型连接偏好' : 'Model connection preference' }}</h2><p>{{ isZh ? 'Endpoint 和模型名是账户级选择；API key、allowlist 和请求策略只由服务端管理。' : 'Endpoint and model are account-level choices; the API key, allowlist, and request policy are server-managed.' }}</p></div></div>
+        <div class="settings-section-heading"><KeyRound :size="17" /><div><h2 id="model-heading">{{ isZh ? '模型连接' : 'Model connection' }}</h2><p>{{ isZh ? 'Endpoint、模型名和 API key 都保存在当前账户中。' : 'The endpoint, model name, and API key are saved to this account.' }}</p></div></div>
         <div class="settings-form-grid model-grid">
           <label><span>Endpoint <small>{{ isZh ? '模型服务地址' : 'model service address' }}</small></span><input v-model.trim="form.modelEndpoint" type="url" autocomplete="url" placeholder="https://provider.example/v1" /></label>
           <label><span>Model <small>{{ isZh ? '要使用的模型标识' : 'model identifier to use' }}</small></span><input v-model.trim="form.modelName" autocomplete="off" placeholder="provider-model-id" maxlength="200" /></label>
+          <label><span>API key <small>{{ isZh ? '仅显示输入框，不会回显已保存密钥' : 'saved securely; never echoed back' }}</small></span><input v-model="modelApiKeyDraft" type="password" autocomplete="new-password" :placeholder="modelApiKeyConfigured ? (isZh ? '已配置，输入新密钥可替换' : 'Configured; enter a new key to replace') : (isZh ? '输入服务商密钥' : 'Enter provider key')" /></label>
         </div>
-        <p class="field-help model-input-help">{{ isZh ? '留空表示使用服务端默认值；自定义地址必须在服务端允许列表中。API key 始终由服务端保管。' : 'Leave a field blank to use the deployment default; a custom endpoint must be on the server allowlist. The API key is always kept by the server.' }}</p>
-        <div v-if="modelStatus?.allowedEndpoints?.length" class="allowed-endpoint-list" :aria-label="isZh ? '服务端允许的模型地址' : 'Server-allowed model endpoints'">
-          <span>{{ isZh ? '允许使用' : 'Allowed' }}</span>
-          <button v-for="endpoint in modelStatus.allowedEndpoints" :key="endpoint" type="button" :title="endpoint" @click="form.modelEndpoint = endpoint">{{ endpoint }}</button>
+        <p class="field-help model-input-help">{{ isZh ? 'Endpoint 必须是 HTTP(S) 地址；API key 仅在后端加密保存，并只发送到你选择的 Endpoint。' : 'The endpoint must be HTTP(S); the API key is encrypted on the server and sent only to your selected endpoint.' }}</p>
+        <div class="settings-model-actions">
+          <button type="button" class="button danger-ghost" :disabled="!modelApiKeyConfigured || modelApiKeySaving || saving" @click="clearModelApiKey"><Trash2 :size="15" />{{ isZh ? '清除 API key' : 'Clear API key' }}</button>
         </div>
         <dl v-if="modelStatus" class="settings-details model-effective-details">
-          <div><dt>{{ isZh ? '当前生效 Endpoint' : 'Effective endpoint' }}</dt><dd><code>{{ modelStatus.effectiveEndpoint || (isZh ? '未配置' : 'Not configured') }}</code></dd></div>
-          <div><dt>{{ isZh ? '当前生效模型' : 'Effective model' }}</dt><dd><code>{{ modelStatus.effectiveModel || (isZh ? '未配置' : 'Not configured') }}</code></dd></div>
-          <div><dt>{{ isZh ? '允许的 Endpoint 数' : 'Allowed endpoints' }}</dt><dd>{{ modelStatus.allowedEndpointCount }}</dd></div>
+          <div><dt>{{ isZh ? '当前生效 Endpoint' : 'Effective endpoint' }}</dt><dd><code>{{ modelStatus.endpoint || (isZh ? '未配置' : 'Not configured') }}</code></dd></div>
+          <div><dt>{{ isZh ? '当前生效模型' : 'Effective model' }}</dt><dd><code>{{ modelStatus.model || (isZh ? '未配置' : 'Not configured') }}</code></dd></div>
+          <div><dt>{{ isZh ? '密钥状态' : 'API key' }}</dt><dd>{{ modelStatus.apiKeyConfigured ? (isZh ? '已配置' : 'Configured') : (isZh ? '未配置' : 'Not configured') }}</dd></div>
         </dl>
         <div class="settings-gate" :class="{ ready: modelReadyForDraft, error: modelStatusError || (modelTest && !modelTest.reachable) }" role="status">
           <ShieldCheck v-if="modelReadyForDraft" :size="17" />
@@ -310,11 +339,11 @@ onBeforeUnmount(() => {
             <strong>{{ modelReadyForDraft ? (isZh ? '模型配置可用' : 'Model configuration is ready') : (isZh ? '模型配置尚未就绪' : 'Model configuration needs attention') }}</strong>
             <span v-if="modelStatusError">{{ modelStatusError }}</span>
             <span v-else-if="!modelStatus">{{ isZh ? '正在读取服务端配置。' : 'Reading server configuration.' }}</span>
-            <span v-else-if="!modelStatus.apiKeyConfigured">{{ isZh ? '服务端尚未配置 OFFCANON_MODEL_API_KEY。' : 'The server has no OFFCANON_MODEL_API_KEY configured.' }}</span>
-            <span v-else-if="!modelStatus.effectiveEndpointConfigured || !modelStatus.effectiveModelConfigured">{{ isZh ? '请填写 endpoint 和模型名，或配置服务端默认值。' : 'Set an endpoint and model name, or configure deployment defaults.' }}</span>
-            <span v-else-if="!modelStatus.effectiveEndpointAllowed">{{ isZh ? '当前 endpoint 不在服务端 allowlist 中。' : 'The selected endpoint is outside the server allowlist.' }}</span>
+            <span v-else-if="!modelStatus.apiKeyConfigured">{{ isZh ? '请在此处保存模型 API key。' : 'Save a model API key here.' }}</span>
+            <span v-else-if="!modelStatus.endpointConfigured || !modelStatus.modelConfigured">{{ isZh ? '请填写 endpoint 和模型名。' : 'Set an endpoint and model name.' }}</span>
+            <span v-else-if="!modelStatus.endpointValid">{{ isZh ? '当前 endpoint 不是有效的 HTTP(S) 地址。' : 'The selected endpoint is not a valid HTTP(S) URL.' }}</span>
             <span v-else-if="modelDraftChanged">{{ isZh ? '草稿已变化，请保存后再用于新实验。' : 'The draft changed; save it before using it for new experiments.' }}</span>
-            <span v-else>{{ isZh ? 'API key 不会发送到浏览器或保存到账户。' : 'The API key never enters the browser or account storage.' }}</span>
+            <span v-else>{{ isZh ? '模型配置保存在账户中，可在此页面替换或清除。' : 'The model configuration is account-scoped and can be replaced or cleared here.' }}</span>
           </div>
           <span class="status-badge" :class="modelReadyForDraft ? 'success' : 'warning'">{{ modelReadyForDraft ? (isZh ? '可运行' : 'READY') : (isZh ? '需配置' : 'CHECK CONFIG') }}</span>
         </div>

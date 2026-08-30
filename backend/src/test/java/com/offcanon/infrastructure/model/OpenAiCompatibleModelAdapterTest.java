@@ -43,9 +43,8 @@ class OpenAiCompatibleModelAdapterTest {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/v1/chat/completions", this::handle);
         server.start();
-        adapter = new OpenAiCompatibleModelAdapter(mapper, HttpClient.newHttpClient(),
-                "http://127.0.0.1:" + server.getAddress().getPort() + "/v1",
-                "contract-model", Duration.ofSeconds(5), () -> "local-test-key");
+        adapter = new OpenAiCompatibleModelAdapter(
+                mapper, HttpClient.newHttpClient(), Duration.ofSeconds(5));
     }
 
     @AfterEach
@@ -82,56 +81,32 @@ class OpenAiCompatibleModelAdapterTest {
     }
 
     @Test
-    void usesPerRequestProviderOverridesBeforeConfiguredDefaults() throws Exception {
+    void usesProviderConfigurationCarriedByTheRequest() throws Exception {
         respond(200, """
                 {"choices":[{"message":{"content":"done"},"finish_reason":"stop"}]}
                 """);
-        String requestEndpoint = "http://127.0.0.1:" + server.getAddress().getPort() + "/v1";
-        OpenAiCompatibleModelAdapter configuredElsewhere = new OpenAiCompatibleModelAdapter(
-                mapper, HttpClient.newHttpClient(), "http://127.0.0.1:1/configured", "configured-model",
-                requestEndpoint,
-                Duration.ofSeconds(5), () -> "local-test-key");
-
-        configuredElsewhere.complete(new ModelRequest(List.of(ModelMessage.user("runtime config")), List.of(),
-                Duration.ofSeconds(5), requestEndpoint, "runtime-model"));
+        adapter.complete(new ModelRequest(List.of(ModelMessage.user("runtime config")), List.of(),
+                Duration.ofSeconds(5), endpoint(), "runtime-model", "runtime-key"));
 
         CapturedRequest captured = request.get();
         assertEquals("/v1/chat/completions", captured.path());
         assertEquals("runtime-model", mapper.readTree(captured.body()).path("model").asText());
-    }
-
-    @Test
-    void rejectsUntrustedPerRequestEndpointBeforeSendingTheGlobalApiKey() throws Exception {
-        respond(200, "{\"choices\":[{\"message\":{\"content\":\"unexpected\"},\"finish_reason\":\"stop\"}]}");
-        String untrusted = "http://127.0.0.1:" + (server.getAddress().getPort() + 1) + "/v1";
-        DomainException error = assertThrows(DomainException.class, () -> adapter.complete(
-                request().withProvider(untrusted, "runtime-model")));
-
-        assertEquals("MODEL_ENDPOINT_NOT_ALLOWED", error.code());
-        assertTrue(request.get() == null, "an untrusted endpoint must be rejected before an HTTP request");
+        assertEquals("Bearer runtime-key", captured.authorization());
     }
 
     @Test
     void rejectsInvalidPerRequestEndpointBeforeSendingTheGlobalApiKey() {
         DomainException error = assertThrows(DomainException.class, () -> adapter.complete(
-                request().withProvider("http://127.0.0.1:" + server.getAddress().getPort()
-                        + "/v1?api-version=2024", "runtime-model")));
+                request("http://127.0.0.1:" + server.getAddress().getPort()
+                        + "/v1?api-version=2024", "runtime-model", "local-test-key")));
 
         assertEquals("MODEL_ENDPOINT_INVALID", error.code());
         assertTrue(request.get() == null, "an invalid endpoint must be rejected before an HTTP request");
 
         DomainException outOfRangePort = assertThrows(DomainException.class, () -> adapter.complete(
-                request().withProvider("http://127.0.0.1:65536/v1", "runtime-model")));
+                request("http://127.0.0.1:65536/v1", "runtime-model", "local-test-key")));
         assertEquals("MODEL_ENDPOINT_INVALID", outOfRangePort.code());
         assertTrue(request.get() == null, "an out-of-range port must be rejected before an HTTP request");
-    }
-
-    @Test
-    void failsFastWhenTheConfiguredAllowlistContainsAnInvalidEndpoint() {
-        assertThrows(IllegalArgumentException.class, () -> new OpenAiCompatibleModelAdapter(
-                mapper, HttpClient.newHttpClient(), "http://127.0.0.1:8080/v1", "contract-model",
-                "http://127.0.0.1:8080/v1?api-version=2024", Duration.ofSeconds(5),
-                () -> "local-test-key"));
     }
 
     @Test
@@ -247,7 +222,7 @@ class OpenAiCompatibleModelAdapterTest {
                 ModelMessage.user("fix the test"),
                 ModelMessage.assistant("I inspected the failing test.", List.of(call)),
                 ModelMessage.tool(call.id(), call.name(), "Wrote src/App.java")),
-                request().tools(), Duration.ofSeconds(5));
+                request().tools(), Duration.ofSeconds(5), endpoint(), "contract-model", "local-test-key");
 
         adapter.complete(modelRequest);
 
@@ -263,9 +238,8 @@ class OpenAiCompatibleModelAdapterTest {
         CountDownLatch releaseBody = new CountDownLatch(1);
         response.set(new StubResponse(200, "{".getBytes(StandardCharsets.UTF_8), 1_024,
                 bodyStarted, releaseBody));
-        adapter = new OpenAiCompatibleModelAdapter(mapper, HttpClient.newHttpClient(),
-                "http://127.0.0.1:" + server.getAddress().getPort() + "/v1",
-                "contract-model", Duration.ofMillis(150), () -> "local-test-key");
+        adapter = new OpenAiCompatibleModelAdapter(
+                mapper, HttpClient.newHttpClient(), Duration.ofMillis(150));
         long started = System.nanoTime();
 
         try {
@@ -285,7 +259,17 @@ class OpenAiCompatibleModelAdapterTest {
                 "type", "object",
                 "properties", Map.of("path", Map.of("type", "string")),
                 "required", List.of("path")));
-        return new ModelRequest(List.of(ModelMessage.user("fix the test")), List.of(tool), Duration.ofSeconds(5));
+        return new ModelRequest(List.of(ModelMessage.user("fix the test")), List.of(tool), Duration.ofSeconds(5),
+                endpoint(), "contract-model", "local-test-key");
+    }
+
+    private ModelRequest request(String endpoint, String model, String apiKey) {
+        return new ModelRequest(List.of(ModelMessage.user("fix the test")), List.of(), Duration.ofSeconds(5),
+                endpoint, model, apiKey);
+    }
+
+    private String endpoint() {
+        return "http://127.0.0.1:" + server.getAddress().getPort() + "/v1";
     }
 
     private void respond(int status, String body) {

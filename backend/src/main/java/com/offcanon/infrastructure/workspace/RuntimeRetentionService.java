@@ -105,8 +105,8 @@ public class RuntimeRetentionService {
     }
 
     /**
-     * The MySQL schema is installed by a CommandLineRunner. Do not let the
-     * scheduler race that initializer during application startup; run one
+     * Do not let the scheduler race SQLite schema initialization during
+     * application startup; run one
      * cleanup as soon as all startup runners have completed instead.
      */
     @EventListener(ApplicationReadyEvent.class)

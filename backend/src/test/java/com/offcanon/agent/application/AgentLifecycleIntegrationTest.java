@@ -106,7 +106,8 @@ class AgentLifecycleIntegrationTest {
                 new LocalCommandExecutor(runner), evidence, snapshots, snapshotRepository, 30);
         ExecutorService executor = Executors.newSingleThreadExecutor();
         AgentApplicationService agent = new AgentApplicationService(experiments, projects, snapshotRepository,
-                snapshots, agentLoop, verification, executor, events, new InMemorySessionRunLease(), workspaces, null, evidence, null);
+                snapshots, agentLoop, verification, executor, events, new InMemorySessionRunLease(), workspaces,
+                null, evidence, null, 20, 600, 80_000);
         PromotionApplicationService promotion = new PromotionApplicationService(experiments, projects,
                 snapshotRepository, snapshots, workspaces, new LocalPromotionAdapter(promotionLock),
                 promotionLock, events, verification, new InMemoryPromotionJournal());
@@ -179,7 +180,7 @@ class AgentLifecycleIntegrationTest {
         ExecutorService executor = Executors.newSingleThreadExecutor();
         AgentApplicationService agent = new AgentApplicationService(experiments, projects, snapshotRepository,
                 snapshots, crashingLoop, null, executor, events, new InMemorySessionRunLease(), workspaces,
-                null, null, null);
+                null, null, null, 20, 600, 80_000);
         try {
             agent.start(experiment.id());
             long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();

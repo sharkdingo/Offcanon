@@ -25,7 +25,9 @@ class OwnershipServiceTest {
     @Test
     void projectListingAndReadsAreScopedToTheAuthenticatedOwner() {
         InMemoryProjectRepository repository = new InMemoryProjectRepository();
-        ProjectApplicationService service = new ProjectApplicationService(repository, new NoopSnapshotPort());
+        ProjectApplicationService service = new ProjectApplicationService(repository, new NoopSnapshotPort(),
+                new com.offcanon.infrastructure.memory.InMemoryExperimentRepository(),
+                new com.offcanon.infrastructure.memory.InMemoryPromotionLock());
         UUID owner = UUID.randomUUID();
         UUID other = UUID.randomUUID();
         Project project = service.register(owner, "demo", Path.of("D:/projects/demo").toString(), List.of("mvn test"));

@@ -30,7 +30,7 @@ async function enterWorkspace() {
       <ol class="onboarding-steps">
         <li>
           <span class="onboarding-icon settings"><KeyRound :size="18" /></span>
-          <div><strong>{{ isZh ? '先确认运行条件' : 'Check run readiness' }}</strong><span>{{ isZh ? '任务开始前需要服务端 API key，以及可用的 Endpoint 和模型（账户选择或服务端默认值）。' : 'A server-side API key plus an available endpoint and model, from account settings or deployment defaults, are required before a task can run.' }}</span></div>
+          <div><strong>{{ isZh ? '先配置模型连接' : 'Configure the model connection' }}</strong><span>{{ isZh ? '在设置中填写 Endpoint、模型名和 API key；保存后即可开始任务。' : 'Enter the endpoint, model name, and API key in Settings; save them before starting a task.' }}</span></div>
           <small>01</small>
         </li>
         <li>
@@ -53,7 +53,7 @@ async function enterWorkspace() {
       <div class="onboarding-boundary">
         <strong>{{ isZh ? '这是受信本机工作台' : 'This is a trusted local workbench' }}</strong>
         <span>{{ isZh ? '项目路径和验收命令在运行 Offcanon 的这台机器上执行；验收证据不是操作系统安全沙箱。' : 'Project paths and acceptance commands run on the machine hosting Offcanon; acceptance evidence is not an operating-system sandbox.' }}</span>
-        <span>{{ isZh ? '当前默认开发模式使用内存存储，重启服务后账户、项目和任务会清空；需要长期保存时请配置 MySQL/Redis。' : 'The default development mode stores account, project, and task data in memory; a restart clears it. Configure MySQL/Redis for durable storage.' }}</span>
+        <span>{{ isZh ? '账户、设置、项目、任务、实验与证据会持久保存在本机；重启 Offcanon 不会清空它们。' : 'Accounts, settings, projects, tasks, experiments, and evidence are stored durably on this machine and survive Offcanon restarts.' }}</span>
       </div>
 
       <footer class="onboarding-actions">

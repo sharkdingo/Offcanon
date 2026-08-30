@@ -109,10 +109,10 @@ public class AgentLoop implements AgentLoopPort {
         this.runTimeout = runTimeout.isNegative() || runTimeout.isZero() ? Duration.ofSeconds(1) : runTimeout;
         this.runtimePolicy = java.util.Objects.requireNonNull(runtimePolicy, "runtimePolicy");
         // Legacy/test constructors may intentionally use a sub-second deadline;
-        // deployment/user settings still go through the policy validator below.
+        // Application defaults and user settings still go through the policy validator below.
         if (this.maxSteps > runtimePolicy.maxStepsCeiling()
                 || this.contextLimit > runtimePolicy.contextLimitCharsCeiling()) {
-            throw new IllegalArgumentException("Agent defaults exceed the deployment runtime policy");
+            throw new IllegalArgumentException("Agent defaults exceed the application runtime policy");
         }
     }
 
@@ -618,8 +618,8 @@ public class AgentLoop implements AgentLoopPort {
             checkRunnable(cancellation, deadline, settings.timeoutSeconds());
             try {
                 long remainingNanos = Math.max(1, deadline - System.nanoTime());
-                ModelRequest request = new ModelRequest(context, tools.definitions(), Duration.ofNanos(remainingNanos))
-                        .withProvider(settings.modelEndpoint(), settings.modelName());
+                ModelRequest request = new ModelRequest(context, tools.definitions(), Duration.ofNanos(remainingNanos),
+                        settings.modelEndpoint(), settings.modelName(), settings.modelApiKey());
                 return completeWithDeadline(request, cancellation, deadline, step, attempt, settings.timeoutSeconds());
             } catch (DomainException error) {
                 boolean retryable = "MODEL_TRANSIENT_FAILURE".equals(error.code());
@@ -823,20 +823,21 @@ public class AgentLoop implements AgentLoopPort {
     }
 
     private RuntimeSettings defaultSettings() {
-        return new RuntimeSettings(maxSteps, runTimeout, contextLimit, "", "");
+        return new RuntimeSettings(maxSteps, runTimeout, contextLimit, "", "", "");
     }
 
     private RuntimeSettings runtimeSettings(AgentRunSettings settings) {
         runtimePolicy.validate(settings.maxSteps(), settings.runTimeoutSeconds(), settings.contextLimitChars());
         return new RuntimeSettings(settings.maxSteps(), Duration.ofSeconds(settings.runTimeoutSeconds()),
-                settings.contextLimitChars(), settings.modelEndpoint(), settings.modelName());
+                settings.contextLimitChars(), settings.modelEndpoint(), settings.modelName(), settings.modelApiKey());
     }
 
     private record RuntimeSettings(int maxSteps,
                                    Duration runTimeout,
                                    int contextLimit,
                                    String modelEndpoint,
-                                   String modelName) {
+                                   String modelName,
+                                   String modelApiKey) {
         private long timeoutSeconds() {
             return Math.max(1, runTimeout.toSeconds());
         }

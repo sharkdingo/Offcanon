@@ -10,8 +10,8 @@ import java.util.UUID;
 
 public final class Experiment {
     /**
-     * Keep the durable summary comfortably below MySQL TEXT's byte limit even
-     * when the model uses multi-byte text. The full bounded context remains an
+     * Keep the durable summary bounded even when the model uses multi-byte
+     * text. The full bounded context remains an
      * audit concern; this field is the user-facing lifecycle summary.
      */
     private static final int MAX_AGENT_SUMMARY_CHARS = 12_000;

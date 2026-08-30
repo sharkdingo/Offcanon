@@ -60,11 +60,9 @@ public class AgentApplicationService {
     private final UserSettingsRepository userSettings;
     private final EvidenceRepository evidenceRepository;
     private final TaskMemoryApplicationService taskMemory;
-    private final int deploymentDefaultMaxSteps;
-    private final long deploymentDefaultRunTimeoutSeconds;
-    private final int deploymentDefaultContextLimitChars;
-    private final String deploymentDefaultModelEndpoint;
-    private final String deploymentDefaultModelName;
+    private final int applicationDefaultMaxSteps;
+    private final long applicationDefaultRunTimeoutSeconds;
+    private final int applicationDefaultContextLimitChars;
     private final ConcurrentHashMap<UUID, AtomicBoolean> cancellations = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<UUID, Future<?>> runs = new ConcurrentHashMap<>();
 
@@ -82,11 +80,9 @@ public class AgentApplicationService {
                                    UserSettingsRepository userSettings,
                                    EvidenceRepository evidenceRepository,
                                    TaskMemoryApplicationService taskMemory,
-                                   @Value("${offcanon.agent.max-steps:20}") int deploymentDefaultMaxSteps,
-                                   @Value("${offcanon.agent.run-timeout-seconds:600}") long deploymentDefaultRunTimeoutSeconds,
-                                   @Value("${offcanon.agent.context-limit-chars:80000}") int deploymentDefaultContextLimitChars,
-                                   @Value("${offcanon.model.base-url:}") String deploymentDefaultModelEndpoint,
-                                   @Value("${offcanon.model.name:}") String deploymentDefaultModelName) {
+                                   @Value("${offcanon.agent.max-steps:20}") int applicationDefaultMaxSteps,
+                                   @Value("${offcanon.agent.run-timeout-seconds:600}") long applicationDefaultRunTimeoutSeconds,
+                                   @Value("${offcanon.agent.context-limit-chars:80000}") int applicationDefaultContextLimitChars) {
         this.experimentRepository = experimentRepository;
         this.projectRepository = projectRepository;
         this.snapshotRepository = snapshotRepository;
@@ -100,33 +96,9 @@ public class AgentApplicationService {
         this.userSettings = userSettings;
         this.evidenceRepository = evidenceRepository;
         this.taskMemory = taskMemory;
-        this.deploymentDefaultMaxSteps = deploymentDefaultMaxSteps;
-        this.deploymentDefaultRunTimeoutSeconds = deploymentDefaultRunTimeoutSeconds;
-        this.deploymentDefaultContextLimitChars = deploymentDefaultContextLimitChars;
-        this.deploymentDefaultModelEndpoint = deploymentDefaultModelEndpoint == null
-                ? "" : deploymentDefaultModelEndpoint.trim();
-        this.deploymentDefaultModelName = deploymentDefaultModelName == null
-                ? "" : deploymentDefaultModelName.trim();
-    }
-
-    /** Compatibility constructor for embedded callers and focused tests. */
-    public AgentApplicationService(ExperimentRepository experimentRepository,
-                                   ProjectRepository projectRepository,
-                                   SnapshotRepository snapshotRepository,
-                                   SnapshotPort snapshotPort,
-                                   AgentLoopPort agentLoop,
-                                   VerificationPort verification,
-                                   ExecutorService agentExecutor,
-                                   EventSink events,
-                                   SessionRunLeasePort sessionRunLease,
-                                   WorkspacePort workspaces,
-                                   UserSettingsRepository userSettings,
-                                   EvidenceRepository evidenceRepository,
-                                   TaskMemoryApplicationService taskMemory) {
-        this(experimentRepository, projectRepository, snapshotRepository, snapshotPort,
-                agentLoop, verification, agentExecutor, events, sessionRunLease, workspaces,
-                userSettings, evidenceRepository, taskMemory,
-                20, 600, 80_000, "", "");
+        this.applicationDefaultMaxSteps = applicationDefaultMaxSteps;
+        this.applicationDefaultRunTimeoutSeconds = applicationDefaultRunTimeoutSeconds;
+        this.applicationDefaultContextLimitChars = applicationDefaultContextLimitChars;
     }
 
     public Experiment start(UUID experimentId) {
@@ -248,10 +220,7 @@ public class AgentApplicationService {
             Optional<AgentRunSettings> settings = userSettings == null || project == null
                     ? Optional.empty()
                     : userSettings.findByUserId(project.ownerId()).map(AgentRunSettings::from);
-            // Resolve defaults once at the application boundary.  The exact
-            // values written to the audit event must be the values forwarded
-            // to the AgentLoop; otherwise blank account provider fields could
-            // make the audit trail disagree with the request actually sent.
+            // Resolve the account-owned values once at the application boundary.
             AgentRunSettings effectiveSettings = effectiveRunSettings(settings);
             publishRunConfiguration(experiment, project, settings, effectiveSettings);
             AgentRunResult result = agentLoop.run(experiment, runControl, sessionContext(experiment),
@@ -580,25 +549,21 @@ public class AgentApplicationService {
     /**
      * Records the configuration actually handed to the Agent boundary. This
      * keeps an auditable explanation of a run even when account preferences are
-     * changed later, without persisting the deployment API key.
+     * changed later, without including the account API key.
      */
     private void publishRunConfiguration(Experiment experiment,
                                          Project project,
                                          Optional<AgentRunSettings> settings,
                                          AgentRunSettings effective) {
         java.util.Map<String, Object> payload = new java.util.LinkedHashMap<>();
-        // Record the values the Agent boundary will actually receive.  A
-        // blank account endpoint/model is an intentional request to use the
-        // deployment default; recording the raw blank value made the audit
-        // event look as if the run had no provider configuration at all.
-        payload.put("source", settings.isPresent() ? "ACCOUNT_SETTINGS" : "DEPLOYMENT_DEFAULT");
+        payload.put("source", settings.isPresent() ? "ACCOUNT_SETTINGS" : "DEFAULT_SETTINGS");
         payload.put("maxSteps", effective.maxSteps());
         payload.put("runTimeoutSeconds", effective.runTimeoutSeconds());
         payload.put("contextLimitChars", effective.contextLimitChars());
         payload.put("modelEndpoint", effective.modelEndpoint());
         payload.put("modelName", effective.modelName());
-        payload.put("modelEndpointSource", hasText(settings, true) ? "ACCOUNT_SETTINGS" : "DEPLOYMENT_DEFAULT");
-        payload.put("modelNameSource", hasText(settings, false) ? "ACCOUNT_SETTINGS" : "DEPLOYMENT_DEFAULT");
+        payload.put("modelEndpointSource", hasText(settings, true) ? "ACCOUNT_SETTINGS" : "UNCONFIGURED");
+        payload.put("modelNameSource", hasText(settings, false) ? "ACCOUNT_SETTINGS" : "UNCONFIGURED");
         payload.put("effective", true);
         if (project != null) {
             payload.put("verificationCommands", project.verificationCommands());
@@ -608,17 +573,15 @@ public class AgentApplicationService {
 
     private AgentRunSettings effectiveRunSettings(Optional<AgentRunSettings> settings) {
         AgentRunSettings requested = settings.orElseGet(() -> new AgentRunSettings(
-                deploymentDefaultMaxSteps,
-                deploymentDefaultRunTimeoutSeconds,
-                deploymentDefaultContextLimitChars,
-                "", ""));
-        String endpoint = firstNonBlank(requested.modelEndpoint(), deploymentDefaultModelEndpoint,
-                environmentModelBaseUrl());
-        String model = firstNonBlank(requested.modelName(), deploymentDefaultModelName,
-                environmentModelName());
+                applicationDefaultMaxSteps,
+                applicationDefaultRunTimeoutSeconds,
+                applicationDefaultContextLimitChars,
+                "", "", ""));
+        String endpoint = firstNonBlank(requested.modelEndpoint());
+        String model = firstNonBlank(requested.modelName());
         return new AgentRunSettings(requested.maxSteps(), requested.runTimeoutSeconds(),
                 requested.contextLimitChars(), endpoint == null ? "" : endpoint,
-                model == null ? "" : model);
+                model == null ? "" : model, requested.modelApiKey());
     }
 
     private boolean hasText(Optional<AgentRunSettings> settings, boolean endpoint) {
@@ -634,13 +597,4 @@ public class AgentApplicationService {
         return "";
     }
 
-    private String environmentModelBaseUrl() {
-        String value = System.getenv("OFFCANON_MODEL_BASE_URL");
-        return value == null ? "" : value.trim();
-    }
-
-    private String environmentModelName() {
-        String value = System.getenv("OFFCANON_MODEL_NAME");
-        return value == null ? "" : value.trim();
-    }
 }

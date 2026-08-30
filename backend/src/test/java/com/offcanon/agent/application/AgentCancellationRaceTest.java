@@ -52,7 +52,7 @@ class AgentCancellationRaceTest {
         AgentApplicationService service = new AgentApplicationService(experiments,
                 new InMemoryProjectRepository(), new InMemorySnapshotRepository(), null,
                 loop, null, workerExecutor, new InMemoryEventSink(),
-                new InMemorySessionRunLease(), null, null, null, null);
+                new InMemorySessionRunLease(), null, null, null, null, 20, 600, 80_000);
 
         try {
             service.start(experiment.id());
@@ -90,7 +90,7 @@ class AgentCancellationRaceTest {
         AgentApplicationService service = new AgentApplicationService(experiments,
                 new InMemoryProjectRepository(), new InMemorySnapshotRepository(), null,
                 loop, null, workerExecutor, new InMemoryEventSink(),
-                new InMemorySessionRunLease(), null, null, null, null);
+                new InMemorySessionRunLease(), null, null, null, null, 20, 600, 80_000);
 
         try {
             Future<Experiment> start = requestExecutor.submit(() -> service.start(experiment.id()));
@@ -122,7 +122,7 @@ class AgentCancellationRaceTest {
         AgentApplicationService service = new AgentApplicationService(experiments,
                 new InMemoryProjectRepository(), new InMemorySnapshotRepository(), null,
                 loop, null, workerExecutor, new InMemoryEventSink(),
-                new InMemorySessionRunLease(), null, null, null, null);
+                new InMemorySessionRunLease(), null, null, null, null, 20, 600, 80_000);
 
         try {
             service.start(experiment.id());
@@ -162,7 +162,8 @@ class AgentCancellationRaceTest {
         };
         AgentApplicationService service = new AgentApplicationService(experiments,
                 new InMemoryProjectRepository(), new InMemorySnapshotRepository(), null,
-                loop, null, workerExecutor, new InMemoryEventSink(), permissiveLease, null, null, null, null);
+                loop, null, workerExecutor, new InMemoryEventSink(), permissiveLease, null, null, null, null,
+                20, 600, 80_000);
 
         try {
             service.start(first.id());
@@ -191,10 +192,12 @@ class AgentCancellationRaceTest {
         ExecutorService workerExecutor = Executors.newSingleThreadExecutor();
         AgentApplicationService workerService = new AgentApplicationService(experiments,
                 new InMemoryProjectRepository(), new InMemorySnapshotRepository(), null,
-                loop, null, workerExecutor, new InMemoryEventSink(), leases, null, null, null, null);
+                loop, null, workerExecutor, new InMemoryEventSink(), leases, null, null, null, null,
+                20, 600, 80_000);
         AgentApplicationService cancellingService = new AgentApplicationService(experiments,
                 new InMemoryProjectRepository(), new InMemorySnapshotRepository(), null,
-                loop, null, workerExecutor, new InMemoryEventSink(), leases, null, null, null, null);
+                loop, null, workerExecutor, new InMemoryEventSink(), leases, null, null, null, null,
+                20, 600, 80_000);
 
         try {
             workerService.start(experiment.id());
