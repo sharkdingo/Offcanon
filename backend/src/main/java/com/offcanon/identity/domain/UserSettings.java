@@ -1,6 +1,8 @@
 package com.offcanon.identity.domain;
 
-import java.net.URI;
+import com.offcanon.shared.domain.ModelEndpointPolicy;
+import com.offcanon.shared.domain.RuntimeSettingsPolicy;
+
 import java.time.Instant;
 import java.util.Objects;
 import java.util.UUID;
@@ -30,21 +32,12 @@ public record UserSettings(UUID userId,
         if (!theme.equals("system") && !theme.equals("light") && !theme.equals("dark")) {
             throw new IllegalArgumentException("Theme must be system, light or dark");
         }
-        if (!locale.matches("[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{2,8})?")) {
-            throw new IllegalArgumentException("Locale must be a language tag such as zh-CN or en-US");
+        if (!locale.equals("zh-CN") && !locale.equals("en-US")) {
+            throw new IllegalArgumentException("Locale must be zh-CN or en-US");
         }
         if (modelEndpoint.length() > 2_048) throw new IllegalArgumentException("Model endpoint is too long");
-        if (!modelEndpoint.isBlank()) {
-            URI endpoint;
-            try {
-                endpoint = URI.create(modelEndpoint);
-            } catch (IllegalArgumentException error) {
-                throw new IllegalArgumentException("Model endpoint must be a valid HTTP(S) URL", error);
-            }
-            if (!("http".equalsIgnoreCase(endpoint.getScheme()) || "https".equalsIgnoreCase(endpoint.getScheme()))
-                    || endpoint.getHost() == null || endpoint.getUserInfo() != null) {
-                throw new IllegalArgumentException("Model endpoint must be an HTTP(S) URL without embedded credentials");
-            }
+        if (!modelEndpoint.isBlank() && !ModelEndpointPolicy.isValid(modelEndpoint)) {
+            throw new IllegalArgumentException("Model endpoint must be an HTTP(S) URL without credentials, query or fragment");
         }
         if (modelName.length() > 200) throw new IllegalArgumentException("Model name is too long");
         if (agentMaxSteps < 1 || agentMaxSteps > 100) throw new IllegalArgumentException("Agent max steps must be between 1 and 100");
@@ -59,6 +52,14 @@ public record UserSettings(UUID userId,
 
     public static UserSettings defaults(UUID userId, Instant now) {
         return new UserSettings(userId, "system", "zh-CN", "", "", 20, 600, 80_000, now, 0);
+    }
+
+    /** Creates account defaults from deployment-owned runtime defaults. */
+    public static UserSettings defaults(UUID userId, Instant now, RuntimeSettingsPolicy policy) {
+        Objects.requireNonNull(policy, "policy");
+        return new UserSettings(userId, "system", "zh-CN", "", "",
+                policy.defaultMaxSteps(), policy.defaultRunTimeoutSeconds(),
+                policy.defaultContextLimitChars(), now, 0);
     }
 
     public UserSettings updated(String theme,

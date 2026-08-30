@@ -1,7 +1,9 @@
 package com.offcanon.infrastructure.diff;
 
+import com.offcanon.infrastructure.filesystem.GitFileMode;
 import com.offcanon.port.DiffPort;
 import com.offcanon.shared.domain.DomainException;
+import com.offcanon.shared.domain.SensitivePathPolicy;
 import com.offcanon.workspace.domain.Snapshot;
 import org.springframework.stereotype.Component;
 
@@ -18,8 +20,8 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.nio.charset.CharacterCodingException;
 import java.nio.ByteBuffer;
@@ -35,47 +37,54 @@ public class LocalDiffAdapter implements DiffPort {
 
     @Override
     public List<DiffEntry> compare(Snapshot base, Path workspace) {
-        Map<String, Path> before = files(base.materializedPath());
-        Map<String, Path> after = files(workspace);
+        Map<String, FileEntry> before = files(base.materializedPath());
+        Map<String, FileEntry> after = files(workspace);
         Set<String> paths = new HashSet<>(before.keySet());
         paths.addAll(after.keySet());
         List<DiffEntry> result = new ArrayList<>();
         for (String path : paths.stream().sorted().toList()) {
-            Path oldFile = before.get(path);
-            Path newFile = after.get(path);
-            if (sameContent(oldFile, newFile)) continue;
+            FileEntry oldFile = before.get(path);
+            FileEntry newFile = after.get(path);
+            boolean modeChanged = modeChanged(oldFile, newFile);
+            if (!modeChanged && sameContent(pathOf(oldFile), pathOf(newFile))) continue;
             DiffEntry.Change change = oldFile == null ? DiffEntry.Change.ADDED
                     : newFile == null ? DiffEntry.Change.DELETED : DiffEntry.Change.MODIFIED;
-            BoundedRead oldRead = readBounded(oldFile);
-            BoundedRead newRead = readBounded(newFile);
+            BoundedRead oldRead = readBounded(pathOf(oldFile));
+            BoundedRead newRead = readBounded(pathOf(newFile));
             long oldSize = oldRead.size();
             long newSize = newRead.size();
             if (oldRead.exceeded() || newRead.exceeded()) {
                 result.add(new DiffEntry(path, change, oldSize, newSize, true,
-                        0, 0, "File differs but exceeds the 2 MB preview limit"));
+                        0, 0, decoratePatch("File differs but exceeds the 2 MB preview limit", oldFile, newFile)));
                 if (result.size() >= MAX_ENTRIES) break;
                 continue;
             }
             if (oldRead.unstable() || newRead.unstable()) {
                 result.add(new DiffEntry(path, change, oldSize, newSize, true,
-                        0, 0, "File changed while being read; preview is unavailable"));
+                        0, 0, decoratePatch("File changed while being read; preview is unavailable", oldFile, newFile)));
                 if (result.size() >= MAX_ENTRIES) break;
                 continue;
             }
             byte[] oldBytes = oldRead.bytes();
             byte[] newBytes = newRead.bytes();
-            if (Arrays.equals(oldBytes, newBytes)) continue;
+            if (Arrays.equals(oldBytes, newBytes)) {
+                if (!modeChanged) continue;
+                result.add(new DiffEntry(path, DiffEntry.Change.MODIFIED, oldSize, newSize, false,
+                        0, 0, decoratePatch("", oldFile, newFile)));
+                if (result.size() >= MAX_ENTRIES) break;
+                continue;
+            }
             boolean binary = !validText(oldBytes) || !validText(newBytes);
             TextDiff textDiff = binary ? new TextDiff(0, 0, "Binary files differ") : textDiff(oldBytes, newBytes, change);
             result.add(new DiffEntry(path, change, oldSize, newSize, binary,
-                    textDiff.additions(), textDiff.deletions(), textDiff.patch()));
+                    textDiff.additions(), textDiff.deletions(), decoratePatch(textDiff.patch(), oldFile, newFile)));
             if (result.size() >= MAX_ENTRIES) break;
         }
         return List.copyOf(result);
     }
 
-    private Map<String, Path> files(Path root) {
-        Map<String, Path> result = new HashMap<>();
+    private Map<String, FileEntry> files(Path root) {
+        Map<String, FileEntry> result = new HashMap<>();
         try {
             if (root == null || !Files.isDirectory(root)) {
                 throw new DomainException("DIFF_WORKSPACE_MISSING", "Diff workspace does not exist: " + root);
@@ -96,7 +105,7 @@ public class LocalDiffAdapter implements DiffPort {
                 public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
                     String relative = root.relativize(file).toString().replace('\\', '/');
                     if (isProtected(relative) || Files.isSymbolicLink(file)) return FileVisitResult.CONTINUE;
-                    result.put(relative, file);
+                    result.put(relative, new FileEntry(file, GitFileMode.read(file)));
                     return FileVisitResult.CONTINUE;
                 }
             });
@@ -106,6 +115,35 @@ public class LocalDiffAdapter implements DiffPort {
         }
     }
 
+    private Path pathOf(FileEntry file) {
+        return file == null ? null : file.path();
+    }
+
+    private boolean modeChanged(FileEntry before, FileEntry after) {
+        if (before == null) return after != null && after.mode() != GitFileMode.REGULAR;
+        if (after == null) return before.mode() != GitFileMode.REGULAR;
+        return before.mode() != after.mode();
+    }
+
+    private String decoratePatch(String contentPatch, FileEntry before, FileEntry after) {
+        if (!modeChanged(before, after)) return contentPatch;
+        StringBuilder patch = new StringBuilder();
+        if (before == null) {
+            patch.append("new mode ").append(modeText(after.mode())).append('\n');
+        } else if (after == null) {
+            patch.append("deleted mode ").append(modeText(before.mode())).append('\n');
+        } else {
+            patch.append("old mode ").append(modeText(before.mode())).append('\n')
+                    .append("new mode ").append(modeText(after.mode())).append('\n');
+        }
+        if (contentPatch != null && !contentPatch.isBlank()) patch.append(contentPatch);
+        return patch.toString();
+    }
+
+    private String modeText(int mode) {
+        return Integer.toOctalString(mode);
+    }
+
     private boolean isProtected(String relative) {
         String[] parts = relative.replace('\\', '/').toLowerCase(Locale.ROOT).split("/");
         for (String part : parts) {
@@ -113,8 +151,7 @@ public class LocalDiffAdapter implements DiffPort {
                     || part.equals("target") || part.equals("build") || part.equals("dist")
                     || part.equals(".idea") || part.equals(".vscode")) return true;
         }
-        String file = parts.length == 0 ? relative : parts[parts.length - 1];
-        return file.equals(".env") || file.startsWith(".env.");
+        return SensitivePathPolicy.isSensitiveRelativePath(relative);
     }
 
     private boolean containsZero(byte[] bytes) {
@@ -296,5 +333,8 @@ public class LocalDiffAdapter implements DiffPort {
     }
 
     private record BoundedRead(byte[] bytes, long size, boolean exceeded, boolean unstable) {
+    }
+
+    private record FileEntry(Path path, int mode) {
     }
 }

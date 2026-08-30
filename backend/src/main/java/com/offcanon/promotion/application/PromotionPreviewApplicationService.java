@@ -61,7 +61,9 @@ public class PromotionPreviewApplicationService {
                 && candidateFingerprint != null && candidateFingerprint.equals(currentFingerprint);
         boolean conflict = baseFingerprint != null && currentFingerprint != null
                 && !baseFingerprint.equals(currentFingerprint) && !promotedCandidateIsCurrent;
-        boolean unresolvedPromotion = !promotionJournals.findUnresolvedByProject(project.id()).isEmpty();
+        var unresolvedJournals = promotionJournals.findUnresolvedByProject(project.id());
+        var recoveryJournal = unresolvedJournals.isEmpty() ? null : unresolvedJournals.getFirst();
+        boolean unresolvedPromotion = recoveryJournal != null;
         String blockingReason = blockingReason(experiment, baseFingerprint,
                 candidateFingerprint, verificationStatus, inspectionFailure, conflict, unresolvedPromotion);
         boolean promotable = experiment.status() == ExperimentStatus.VERIFIED
@@ -74,7 +76,10 @@ public class PromotionPreviewApplicationService {
                 && candidateFingerprint != null;
 
         return new PromotionPreview(baseFingerprint, currentFingerprint, candidateFingerprint,
-                verificationStatus, trustedVerification, conflict, blockingReason, promotable);
+                verificationStatus, trustedVerification, conflict, blockingReason, promotable,
+                unresolvedPromotion,
+                recoveryJournal == null ? null : recoveryJournal.phase().name(),
+                recoveryJournal == null ? null : recoveryJournal.promotionId());
     }
 
     private String blockingReason(Experiment experiment,
@@ -124,6 +129,21 @@ public class PromotionPreviewApplicationService {
                                    boolean trustedVerification,
                                    boolean conflict,
                                    String blockingReason,
-                                   boolean promotable) {
+                                   boolean promotable,
+                                   boolean recoveryRequired,
+                                   String recoveryJournalPhase,
+                                   UUID recoveryPromotionId) {
+        /** Preserve the original constructor for embedded callers and tests. */
+        public PromotionPreview(String baseFingerprint,
+                                String currentFingerprint,
+                                String finalCandidateFingerprint,
+                                String verificationStatus,
+                                boolean trustedVerification,
+                                boolean conflict,
+                                String blockingReason,
+                                boolean promotable) {
+            this(baseFingerprint, currentFingerprint, finalCandidateFingerprint, verificationStatus,
+                    trustedVerification, conflict, blockingReason, promotable, false, null, null);
+        }
     }
 }

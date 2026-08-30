@@ -17,6 +17,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
@@ -42,14 +43,62 @@ public class JdbcProjectRepository implements ProjectRepository {
                     Timestamp.from(project.createdAt()), project.version());
             return project;
         } catch (DuplicateKeyException error) {
+            Optional<Project> byId = findById(project.id());
+            if (byId.isPresent()) {
+                if (sameProject(byId.get(), project)) {
+                    return byId.get();
+                }
+                throw new DomainException("PROJECT_IDENTITY_CONFLICT",
+                        "Project identity is already bound to different content: " + project.id());
+            }
             Optional<Project> existing = findByCanonicalPath(project.canonicalPath());
             if (existing.isPresent()) {
+                if (existing.get().id().equals(project.id())) {
+                    if (sameProject(existing.get(), project)) {
+                        return existing.get();
+                    }
+                    throw new DomainException("PROJECT_IDENTITY_CONFLICT",
+                            "Project identity is already bound to different content: " + project.id());
+                }
                 throw new DomainException("PROJECT_ALREADY_REGISTERED",
                         "Canonical Git repository is already registered as project " + existing.get().id()
                                 + ": " + project.canonicalPath());
             }
             throw new DomainException("PROJECT_IDENTITY_CONFLICT", "Project identity is already registered: " + project.id());
         }
+    }
+
+    @Override
+    public Project update(Project project) {
+        Optional<Project> current = findById(project.id());
+        if (current.isEmpty()) {
+            throw new DomainException("PROJECT_NOT_FOUND", "Project not found: " + project.id());
+        }
+        Project previous = current.get();
+        if (!previous.ownerId().equals(project.ownerId())
+                || !CanonicalPathIdentity.key(previous.canonicalPath())
+                .equals(CanonicalPathIdentity.key(project.canonicalPath()))) {
+            throw new DomainException("PROJECT_IDENTITY_CONFLICT",
+                    "Project identity cannot be changed: " + project.id());
+        }
+        int updated = jdbc.update("UPDATE projects SET name=?, verification_commands=?, version=? WHERE id=? AND version=?",
+                project.name(), json(project.verificationCommands()), project.version(),
+                project.id().toString(), previous.version());
+        if (updated == 1) return project;
+        throw new DomainException("PROJECT_VERSION_CONFLICT",
+                "Project was changed by another request: " + project.id());
+    }
+
+    private boolean sameProject(Project left, Project right) {
+        return left.id().equals(right.id())
+                && left.ownerId().equals(right.ownerId())
+                && left.name().equals(right.name())
+                && left.canonicalPath().toAbsolutePath().normalize()
+                .equals(right.canonicalPath().toAbsolutePath().normalize())
+                && left.verificationCommands().equals(right.verificationCommands())
+                && left.createdAt().truncatedTo(ChronoUnit.MICROS)
+                .equals(right.createdAt().truncatedTo(ChronoUnit.MICROS))
+                && left.version() == right.version();
     }
 
     @Override
@@ -70,11 +119,10 @@ public class JdbcProjectRepository implements ProjectRepository {
     }
 
     private Project map(ResultSet rs, int row) throws SQLException {
-        String owner = rs.getString("owner_id");
         return new Project(UUID.fromString(rs.getString("id")), rs.getString("name"),
                 Path.of(rs.getString("canonical_path")), jsonList(rs.getString("verification_commands")),
                 instant(rs.getTimestamp("created_at")), rs.getLong("version"),
-                owner == null ? Project.LEGACY_OWNER_ID : UUID.fromString(owner));
+                UUID.fromString(rs.getString("owner_id")));
     }
 
     private Instant instant(Timestamp timestamp) {

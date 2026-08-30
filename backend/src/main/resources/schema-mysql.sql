@@ -50,6 +50,29 @@ CREATE TABLE IF NOT EXISTS sessions (
     INDEX idx_sessions_project (project_id)
 );
 
+CREATE TABLE IF NOT EXISTS task_memory_revisions (
+    id CHAR(36) PRIMARY KEY,
+    project_id CHAR(36) NOT NULL,
+    session_id CHAR(36) NOT NULL,
+    source_experiment_id CHAR(36) NOT NULL,
+    source_snapshot_id CHAR(36) NOT NULL,
+    source_fingerprint VARCHAR(255) NOT NULL,
+    memory_kind VARCHAR(32) NOT NULL,
+    content TEXT NOT NULL,
+    source_evidence_ids JSON NOT NULL,
+    origin VARCHAR(32) NOT NULL,
+    trust VARCHAR(32) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    supersedes_ids JSON NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL,
+    sequence BIGINT NOT NULL,
+    UNIQUE KEY uk_task_memory_session_sequence (session_id, sequence),
+    INDEX idx_task_memory_session (session_id, sequence),
+    INDEX idx_task_memory_project (project_id, created_at),
+    INDEX idx_task_memory_experiment (source_experiment_id),
+    INDEX idx_task_memory_snapshot (source_snapshot_id)
+);
+
 CREATE TABLE IF NOT EXISTS snapshots (
     id CHAR(36) PRIMARY KEY,
     project_id CHAR(36) NOT NULL,
@@ -65,6 +88,7 @@ CREATE TABLE IF NOT EXISTS experiments (
     id CHAR(36) PRIMARY KEY,
     project_id CHAR(36) NOT NULL,
     session_id CHAR(36) NOT NULL,
+    continued_from_experiment_id CHAR(36) NULL,
     task TEXT NOT NULL,
     created_at TIMESTAMP(6) NOT NULL,
     status VARCHAR(48) NOT NULL,
@@ -76,7 +100,8 @@ CREATE TABLE IF NOT EXISTS experiments (
     verification_passed BOOLEAN NULL,
     version BIGINT NOT NULL,
     INDEX idx_experiments_project (project_id),
-    INDEX idx_experiments_session_status (session_id, status)
+    INDEX idx_experiments_session_status (session_id, status),
+    INDEX idx_experiments_continued_from (continued_from_experiment_id)
 );
 
 CREATE TABLE IF NOT EXISTS evidence (

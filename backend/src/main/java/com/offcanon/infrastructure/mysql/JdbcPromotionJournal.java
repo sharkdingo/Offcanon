@@ -53,6 +53,12 @@ public class JdbcPromotionJournal implements PromotionJournalPort {
     }
 
     @Override
+    public List<PromotionJournal> findByExperimentId(UUID experimentId) {
+        return jdbc.query("SELECT * FROM promotion_journal WHERE experiment_id=? ORDER BY created_at,promotion_id",
+                this::map, experimentId.toString());
+    }
+
+    @Override
     @Transactional
     public PromotionJournal markApplying(PromotionJournal journal, Instant now) {
         return transition(journal, PromotionPhase.APPLYING, null, null, now);

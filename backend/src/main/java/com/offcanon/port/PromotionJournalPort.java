@@ -10,6 +10,8 @@ import java.util.UUID;
 public interface PromotionJournalPort {
     PromotionJournal create(PromotionJournal journal);
     Optional<PromotionJournal> findById(UUID promotionId);
+    /** All journal records for one experiment, including terminal outcomes. */
+    List<PromotionJournal> findByExperimentId(UUID experimentId);
     PromotionJournal markApplying(PromotionJournal journal, Instant now);
     PromotionJournal markCommitted(PromotionJournal journal, String resultingFingerprint, Instant now);
     PromotionJournal markAborted(PromotionJournal journal, String reason, Instant now);

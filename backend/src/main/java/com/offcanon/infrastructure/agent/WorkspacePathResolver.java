@@ -2,6 +2,7 @@ package com.offcanon.infrastructure.agent;
 
 import com.offcanon.experiment.domain.Experiment;
 import com.offcanon.shared.domain.DomainException;
+import com.offcanon.shared.domain.SensitivePathPolicy;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
@@ -20,6 +21,12 @@ public class WorkspacePathResolver {
             throw new DomainException("INVALID_PATH", "Path must not be blank");
         }
         Path workspace = experiment.workspacePath().toAbsolutePath().normalize();
+        // The experiment root is a capability boundary.  Reject replacing the
+        // root itself with a symlink before resolving any child path.
+        if (Files.isSymbolicLink(workspace)
+                || !Files.isDirectory(workspace, LinkOption.NOFOLLOW_LINKS)) {
+            throw new DomainException("WORKSPACE_NOT_READY", "Experiment workspace is not a real directory");
+        }
         Path candidate = workspace.resolve(requestedPath).normalize();
         if (!candidate.startsWith(workspace)) {
             throw new DomainException("PATH_ESCAPE", "Path escapes experiment workspace");
@@ -56,7 +63,6 @@ public class WorkspacePathResolver {
         for (String part : parts) {
             if (part.equals(".git") || part.equals(".offcanon")) return true;
         }
-        String file = parts.length == 0 ? relative : parts[parts.length - 1];
-        return file.equals(".env") || file.startsWith(".env.");
+        return SensitivePathPolicy.isSensitiveRelativePath(relative);
     }
 }

@@ -31,6 +31,30 @@ public class SettingsController {
         return response(auth.getSettings(identity.requireUser(request)));
     }
 
+    /**
+     * Exposes only non-secret deployment/model state for the settings UI.  In
+     * particular, the API key is reduced to a boolean and is never serialized.
+     */
+    @GetMapping("/model-status")
+    public ModelStatusResponse modelStatus(HttpServletRequest request) {
+        AuthApplicationService.ModelConfigurationStatus status =
+                auth.modelConfigurationStatus(identity.requireUser(request));
+        return new ModelStatusResponse(status.apiKeyConfigured(), status.defaultEndpointConfigured(),
+                status.defaultModelConfigured(), status.effectiveEndpointConfigured(),
+                status.effectiveModelConfigured(), status.effectiveEndpointAllowed(),
+                status.effectiveEndpoint(), status.effectiveModel(), status.allowedEndpointCount());
+    }
+
+    /** Deployment ceilings are safe to show because they contain no secrets. */
+    @GetMapping("/runtime-policy")
+    public RuntimePolicyResponse runtimePolicy(HttpServletRequest request) {
+        identity.requireUser(request);
+        var policy = auth.runtimePolicy();
+        return new RuntimePolicyResponse(policy.defaultMaxSteps(), policy.defaultRunTimeoutSeconds(),
+                policy.defaultContextLimitChars(), policy.maxStepsCeiling(),
+                policy.runTimeoutSecondsCeiling(), policy.contextLimitCharsCeiling());
+    }
+
     @PutMapping
     public SettingsResponse update(@Valid @RequestBody UpdateSettingsRequest body,
                                    HttpServletRequest request) {
@@ -66,6 +90,25 @@ public class SettingsController {
                                    long agentRunTimeoutSeconds,
                                    int contextLimitChars,
                                    java.time.Instant updatedAt,
-                                   long version) {
+                                    long version) {
+    }
+
+    public record ModelStatusResponse(boolean apiKeyConfigured,
+                                      boolean defaultEndpointConfigured,
+                                      boolean defaultModelConfigured,
+                                      boolean effectiveEndpointConfigured,
+                                      boolean effectiveModelConfigured,
+                                      boolean effectiveEndpointAllowed,
+                                      String effectiveEndpoint,
+                                      String effectiveModel,
+                                      int allowedEndpointCount) {
+    }
+
+    public record RuntimePolicyResponse(int defaultMaxSteps,
+                                        long defaultRunTimeoutSeconds,
+                                        int defaultContextLimitChars,
+                                        int maxStepsCeiling,
+                                        long runTimeoutSecondsCeiling,
+                                        int contextLimitCharsCeiling) {
     }
 }

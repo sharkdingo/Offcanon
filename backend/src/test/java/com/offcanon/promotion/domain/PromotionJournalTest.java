@@ -74,6 +74,20 @@ class PromotionJournalTest {
         assertEquals("canonical is base", aborted.failureReason());
     }
 
+    @Test
+    void findsTerminalAndUnresolvedJournalsByExperiment() {
+        InMemoryPromotionJournal store = new InMemoryPromotionJournal();
+        PromotionJournal first = store.create(journal(NOW.plusSeconds(60)));
+        PromotionJournal second = store.create(PromotionJournal.create(first.experimentId(), first.projectId(),
+                "base-2", "candidate-2", first.candidatePath().resolveSibling("candidate-2"),
+                "worker-2", NOW, NOW.plusSeconds(60)));
+
+        assertEquals(2, store.findByExperimentId(first.experimentId()).size());
+        assertEquals(first.promotionId(), store.findByExperimentId(first.experimentId()).get(0).promotionId());
+        assertTrue(store.findUnresolvedByProject(first.projectId()).stream()
+                .anyMatch(item -> item.promotionId().equals(second.promotionId())));
+    }
+
     private PromotionJournal journal(Instant leaseUntil) {
         UUID experiment = UUID.randomUUID();
         return PromotionJournal.create(experiment, UUID.randomUUID(), "base", "candidate",

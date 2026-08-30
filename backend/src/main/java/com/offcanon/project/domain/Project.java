@@ -15,18 +15,6 @@ public record Project(
         long version,
         UUID ownerId) {
 
-    /** Owner used by pre-identity domain fixtures and legacy rows during migration. */
-    public static final UUID LEGACY_OWNER_ID = UUID.fromString("00000000-0000-0000-0000-000000000001");
-
-    public Project(UUID id,
-                   String name,
-                   Path canonicalPath,
-                   List<String> verificationCommands,
-                   Instant createdAt,
-                   long version) {
-        this(id, name, canonicalPath, verificationCommands, createdAt, version, LEGACY_OWNER_ID);
-    }
-
     public Project {
         Objects.requireNonNull(id, "id");
         Objects.requireNonNull(name, "name");
@@ -41,15 +29,20 @@ public record Project(
         verificationCommands = List.copyOf(verificationCommands);
     }
 
-    public static Project create(String name, Path canonicalPath, List<String> verificationCommands, Instant now) {
-        return create(LEGACY_OWNER_ID, name, canonicalPath, verificationCommands, now);
-    }
-
     public static Project create(UUID ownerId,
                                  String name,
                                  Path canonicalPath,
                                  List<String> verificationCommands,
                                  Instant now) {
         return new Project(UUID.randomUUID(), name.trim(), canonicalPath, verificationCommands, now, 0, ownerId);
+    }
+
+    /**
+     * Update only user-facing project metadata. The canonical path and owner
+     * remain immutable because experiments and snapshots are bound to them.
+     */
+    public Project updated(String name, List<String> verificationCommands) {
+        return new Project(id, name.trim(), canonicalPath, verificationCommands,
+                createdAt, version + 1, ownerId);
     }
 }

@@ -1,9 +1,11 @@
 package com.offcanon.infrastructure.git;
 
 import com.offcanon.infrastructure.process.ProcessRunner;
+import com.offcanon.infrastructure.filesystem.GitFileMode;
 import com.offcanon.port.SnapshotPort;
 import com.offcanon.project.domain.Project;
 import com.offcanon.shared.domain.DomainException;
+import com.offcanon.shared.domain.SensitivePathPolicy;
 import com.offcanon.workspace.domain.Snapshot;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -22,7 +24,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Locale;
 import java.util.Set;
 import java.util.HashSet;
 import java.util.UUID;
@@ -71,6 +72,18 @@ public class GitSnapshotAdapter implements SnapshotPort {
     }
 
     @Override
+    public void discard(Snapshot snapshot) {
+        Path expected = dataRoot.resolve("snapshots").resolve(snapshot.id().toString())
+                .toAbsolutePath().normalize();
+        Path actual = snapshot.materializedPath().toAbsolutePath().normalize();
+        if (!actual.equals(expected) || Files.isSymbolicLink(actual)) {
+            throw new DomainException("SNAPSHOT_DISCARD_REJECTED",
+                    "Temporary snapshot is outside the managed snapshot directory");
+        }
+        deleteQuietly(expected);
+    }
+
+    @Override
     public String fingerprintWorkspace(Project project, Path workspace, String parentFingerprint) {
         Path root = requireGitRoot(project.canonicalPath());
         return writeWorkspaceTree(root, requireWorkspace(workspace), parentFingerprint,
@@ -90,7 +103,7 @@ public class GitSnapshotAdapter implements SnapshotPort {
             String rawBefore = rawFingerprint(source, ignored);
             String before = fingerprint.get();
             Path gitRoot = requireGitRoot(project.canonicalPath());
-            List<String> treeFiles = listTreeFiles(gitRoot, before, objectStore.environment());
+            List<TreeEntry> treeFiles = listTreeFiles(gitRoot, before, objectStore.environment());
 
             List<String> included = new ArrayList<>();
             List<Snapshot.ExcludedPath> excluded = new ArrayList<>();
@@ -120,11 +133,16 @@ public class GitSnapshotAdapter implements SnapshotPort {
     }
 
     private Path requireWorkspace(Path path) {
-        if (path == null || !Files.isDirectory(path)) {
+        if (path == null || Files.isSymbolicLink(path)
+                || !Files.isDirectory(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
             throw new DomainException("WORKSPACE_SOURCE_MISSING", "Workspace is not a directory: " + path);
         }
         try {
-            return path.toRealPath();
+            Path real = path.toRealPath();
+            if (Files.isSymbolicLink(real)) {
+                throw new DomainException("WORKSPACE_PATH_INVALID", "Workspace root must not be a symbolic link: " + path);
+            }
+            return real;
         } catch (IOException error) {
             throw new DomainException("WORKSPACE_PATH_INVALID", "Unable to resolve workspace: " + path);
         }
@@ -249,10 +267,18 @@ public class GitSnapshotAdapter implements SnapshotPort {
     }
 
     private void stageWorkingTree(Path root, Map<String, String> env) {
-        List<String> addArgs = new ArrayList<>(List.of("add", "-A", "--", "."));
+        List<String> addArgs = new ArrayList<>();
+        // Git's core.filemode setting is commonly disabled on shared or
+        // copied repositories. Offcanon tracks the executable bit explicitly,
+        // so POSIX workspaces must opt into Git's mode comparison for this
+        // isolated index. Providers without POSIX attributes cannot represent
+        // a local chmod and retain Git's normal platform behavior.
+        if (GitFileMode.supportsPosixAttributes(root)) {
+            addArgs.addAll(List.of("-c", "core.filemode=true"));
+        }
+        addArgs.addAll(List.of("add", "-A", "--", "."));
         addArgs.addAll(List.of(
                 ":(exclude,icase,glob)**/.env",
-                ":(exclude,icase,glob)**/.env.*",
                 ":(exclude,icase,glob)**/.git/**",
                 ":(exclude,icase,glob)**/.offcanon/**",
                 ":(exclude,glob)**/node_modules/**",
@@ -323,9 +349,9 @@ public class GitSnapshotAdapter implements SnapshotPort {
         }
     }
 
-    private List<String> listTreeFiles(Path gitRoot,
-                                       String fingerprint,
-                                       Map<String, String> environment) {
+    private List<TreeEntry> listTreeFiles(Path gitRoot,
+                                          String fingerprint,
+                                          Map<String, String> environment) {
         ProcessRunner.ProcessResult listed = runGit(gitRoot,
                 List.of("ls-tree", "-r", "-z", "--full-tree", fingerprint), environment);
         if (listed.exitCode() != 0) {
@@ -336,7 +362,7 @@ public class GitSnapshotAdapter implements SnapshotPort {
                     "Snapshot tree path metadata exceeded the capture safety limit");
         }
 
-        List<String> files = new ArrayList<>();
+        List<TreeEntry> files = new ArrayList<>();
         for (String record : listed.stdout().split("\0", -1)) {
             if (record.isEmpty()) continue;
             int separator = record.indexOf('\t');
@@ -355,8 +381,12 @@ public class GitSnapshotAdapter implements SnapshotPort {
                 throw new DomainException("SNAPSHOT_GITLINK_UNSUPPORTED",
                         "Git submodules are not supported in an experiment snapshot: " + relative);
             }
-            if (!"blob".equals(metadata[1])
-                    || !("100644".equals(metadata[0]) || "100755".equals(metadata[0]))) {
+            int mode = switch (metadata[0]) {
+                case "100644" -> GitFileMode.REGULAR;
+                case "100755" -> GitFileMode.EXECUTABLE;
+                default -> -1;
+            };
+            if (!"blob".equals(metadata[1]) || mode < 0) {
                 throw new DomainException("SNAPSHOT_INVALID_ENTRY", "Unsupported snapshot tree entry: " + relative);
             }
             validateTreePath(relative);
@@ -364,7 +394,7 @@ public class GitSnapshotAdapter implements SnapshotPort {
                 throw new DomainException("SNAPSHOT_PROTECTED_ENTRY",
                         "Protected path remained in snapshot tree: " + relative);
             }
-            files.add(relative);
+            files.add(new TreeEntry(relative, mode));
         }
         return List.copyOf(files);
     }
@@ -403,12 +433,13 @@ public class GitSnapshotAdapter implements SnapshotPort {
 
     private void materializeTreeFiles(Path source,
                                       Path destination,
-                                      List<String> treeFiles,
+                                      List<TreeEntry> treeFiles,
                                       List<String> included) throws IOException {
         Files.createDirectories(destination);
         Path realSource = source.toRealPath();
         Path realDestination = destination.toRealPath();
-        for (String relative : treeFiles) {
+        for (TreeEntry entry : treeFiles) {
+            String relative = entry.relative();
             Path original = source.resolve(relative).normalize();
             Path target = destination.resolve(relative).normalize();
             if (!original.startsWith(source) || !target.startsWith(destination)
@@ -425,7 +456,11 @@ public class GitSnapshotAdapter implements SnapshotPort {
                     && (Files.isSymbolicLink(target) || !target.toRealPath().startsWith(realDestination)))) {
                 throw new DomainException("SNAPSHOT_PATH_ESCAPE", "Snapshot target escapes destination: " + relative);
             }
-            Files.copy(original, target, StandardCopyOption.REPLACE_EXISTING);
+            Files.copy(original, target, StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.COPY_ATTRIBUTES);
+            // COPY_ATTRIBUTES is provider-dependent; apply the Git bit
+            // explicitly so the materialized tree agrees with its tree hash.
+            GitFileMode.apply(target, entry.mode());
             included.add(relative);
         }
     }
@@ -537,7 +572,7 @@ public class GitSnapshotAdapter implements SnapshotPort {
     }
 
     private String exclusionReason(String relative) {
-        String[] parts = relative.toLowerCase(Locale.ROOT).split("/");
+        String[] parts = relative.toLowerCase(java.util.Locale.ROOT).split("/");
         for (String part : parts) {
             if (part.equals(".git") || part.equals(".offcanon") || part.equals("node_modules")
                     || part.equals("target") || part.equals("build") || part.equals("dist")
@@ -545,8 +580,7 @@ public class GitSnapshotAdapter implements SnapshotPort {
                 return "runtime or dependency directory";
             }
         }
-        String fileName = parts[parts.length - 1];
-        if (fileName.equals(".env") || fileName.startsWith(".env.")) {
+        if (SensitivePathPolicy.isSensitiveRelativePath(relative)) {
             return "sensitive environment file";
         }
         return null;
@@ -603,5 +637,8 @@ public class GitSnapshotAdapter implements SnapshotPort {
                     "GIT_OBJECT_DIRECTORY", objectDirectory.toString(),
                     "GIT_ALTERNATE_OBJECT_DIRECTORIES", canonicalObjects.toString());
         }
+    }
+
+    private record TreeEntry(String relative, int mode) {
     }
 }

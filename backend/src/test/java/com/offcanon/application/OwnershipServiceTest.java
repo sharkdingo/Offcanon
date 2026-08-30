@@ -1,8 +1,10 @@
 package com.offcanon.application;
 
 import com.offcanon.infrastructure.memory.InMemoryExperimentRepository;
+import com.offcanon.infrastructure.memory.InMemoryPromotionLock;
 import com.offcanon.infrastructure.memory.InMemoryProjectRepository;
 import com.offcanon.infrastructure.memory.InMemorySessionRepository;
+import com.offcanon.infrastructure.memory.InMemorySessionRunLease;
 import com.offcanon.infrastructure.memory.InMemorySnapshotRepository;
 import com.offcanon.project.domain.Project;
 import com.offcanon.shared.web.ForbiddenException;
@@ -44,7 +46,7 @@ class OwnershipServiceTest {
         projects.save(project);
         ExperimentApplicationService service = new ExperimentApplicationService(projects, sessions, experiments,
                 new InMemorySnapshotRepository(), new NoopSnapshotPort(), mock(com.offcanon.port.WorkspacePort.class),
-                Instant::now);
+                Instant::now, new InMemorySessionRunLease(), new InMemoryPromotionLock());
 
         service.createSession(owner, project.id(), "owner session");
         assertEquals(1, service.listSessions(project.id(), owner).size());

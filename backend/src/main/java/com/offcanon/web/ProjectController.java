@@ -12,6 +12,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseStatus;
@@ -22,6 +23,7 @@ import java.util.UUID;
 
 import static com.offcanon.web.ApiDtos.CreateExperimentRequest;
 import static com.offcanon.web.ApiDtos.CreateProjectRequest;
+import static com.offcanon.web.ApiDtos.UpdateProjectRequest;
 import static com.offcanon.web.ApiDtos.ExperimentResponse;
 import static com.offcanon.web.ApiDtos.ProjectResponse;
 import static com.offcanon.web.ApiDtos.SessionResponse;
@@ -43,32 +45,34 @@ public class ProjectController {
         this.identity = identity;
     }
 
-    /** Kept for narrow unit fixtures that instantiate the controller directly. */
-    public ProjectController(ProjectApplicationService projectService,
-                             ExperimentApplicationService experimentService) {
-        this(projectService, experimentService, null);
-    }
-
     @GetMapping
     public List<ProjectResponse> listProjects(HttpServletRequest request) {
-        return (identity == null ? projectService.list() : projectService.list(identity.ownerId(request))).stream().map(ProjectController::toResponse).toList();
+        return projectService.list(identity.ownerId(request)).stream().map(ProjectController::toResponse).toList();
     }
 
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
     public ProjectResponse createProject(@Valid @RequestBody CreateProjectRequest request,
                                          HttpServletRequest httpRequest) {
-        return toResponse(projectService.register(identity == null ? Project.LEGACY_OWNER_ID : identity.ownerId(httpRequest), request.name(), request.canonicalPath(), request.verificationCommands()));
+        return toResponse(projectService.register(identity.ownerId(httpRequest), request.name(), request.canonicalPath(), request.verificationCommands()));
+    }
+
+    @PutMapping("/{projectId}")
+    public ProjectResponse updateProject(@PathVariable UUID projectId,
+                                         @Valid @RequestBody UpdateProjectRequest request,
+                                         HttpServletRequest httpRequest) {
+        return toResponse(projectService.update(identity.ownerId(httpRequest), projectId,
+                request.name(), request.canonicalPath(), request.verificationCommands()));
     }
 
     @GetMapping("/{projectId}/experiments")
     public List<ExperimentResponse> listExperiments(@PathVariable UUID projectId, HttpServletRequest request) {
-        return experimentService.listByProject(projectId, identity == null ? Project.LEGACY_OWNER_ID : identity.ownerId(request)).stream().map(ProjectController::toResponse).toList();
+        return experimentService.listByProject(projectId, identity.ownerId(request)).stream().map(ProjectController::toExperimentResponse).toList();
     }
 
     @GetMapping("/{projectId}/sessions")
     public List<SessionResponse> listSessions(@PathVariable UUID projectId, HttpServletRequest request) {
-        return experimentService.listSessions(projectId, identity == null ? Project.LEGACY_OWNER_ID : identity.ownerId(request)).stream()
+        return experimentService.listSessions(projectId, identity.ownerId(request)).stream()
                 .map(session -> new SessionResponse(session.id(), session.projectId(), session.title(), session.createdAt()))
                 .toList();
     }
@@ -78,7 +82,7 @@ public class ProjectController {
     public SessionResponse createSession(@PathVariable UUID projectId,
                                          @Valid @RequestBody CreateSessionRequest request,
                                          HttpServletRequest httpRequest) {
-        var session = experimentService.createSession(identity == null ? Project.LEGACY_OWNER_ID : identity.ownerId(httpRequest), projectId, request.title());
+        var session = experimentService.createSession(identity.ownerId(httpRequest), projectId, request.title());
         return new SessionResponse(session.id(), session.projectId(), session.title(), session.createdAt());
     }
 
@@ -87,7 +91,7 @@ public class ProjectController {
     public ExperimentResponse createExperiment(@PathVariable UUID projectId,
                                                @Valid @RequestBody CreateExperimentRequest request,
                                                HttpServletRequest httpRequest) {
-        return toResponse(experimentService.create(identity == null ? Project.LEGACY_OWNER_ID : identity.ownerId(httpRequest), projectId, request.sessionId(), request.sessionTitle(), request.task()));
+        return toExperimentResponse(experimentService.create(identity.ownerId(httpRequest), projectId, request.sessionId(), request.sessionTitle(), request.task()));
     }
 
     private static ProjectResponse toResponse(Project project) {
@@ -95,8 +99,9 @@ public class ProjectController {
                 project.verificationCommands(), project.createdAt());
     }
 
-    private static ExperimentResponse toResponse(Experiment experiment) {
-        return new ExperimentResponse(experiment.id(), experiment.projectId(), experiment.sessionId(), experiment.task(),
+    private static ExperimentResponse toExperimentResponse(Experiment experiment) {
+        return new ExperimentResponse(experiment.id(), experiment.projectId(), experiment.sessionId(),
+                experiment.continuedFromExperimentId(), experiment.task(),
                 experiment.status().name(), experiment.baseSnapshotId(), experiment.resultSnapshotId(),
                 experiment.workspacePath() == null ? null : experiment.workspacePath().toString(),
                 experiment.agentSummary(), experiment.failureReason(), experiment.createdAt(), experiment.version());

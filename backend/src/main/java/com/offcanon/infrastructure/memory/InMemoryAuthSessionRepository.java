@@ -8,6 +8,7 @@ import org.springframework.stereotype.Repository;
 import java.time.Instant;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import com.offcanon.shared.domain.DomainException;
 
 @Repository
 @Profile("!mysql")
@@ -16,8 +17,12 @@ public class InMemoryAuthSessionRepository implements AuthSessionRepository {
 
     @Override
     public AuthSession save(AuthSession session) {
-        sessions.put(session.tokenHash(), session);
-        return session;
+        AuthSession existing = sessions.putIfAbsent(session.tokenHash(), session);
+        if (existing != null && !existing.equals(session)) {
+            throw new DomainException("AUTH_SESSION_IDENTITY_CONFLICT",
+                    "Authentication session identity is already bound to different content");
+        }
+        return existing == null ? session : existing;
     }
 
     @Override

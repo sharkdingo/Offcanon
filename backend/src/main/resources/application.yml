@@ -13,13 +13,33 @@ offcanon:
   data-root: ${OFFCANON_DATA_ROOT:${user.home}/.offcanon}
   agent:
     max-steps: ${OFFCANON_AGENT_MAX_STEPS:20}
-    model-max-attempts: ${OFFCANON_MODEL_MAX_ATTEMPTS:3}
+    # User Settings may lower these defaults, never raise them above the
+    # deployment-owned ceilings.
+    max-steps-ceiling: ${OFFCANON_AGENT_MAX_STEPS_CEILING:100}
+    model-max-attempts: ${OFFCANON_MODEL_MAX_ATTEMPTS:4}
     run-timeout-seconds: ${OFFCANON_AGENT_RUN_TIMEOUT_SECONDS:600}
+    run-timeout-seconds-ceiling: ${OFFCANON_AGENT_RUN_TIMEOUT_SECONDS_CEILING:86400}
     context-limit-chars: ${OFFCANON_AGENT_CONTEXT_LIMIT_CHARS:80000}
+    context-limit-chars-ceiling: ${OFFCANON_AGENT_CONTEXT_LIMIT_CHARS_CEILING:1000000}
+    recovery-interval-ms: ${OFFCANON_AGENT_RECOVERY_INTERVAL_MS:30000}
     command-timeout-seconds: ${OFFCANON_COMMAND_TIMEOUT_SECONDS:30}
     observation-limit: ${OFFCANON_OBSERVATION_LIMIT:12000}
   model:
+    # Deployment defaults are visible to the backend only. User Settings may
+    # select among the trusted endpoint allowlist without receiving the key.
+    base-url: ${OFFCANON_MODEL_BASE_URL:}
+    name: ${OFFCANON_MODEL_NAME:}
+    # User-selected endpoints are credential-bearing destinations.  The
+    # adapter trusts the configured base URL and any explicit comma-separated
+    # additions only; arbitrary Settings values are rejected.
+    allowed-base-urls: ${OFFCANON_MODEL_ALLOWED_BASE_URLS:}
     request-timeout-seconds: ${OFFCANON_MODEL_REQUEST_TIMEOUT_SECONDS:120}
+  runtime:
+    retention-interval-ms: ${OFFCANON_RUNTIME_RETENTION_INTERVAL_MS:3600000}
+    orphan-retention-hours: ${OFFCANON_RUNTIME_ORPHAN_RETENTION_HOURS:24}
+    verification-retention-hours: ${OFFCANON_RUNTIME_VERIFICATION_RETENTION_HOURS:24}
+    promotion-retention-hours: ${OFFCANON_RUNTIME_PROMOTION_RETENTION_HOURS:24}
+    snapshot-retention-hours: ${OFFCANON_RUNTIME_SNAPSHOT_RETENTION_HOURS:168}
   events:
     in-memory-retention: ${OFFCANON_EVENT_RETENTION:2000}
     poll-interval-ms: ${OFFCANON_EVENT_POLL_INTERVAL_MS:500}

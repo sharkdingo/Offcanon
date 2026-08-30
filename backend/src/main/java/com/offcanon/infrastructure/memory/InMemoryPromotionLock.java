@@ -17,6 +17,7 @@ public class InMemoryPromotionLock implements PromotionLockPort {
 
     @Override
     public <T> T withProjectLock(UUID projectId, Supplier<T> action) {
+        if (projectId == null) throw new IllegalArgumentException("projectId must not be null");
         ReentrantLock lock = locks.computeIfAbsent(projectId, ignored -> new ReentrantLock());
         try {
             lock.lockInterruptibly();
@@ -28,6 +29,15 @@ public class InMemoryPromotionLock implements PromotionLockPort {
             return action.get();
         } finally {
             lock.unlock();
+        }
+    }
+
+    @Override
+    public void assertHeld(UUID projectId) {
+        ReentrantLock lock = projectId == null ? null : locks.get(projectId);
+        if (lock == null || !lock.isHeldByCurrentThread()) {
+            throw new DomainException("PROMOTION_LOCK_LOST",
+                    "The current thread does not hold the project promotion lock");
         }
     }
 }

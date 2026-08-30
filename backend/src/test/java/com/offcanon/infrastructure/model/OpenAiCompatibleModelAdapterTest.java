@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.offcanon.agent.domain.ModelMessage;
 import com.offcanon.agent.domain.ModelRequest;
+import com.offcanon.agent.domain.ModelTransientException;
 import com.offcanon.agent.domain.ToolCall;
 import com.offcanon.agent.domain.ToolDefinition;
 import com.offcanon.shared.domain.DomainException;
@@ -25,6 +26,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -87,6 +89,7 @@ class OpenAiCompatibleModelAdapterTest {
         String requestEndpoint = "http://127.0.0.1:" + server.getAddress().getPort() + "/v1";
         OpenAiCompatibleModelAdapter configuredElsewhere = new OpenAiCompatibleModelAdapter(
                 mapper, HttpClient.newHttpClient(), "http://127.0.0.1:1/configured", "configured-model",
+                requestEndpoint,
                 Duration.ofSeconds(5), () -> "local-test-key");
 
         configuredElsewhere.complete(new ModelRequest(List.of(ModelMessage.user("runtime config")), List.of(),
@@ -95,6 +98,40 @@ class OpenAiCompatibleModelAdapterTest {
         CapturedRequest captured = request.get();
         assertEquals("/v1/chat/completions", captured.path());
         assertEquals("runtime-model", mapper.readTree(captured.body()).path("model").asText());
+    }
+
+    @Test
+    void rejectsUntrustedPerRequestEndpointBeforeSendingTheGlobalApiKey() throws Exception {
+        respond(200, "{\"choices\":[{\"message\":{\"content\":\"unexpected\"},\"finish_reason\":\"stop\"}]}");
+        String untrusted = "http://127.0.0.1:" + (server.getAddress().getPort() + 1) + "/v1";
+        DomainException error = assertThrows(DomainException.class, () -> adapter.complete(
+                request().withProvider(untrusted, "runtime-model")));
+
+        assertEquals("MODEL_ENDPOINT_NOT_ALLOWED", error.code());
+        assertTrue(request.get() == null, "an untrusted endpoint must be rejected before an HTTP request");
+    }
+
+    @Test
+    void rejectsInvalidPerRequestEndpointBeforeSendingTheGlobalApiKey() {
+        DomainException error = assertThrows(DomainException.class, () -> adapter.complete(
+                request().withProvider("http://127.0.0.1:" + server.getAddress().getPort()
+                        + "/v1?api-version=2024", "runtime-model")));
+
+        assertEquals("MODEL_ENDPOINT_INVALID", error.code());
+        assertTrue(request.get() == null, "an invalid endpoint must be rejected before an HTTP request");
+
+        DomainException outOfRangePort = assertThrows(DomainException.class, () -> adapter.complete(
+                request().withProvider("http://127.0.0.1:65536/v1", "runtime-model")));
+        assertEquals("MODEL_ENDPOINT_INVALID", outOfRangePort.code());
+        assertTrue(request.get() == null, "an out-of-range port must be rejected before an HTTP request");
+    }
+
+    @Test
+    void failsFastWhenTheConfiguredAllowlistContainsAnInvalidEndpoint() {
+        assertThrows(IllegalArgumentException.class, () -> new OpenAiCompatibleModelAdapter(
+                mapper, HttpClient.newHttpClient(), "http://127.0.0.1:8080/v1", "contract-model",
+                "http://127.0.0.1:8080/v1?api-version=2024", Duration.ofSeconds(5),
+                () -> "local-test-key"));
     }
 
     @Test
@@ -110,6 +147,16 @@ class OpenAiCompatibleModelAdapterTest {
     }
 
     @Test
+    void carriesProviderRetryAfterIntoTransientFailure() {
+        respond(429, "{\"error\":\"rate limited\"}", Map.of("Retry-After", "7"));
+
+        DomainException error = assertThrows(DomainException.class, () -> adapter.complete(request()));
+
+        ModelTransientException transientFailure = assertInstanceOf(ModelTransientException.class, error);
+        assertEquals(Duration.ofSeconds(7), transientFailure.retryAfter().orElseThrow());
+    }
+
+    @Test
     void classifiesOtherClientFailuresAsPermanent() {
         respond(401, "{\"error\":\"invalid key\"}");
 
@@ -122,6 +169,58 @@ class OpenAiCompatibleModelAdapterTest {
     @Test
     void rejectsMalformedSuccessfulResponse() {
         respond(200, "not-json");
+
+        DomainException error = assertThrows(DomainException.class, () -> adapter.complete(request()));
+
+        assertEquals("MODEL_RESPONSE_INVALID", error.code());
+    }
+
+    @Test
+    void rejectsMalformedToolCallShapesAndTrailingJson() {
+        List<String> malformed = List.of(
+                """
+                        {"choices":[{"message":{"content":null,"tool_calls":[
+                          {"id":"call-1","type":"custom","function":{"name":"write_file","arguments":"{}"}}
+                        ]},"finish_reason":"tool_calls"}]}
+                        """,
+                """
+                        {"choices":[{"message":{"content":null,"tool_calls":[
+                          {"id":"call-1","type":"function","function":{"name":"write_file","arguments":{"path":"x"}}}
+                        ]},"finish_reason":"tool_calls"}]}
+                        """,
+                """
+                        {"choices":[{"message":{"content":null,"tool_calls":[
+                          {"id":"call-1","type":"function","function":{"name":"write_file"}}
+                        ]},"finish_reason":"tool_calls"}]}
+                        """,
+                """
+                        {"choices":[{"message":{"content":null,"tool_calls":[
+                          {"id":"call-1","type":"function","function":{"name":"write_file","arguments":"[]"}}
+                        ]},"finish_reason":"tool_calls"}]}
+                        """,
+                """
+                        {"choices":[{"message":{"content":7},"finish_reason":"stop"}]}
+                        """,
+                """
+                        {"choices":[{"message":{"content":"done","tool_calls":{}},"finish_reason":"stop"}]}
+                        """,
+                "{\"choices\":[{\"message\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]} {\"extra\":true}"
+        );
+
+        for (String body : malformed) {
+            respond(200, body);
+            DomainException error = assertThrows(DomainException.class, () -> adapter.complete(request()));
+            assertEquals("MODEL_RESPONSE_INVALID", error.code(), body);
+        }
+    }
+
+    @Test
+    void rejectsTrailingJsonInsideToolArguments() {
+        respond(200, """
+                {"choices":[{"message":{"content":null,"tool_calls":[
+                  {"id":"call-1","type":"function","function":{"name":"write_file","arguments":"{} {}"}}
+                ]},"finish_reason":"tool_calls"}]}
+                """);
 
         DomainException error = assertThrows(DomainException.class, () -> adapter.complete(request()));
 
@@ -193,6 +292,11 @@ class OpenAiCompatibleModelAdapterTest {
         response.set(new StubResponse(status, body.getBytes(StandardCharsets.UTF_8)));
     }
 
+    private void respond(int status, String body, Map<String, String> headers) {
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        response.set(new StubResponse(status, bytes, bytes.length, null, null, headers));
+    }
+
     private void handle(HttpExchange exchange) throws IOException {
         request.set(new CapturedRequest(exchange.getRequestURI().getPath(),
                 exchange.getRequestHeaders().getFirst("Authorization"),
@@ -200,6 +304,7 @@ class OpenAiCompatibleModelAdapterTest {
         StubResponse current = response.get();
         if (current == null) throw new AssertionError("Test response was not configured");
         exchange.getResponseHeaders().set("Content-Type", "application/json");
+        current.headers().forEach((name, value) -> exchange.getResponseHeaders().set(name, value));
         exchange.sendResponseHeaders(current.status(), current.declaredLength());
         try (var output = exchange.getResponseBody()) {
             output.write(current.body());
@@ -219,9 +324,18 @@ class OpenAiCompatibleModelAdapterTest {
                                 byte[] body,
                                 int declaredLength,
                                 CountDownLatch bodyStarted,
-                                CountDownLatch releaseBody) {
+                                CountDownLatch releaseBody,
+                                Map<String, String> headers) {
         private StubResponse(int status, byte[] body) {
-            this(status, body, body.length, null, null);
+            this(status, body, body.length, null, null, Map.of());
+        }
+
+        private StubResponse(int status,
+                             byte[] body,
+                             int declaredLength,
+                             CountDownLatch bodyStarted,
+                             CountDownLatch releaseBody) {
+            this(status, body, declaredLength, bodyStarted, releaseBody, Map.of());
         }
     }
 

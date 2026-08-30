@@ -52,13 +52,19 @@ public class InMemoryExperimentRepository implements ExperimentRepository {
     public boolean hasRunningExperiment(UUID sessionId) {
         return experiments.values().stream().anyMatch(e -> e.sessionId().equals(sessionId)
                 && switch (e.status()) {
-                    case RUNNING, AGENT_COMPLETED, VERIFYING -> true;
+                    // A session owns one lifecycle at a time. Waiting,
+                    // promotion and recovery states must block a second
+                    // experiment just like an actively running agent.
+                    case CREATED, SNAPSHOTTING, READY_TO_RUN, RUNNING,
+                            AGENT_COMPLETED, VERIFYING, PREPARING_PROMOTION,
+                            PROMOTING, RECOVERY_REQUIRED -> true;
                     default -> false;
                 });
     }
 
     private Experiment copy(Experiment experiment) {
-        return Experiment.restore(experiment.id(), experiment.projectId(), experiment.sessionId(), experiment.task(),
+        return Experiment.restore(experiment.id(), experiment.projectId(), experiment.sessionId(),
+                experiment.continuedFromExperimentId(), experiment.task(),
                 experiment.createdAt(), experiment.status(), experiment.baseSnapshotId(), experiment.resultSnapshotId(),
                 experiment.workspacePath(), experiment.agentSummary(), experiment.verificationResult(),
                 experiment.failureReason(), experiment.version());

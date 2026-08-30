@@ -2,6 +2,8 @@ package com.offcanon.web;
 
 import jakarta.servlet.http.HttpServletResponse;
 import org.junit.jupiter.api.Test;
+import org.springframework.http.HttpMethod;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.io.IOException;
 
@@ -30,5 +32,15 @@ class ApiExceptionHandlerTest {
         assertNotNull(problem);
         assertEquals(500, problem.getStatus());
         assertEquals("INTERNAL_ERROR", problem.getProperties().get("code"));
+    }
+
+    @Test
+    void mapsMissingStaticResourcesToNotFound() throws Exception {
+        var problem = new ApiExceptionHandler().resourceNotFound(
+                new NoResourceFoundException(HttpMethod.GET, "missing"));
+
+        assertNotNull(problem);
+        assertEquals(404, problem.getStatus());
+        assertEquals("NOT_FOUND", problem.getProperties().get("code"));
     }
 }

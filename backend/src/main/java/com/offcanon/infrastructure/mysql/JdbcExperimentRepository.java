@@ -22,7 +22,7 @@ import java.util.UUID;
 @Repository
 @Profile("mysql")
 public class JdbcExperimentRepository implements ExperimentRepository {
-    private static final String INSERT = "INSERT INTO experiments (id,project_id,session_id,task,created_at,status,base_snapshot_id,result_snapshot_id,workspace_path,agent_summary,failure_reason,verification_passed,version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)";
+    private static final String INSERT = "INSERT INTO experiments (id,project_id,session_id,continued_from_experiment_id,task,created_at,status,base_snapshot_id,result_snapshot_id,workspace_path,agent_summary,failure_reason,verification_passed,version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
     private static final String UPDATE = "UPDATE experiments SET status=?, base_snapshot_id=?, result_snapshot_id=?, workspace_path=?, agent_summary=?, failure_reason=?, verification_passed=?, version=? WHERE id=? AND version=?";
     private final JdbcTemplate jdbc;
 
@@ -37,7 +37,8 @@ public class JdbcExperimentRepository implements ExperimentRepository {
         if (experiment.version() == 0) {
             try {
                 jdbc.update(INSERT, experiment.id().toString(), experiment.projectId().toString(), experiment.sessionId().toString(),
-                        experiment.task(), Timestamp.from(experiment.createdAt()), experiment.status().name(),
+                        nullable(experiment.continuedFromExperimentId()), experiment.task(),
+                        Timestamp.from(experiment.createdAt()), experiment.status().name(),
                         nullable(experiment.baseSnapshotId()), nullable(experiment.resultSnapshotId()), nullable(experiment.workspacePath()),
                         experiment.agentSummary(), experiment.failureReason(), verified, experiment.version());
             } catch (DuplicateKeyException error) {
@@ -69,8 +70,15 @@ public class JdbcExperimentRepository implements ExperimentRepository {
 
     @Override
     public boolean hasRunningExperiment(UUID sessionId) {
-        Integer count = jdbc.queryForObject("SELECT COUNT(*) FROM experiments WHERE session_id=? AND status IN ('RUNNING','AGENT_COMPLETED','VERIFYING')",
+        Integer count = jdbc.queryForObject("SELECT COUNT(*) FROM experiments WHERE session_id=? AND status IN ('CREATED','SNAPSHOTTING','READY_TO_RUN','RUNNING','AGENT_COMPLETED','VERIFYING','PREPARING_PROMOTION','PROMOTING','RECOVERY_REQUIRED')",
                 Integer.class, sessionId.toString());
+        return count != null && count > 0;
+    }
+
+    @Override
+    public boolean hasActiveExperimentForProject(UUID projectId) {
+        Integer count = jdbc.queryForObject("SELECT COUNT(*) FROM experiments WHERE project_id=? AND status IN ('CREATED','SNAPSHOTTING','READY_TO_RUN','RUNNING','AGENT_COMPLETED','VERIFYING','VERIFIED','PREPARING_PROMOTION','PROMOTING','RECOVERY_REQUIRED')",
+                Integer.class, projectId.toString());
         return count != null && count > 0;
     }
 
@@ -82,9 +90,11 @@ public class JdbcExperimentRepository implements ExperimentRepository {
                 : VerificationResult.failed(List.of(), failure == null ? "Verification failed" : failure);
         String base = rs.getString("base_snapshot_id");
         String resultSnapshot = rs.getString("result_snapshot_id");
+        String continuedFrom = rs.getString("continued_from_experiment_id");
         String workspace = rs.getString("workspace_path");
         return Experiment.restore(UUID.fromString(rs.getString("id")), UUID.fromString(rs.getString("project_id")),
-                UUID.fromString(rs.getString("session_id")), rs.getString("task"), rs.getTimestamp("created_at").toInstant(),
+                UUID.fromString(rs.getString("session_id")), continuedFrom == null ? null : UUID.fromString(continuedFrom),
+                rs.getString("task"), rs.getTimestamp("created_at").toInstant(),
                 ExperimentStatus.valueOf(rs.getString("status")), base == null ? null : UUID.fromString(base),
                 resultSnapshot == null ? null : UUID.fromString(resultSnapshot),
                 workspace == null ? null : Path.of(workspace), rs.getString("agent_summary"), result, failure, rs.getLong("version"));

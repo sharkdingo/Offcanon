@@ -71,16 +71,11 @@ class AgentSettingsIntegrationTest {
         AtomicReference<AgentRunSettings> captured = new AtomicReference<>();
         AgentLoopPort loop = new AgentLoopPort() {
             @Override
-            public AgentRunResult run(Experiment current, CancellationPort cancellation) {
-                throw new AssertionError("settings-aware overload was not selected");
-            }
-
-            @Override
             public AgentRunResult run(Experiment current,
                                       CancellationPort cancellation,
                                       java.util.Optional<com.offcanon.agent.domain.SessionContext> context,
-                                      AgentRunSettings runSettings) {
-                captured.set(runSettings);
+                                      java.util.Optional<AgentRunSettings> runSettings) {
+                captured.set(runSettings.orElseThrow());
                 return new AgentRunResult("done", 1, "MODEL_FINISH", List.of());
             }
         };
@@ -100,7 +95,7 @@ class AgentSettingsIntegrationTest {
         }).when(executor).execute(any(Runnable.class));
 
         AgentApplicationService service = new AgentApplicationService(experiments, projects, snapshots, snapshotPort,
-                loop, verification, executor, new InMemoryEventSink(), new InMemorySessionRunLease(), workspaces, settings);
+                loop, verification, executor, new InMemoryEventSink(), new InMemorySessionRunLease(), workspaces, settings, null, null);
 
         service.start(experiment.id());
 

@@ -2,6 +2,9 @@ package com.offcanon.application;
 
 import com.offcanon.infrastructure.git.GitSnapshotAdapter;
 import com.offcanon.infrastructure.memory.InMemoryProjectRepository;
+import com.offcanon.infrastructure.memory.InMemoryExperimentRepository;
+import com.offcanon.infrastructure.memory.InMemoryPromotionLock;
+import com.offcanon.experiment.domain.Experiment;
 import com.offcanon.infrastructure.process.ProcessRunner;
 import com.offcanon.project.domain.Project;
 import com.offcanon.shared.domain.DomainException;
@@ -18,6 +21,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -35,12 +39,14 @@ class ProjectApplicationServiceTest {
     private InMemoryProjectRepository projects;
     private ProjectApplicationService service;
     private ExecutorService executor;
+    private UUID fixtureOwner;
 
     @BeforeEach
     void setUp() throws Exception {
         repository = Files.createDirectories(temp.resolve("repository"));
         run(repository, "git", "init", "-q");
         projects = new InMemoryProjectRepository();
+        fixtureOwner = UUID.randomUUID();
         service = new ProjectApplicationService(projects,
                 new GitSnapshotAdapter(new ProcessRunner(), temp.resolve("offcanon-data").toString()));
     }
@@ -51,11 +57,72 @@ class ProjectApplicationServiceTest {
     }
 
     @Test
-    void rejectsAnExactlyRepeatedCanonicalPath() {
+    void reopensAnExactlyRepeatedCanonicalPathForTheSameOwner() {
         Project registered = register("first", repository);
 
+        Project reopened = service.register(registered.ownerId(), "renamed", repository.toString(), List.of("gradle test"));
+
+        assertEquals(registered.id(), reopened.id());
+        assertEquals("first", reopened.name());
+        assertEquals(List.of("mvn test"), reopened.verificationCommands());
+        assertEquals(1, projects.findAll().size());
+    }
+
+    @Test
+    void updatesMetadataWithoutChangingCanonicalIdentity() {
+        Project registered = register("first", repository);
+
+        Project updated = service.update(fixtureOwner, registered.id(), "renamed",
+                repository.toString(), List.of("gradle test", "npm test"));
+
+        assertEquals(registered.id(), updated.id());
+        assertEquals("renamed", updated.name());
+        assertEquals(List.of("gradle test", "npm test"), updated.verificationCommands());
+        assertEquals(registered.canonicalPath(), updated.canonicalPath());
+        assertEquals(1, updated.version());
+        assertEquals(updated, projects.findById(registered.id()).orElseThrow());
+    }
+
+    @Test
+    void rejectsChangingCanonicalIdentityDuringMetadataUpdate() {
+        Project registered = register("first", repository);
+        Path another = temp.resolve("another");
+        try {
+            Files.createDirectories(another);
+            run(another, "git", "init", "-q");
+        } catch (Exception error) {
+            throw new AssertionError(error);
+        }
+
+        DomainException error = assertThrows(DomainException.class, () -> service.update(
+                fixtureOwner, registered.id(), "renamed", another.toString(), List.of("mvn test")));
+
+        assertEquals("PROJECT_PATH_IMMUTABLE", error.code());
+        assertEquals("first", projects.findById(registered.id()).orElseThrow().name());
+    }
+
+    @Test
+    void locksAcceptancePolicyWhileAnExperimentIsActive() {
+        Project registered = register("first", repository);
+        InMemoryExperimentRepository experiments = new InMemoryExperimentRepository();
+        experiments.save(Experiment.create(registered.id(), UUID.randomUUID(), "active task", java.time.Instant.now()));
+        ProjectApplicationService guarded = new ProjectApplicationService(projects,
+                new GitSnapshotAdapter(new ProcessRunner(), temp.resolve("offcanon-data-guarded").toString()),
+                experiments, new InMemoryPromotionLock());
+
+        DomainException error = assertThrows(DomainException.class, () -> guarded.update(
+                fixtureOwner, registered.id(), "renamed", repository.toString(), List.of("gradle test")));
+
+        assertEquals("VERIFICATION_POLICY_LOCKED", error.code());
+        assertEquals(List.of("mvn test"), projects.findById(registered.id()).orElseThrow().verificationCommands());
+    }
+
+    @Test
+    void rejectsACanonicalPathRegisteredByAnotherOwner() {
+        Project registered = service.register(UUID.randomUUID(), "first", repository.toString(), List.of("mvn test"));
+
         DomainException error = assertThrows(DomainException.class,
-                () -> register("duplicate", repository));
+                () -> service.register(UUID.randomUUID(), "duplicate", repository.toString(), List.of("mvn test")));
 
         assertEquals("PROJECT_ALREADY_REGISTERED", error.code());
         assertTrue(error.getMessage().contains(registered.id().toString()));
@@ -83,41 +150,36 @@ class ProjectApplicationServiceTest {
         Project registered = register("case-alias", alias);
 
         assertEquals(repository.toRealPath(), registered.canonicalPath());
-        DomainException error = assertThrows(DomainException.class,
-                () -> register("root", repository));
-        assertEquals("PROJECT_ALREADY_REGISTERED", error.code());
+        Project reopened = register("root", repository);
+        assertEquals(registered.id(), reopened.id());
         assertEquals(1, projects.findAll().size());
     }
 
     @Test
-    void rejectsConcurrentRegistrationOfTheSameCanonicalRoot() throws Exception {
+    void concurrentRegistrationByTheSameOwnerReopensOneProject() throws Exception {
         int attempts = 8;
+        UUID ownerId = UUID.randomUUID();
         executor = Executors.newFixedThreadPool(attempts);
         CountDownLatch ready = new CountDownLatch(attempts);
         CountDownLatch start = new CountDownLatch(1);
-        List<Future<Boolean>> results = new ArrayList<>();
+        List<Future<Project>> results = new ArrayList<>();
         for (int index = 0; index < attempts; index++) {
             int attempt = index;
             results.add(executor.submit(() -> {
                 ready.countDown();
                 start.await();
-                try {
-                    register("project-" + attempt, repository);
-                    return true;
-                } catch (DomainException error) {
-                    assertEquals("PROJECT_ALREADY_REGISTERED", error.code());
-                    return false;
-                }
+                return service.register(ownerId, "project-" + attempt, repository.toString(), List.of("mvn test"));
             }));
         }
         assertTrue(ready.await(5, java.util.concurrent.TimeUnit.SECONDS));
         start.countDown();
 
-        int successes = 0;
-        for (Future<Boolean> result : results) {
-            if (result.get()) successes++;
+        UUID projectId = null;
+        for (Future<Project> result : results) {
+            Project project = result.get();
+            if (projectId == null) projectId = project.id();
+            assertEquals(projectId, project.id());
         }
-        assertEquals(1, successes);
         assertEquals(1, projects.findAll().size());
     }
 
@@ -134,13 +196,12 @@ class ProjectApplicationServiceTest {
         Project registered = register("alias", alias);
 
         assertEquals(repository.toRealPath(), registered.canonicalPath());
-        DomainException error = assertThrows(DomainException.class,
-                () -> register("root", repository));
-        assertEquals("PROJECT_ALREADY_REGISTERED", error.code());
+        Project reopened = register("root", repository);
+        assertEquals(registered.id(), reopened.id());
     }
 
     private Project register(String name, Path path) {
-        return service.register(name, path.toString(), List.of("mvn test"));
+        return service.register(fixtureOwner, name, path.toString(), List.of("mvn test"));
     }
 
     private void run(Path cwd, String... command) {

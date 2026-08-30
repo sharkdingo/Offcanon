@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ArrowRight, FileCheck2, FolderGit2, ShieldCheck } from 'lucide-vue-next'
+import { ArrowRight, Bot, FileCheck2, FolderGit2 } from 'lucide-vue-next'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import { computed } from 'vue'
@@ -13,9 +13,6 @@ async function enterWorkspace() {
   await router.replace({ name: 'home' })
 }
 
-async function skip() {
-  await enterWorkspace()
-}
 </script>
 
 <template>
@@ -28,29 +25,28 @@ async function skip() {
           <h1 id="onboarding-title">{{ isZh ? '欢迎，' : 'Welcome, ' }}{{ auth.session?.displayName }}</h1>
         </div>
       </header>
-      <p class="onboarding-lede">{{ isZh ? '三个检查点，让每次改动都可复核。' : 'Three checkpoints keep every change reviewable.' }}</p>
+      <p class="onboarding-lede">{{ isZh ? '从本机项目开始，Agent 的改动只在你确认后进入主线。' : 'Start with a local project. Agent changes reach canonical only after you accept them.' }}</p>
 
       <ol class="onboarding-steps">
         <li>
           <span class="onboarding-icon canonical"><FolderGit2 :size="18" /></span>
-          <div><strong>{{ isZh ? '登记主线' : 'Register canonical' }}</strong><span>{{ isZh ? '指定你想保护的代码仓库。' : 'Point Offcanon at the repository you want to protect.' }}</span></div>
+          <div><strong>{{ isZh ? '打开本机项目' : 'Open a local project' }}</strong><span>{{ isZh ? '选择这台机器上的 Git 仓库。' : 'Choose a Git repository on this machine.' }}</span></div>
           <small>01</small>
         </li>
         <li>
-          <span class="onboarding-icon experiment"><ShieldCheck :size="18" /></span>
-          <div><strong>{{ isZh ? '运行隔离改动' : 'Run an isolated change' }}</strong><span>{{ isZh ? '代理在源代码树之外工作。' : 'The agent works away from the source tree.' }}</span></div>
+          <span class="onboarding-icon experiment"><Bot :size="18" /></span>
+          <div><strong>{{ isZh ? '描述编程任务' : 'Describe a coding task' }}</strong><span>{{ isZh ? 'Agent 在独立实验中探索、修改并运行代码。' : 'The agent explores, edits, and runs code in a separate experiment.' }}</span></div>
           <small>02</small>
         </li>
         <li>
           <span class="onboarding-icon verified"><FileCheck2 :size="18" /></span>
-          <div><strong>{{ isZh ? '审阅证据' : 'Review the proof' }}</strong><span>{{ isZh ? '提升前，差异、检查和活动记录始终在一起。' : 'Diff, checks, and activity stay together before promotion.' }}</span></div>
+          <div><strong>{{ isZh ? '审阅并应用' : 'Review and apply' }}</strong><span>{{ isZh ? '查看代码改动和验证结果，再决定是否更新项目。' : 'Review the changes and checks, then decide whether to update your project.' }}</span></div>
           <small>03</small>
         </li>
       </ol>
 
       <footer class="onboarding-actions">
-        <button class="button secondary" @click="skip">{{ isZh ? '暂时跳过' : 'Skip for now' }}</button>
-        <button class="button primary" @click="enterWorkspace">{{ isZh ? '打开工作区' : 'Open workspace' }} <ArrowRight :size="15" /></button>
+        <button class="button primary" @click="enterWorkspace">{{ isZh ? '打开项目列表' : 'Open project list' }} <ArrowRight :size="15" /></button>
       </footer>
     </section>
   </main>

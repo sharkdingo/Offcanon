@@ -41,7 +41,7 @@ class AgentCancellationRaceTest {
         Experiment experiment = readyExperiment(experiments);
         CountDownLatch loopEntered = new CountDownLatch(1);
         CountDownLatch allowLoopReturn = new CountDownLatch(1);
-        AgentLoopPort loop = (current, cancellation) -> {
+        AgentLoopPort loop = (current, cancellation, context, settings) -> {
             loopEntered.countDown();
             awaitIgnoringInterrupts(allowLoopReturn);
             return new AgentRunResult("finished concurrently", 1, "MODEL_FINISH", List.of());
@@ -52,7 +52,7 @@ class AgentCancellationRaceTest {
         AgentApplicationService service = new AgentApplicationService(experiments,
                 new InMemoryProjectRepository(), new InMemorySnapshotRepository(), null,
                 loop, null, workerExecutor, new InMemoryEventSink(),
-                new InMemorySessionRunLease(), null);
+                new InMemorySessionRunLease(), null, null, null, null);
 
         try {
             service.start(experiment.id());
@@ -81,7 +81,7 @@ class AgentCancellationRaceTest {
         StartWindowRepository experiments = new StartWindowRepository();
         Experiment experiment = readyExperiment(experiments);
         AtomicInteger loopInvocations = new AtomicInteger();
-        AgentLoopPort loop = (current, cancellation) -> {
+        AgentLoopPort loop = (current, cancellation, context, settings) -> {
             loopInvocations.incrementAndGet();
             return new AgentRunResult("must not run", 1, "MODEL_FINISH", List.of());
         };
@@ -90,7 +90,7 @@ class AgentCancellationRaceTest {
         AgentApplicationService service = new AgentApplicationService(experiments,
                 new InMemoryProjectRepository(), new InMemorySnapshotRepository(), null,
                 loop, null, workerExecutor, new InMemoryEventSink(),
-                new InMemorySessionRunLease(), null);
+                new InMemorySessionRunLease(), null, null, null, null);
 
         try {
             Future<Experiment> start = requestExecutor.submit(() -> service.start(experiment.id()));
@@ -116,13 +116,13 @@ class AgentCancellationRaceTest {
     void workerReloadsPersistedStateBeforeSettlingAnOptimisticLockFailure() throws Exception {
         ConflictOnceRepository experiments = new ConflictOnceRepository();
         Experiment experiment = readyExperiment(experiments);
-        AgentLoopPort loop = (current, cancellation) ->
+        AgentLoopPort loop = (current, cancellation, context, settings) ->
                 new AgentRunResult("done", 1, "MODEL_FINISH", List.of());
         ExecutorService workerExecutor = Executors.newSingleThreadExecutor();
         AgentApplicationService service = new AgentApplicationService(experiments,
                 new InMemoryProjectRepository(), new InMemorySnapshotRepository(), null,
                 loop, null, workerExecutor, new InMemoryEventSink(),
-                new InMemorySessionRunLease(), null);
+                new InMemorySessionRunLease(), null, null, null, null);
 
         try {
             service.start(experiment.id());
@@ -142,18 +142,27 @@ class AgentCancellationRaceTest {
         Experiment first = readyExperiment(experiments, projectId, sessionId);
         Experiment second = readyExperiment(experiments, projectId, sessionId);
         CountDownLatch keepFirstRunning = new CountDownLatch(1);
-        AgentLoopPort loop = (current, cancellation) -> {
+        AgentLoopPort loop = (current, cancellation, context, settings) -> {
             awaitIgnoringInterrupts(keepFirstRunning);
             return new AgentRunResult("done", 1, "MODEL_FINISH", List.of());
         };
         ExecutorService workerExecutor = Executors.newFixedThreadPool(2);
         com.offcanon.port.SessionRunLeasePort permissiveLease = new com.offcanon.port.SessionRunLeasePort() {
-            @Override public boolean tryAcquire(UUID ignoredSession, UUID ignoredExperiment) { return true; }
-            @Override public void release(UUID ignoredSession, UUID ignoredExperiment) { }
+            @Override
+            public Optional<Lease> tryAcquire(UUID session, UUID experiment) {
+                return Optional.of(new Lease() {
+                    @Override public UUID sessionId() { return session; }
+                    @Override public UUID experimentId() { return experiment; }
+                    @Override public void assertHeld() { }
+                    @Override public void release() { }
+                });
+            }
+
+            @Override public void revoke(UUID ignoredSession, UUID ignoredExperiment) { }
         };
         AgentApplicationService service = new AgentApplicationService(experiments,
                 new InMemoryProjectRepository(), new InMemorySnapshotRepository(), null,
-                loop, null, workerExecutor, new InMemoryEventSink(), permissiveLease, null);
+                loop, null, workerExecutor, new InMemoryEventSink(), permissiveLease, null, null, null, null);
 
         try {
             service.start(first.id());
@@ -163,6 +172,45 @@ class AgentCancellationRaceTest {
             assertEquals(ExperimentStatus.READY_TO_RUN, experiments.findById(second.id()).orElseThrow().status());
         } finally {
             keepFirstRunning.countDown();
+            workerExecutor.shutdownNow();
+        }
+    }
+
+    @Test
+    void cancellationFromAnotherServiceRevokesWorkerWithoutLettingStaleCleanupReleaseSuccessorLease() throws Exception {
+        InMemoryExperimentRepository experiments = new InMemoryExperimentRepository();
+        Experiment experiment = readyExperiment(experiments);
+        InMemorySessionRunLease leases = new InMemorySessionRunLease();
+        CountDownLatch loopEntered = new CountDownLatch(1);
+        CountDownLatch allowLoopReturn = new CountDownLatch(1);
+        AgentLoopPort loop = (current, cancellation, context, settings) -> {
+            loopEntered.countDown();
+            awaitIgnoringInterrupts(allowLoopReturn);
+            return new AgentRunResult("finished after remote cancellation", 1, "MODEL_FINISH", List.of());
+        };
+        ExecutorService workerExecutor = Executors.newSingleThreadExecutor();
+        AgentApplicationService workerService = new AgentApplicationService(experiments,
+                new InMemoryProjectRepository(), new InMemorySnapshotRepository(), null,
+                loop, null, workerExecutor, new InMemoryEventSink(), leases, null, null, null, null);
+        AgentApplicationService cancellingService = new AgentApplicationService(experiments,
+                new InMemoryProjectRepository(), new InMemorySnapshotRepository(), null,
+                loop, null, workerExecutor, new InMemoryEventSink(), leases, null, null, null, null);
+
+        try {
+            workerService.start(experiment.id());
+            assertTrue(loopEntered.await(5, TimeUnit.SECONDS));
+
+            assertEquals(ExperimentStatus.CANCELLED, cancellingService.cancel(experiment.id()).status());
+            var successorLease = leases.tryAcquire(experiment.sessionId(), UUID.randomUUID()).orElseThrow();
+            allowLoopReturn.countDown();
+            workerExecutor.submit(() -> { }).get(5, TimeUnit.SECONDS);
+
+            successorLease.assertHeld();
+            successorLease.release();
+            assertEquals(ExperimentStatus.CANCELLED,
+                    experiments.findById(experiment.id()).orElseThrow().status());
+        } finally {
+            allowLoopReturn.countDown();
             workerExecutor.shutdownNow();
         }
     }

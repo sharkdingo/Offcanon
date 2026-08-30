@@ -54,24 +54,12 @@ public class ExperimentEventController {
         this.identity = identity;
     }
 
-    public ExperimentEventController(ExperimentApplicationService experimentService,
-                                     EventSink events,
-                                     ScheduledExecutorService eventStreamExecutor,
-                                     long pollIntervalMillis,
-                                     long heartbeatIntervalMillis) {
-        this(experimentService, events, eventStreamExecutor, pollIntervalMillis, heartbeatIntervalMillis, null);
-    }
-
     @GetMapping(value = "/{experimentId}/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter stream(@PathVariable UUID experimentId,
                              @RequestParam(defaultValue = "0") long after,
                              @RequestHeader(value = "Last-Event-ID", required = false) String lastEventId,
                              HttpServletRequest request) {
-        if (identity == null) {
-            experimentService.get(experimentId);
-        } else {
-            experimentService.get(experimentId, identity.ownerId(request));
-        }
+        experimentService.get(experimentId, identity.ownerId(request));
         SseEmitter emitter = new SseEmitter(0L);
         long reconnectCursor = parseCursor(lastEventId);
         AtomicLong cursor = new AtomicLong(Math.max(0, Math.max(after, reconnectCursor)));
@@ -113,11 +101,6 @@ public class ExperimentEventController {
         emitter.onTimeout(stopPolling);
         emitter.onError(error -> stopPolling.run());
         return emitter;
-    }
-
-    /** Compatibility entry point for direct callers that predate HTTP identity. */
-    public SseEmitter stream(UUID experimentId, long after, String lastEventId) {
-        return stream(experimentId, after, lastEventId, null);
     }
 
     private long parseCursor(String value) {

@@ -31,7 +31,7 @@ class TrustedVerificationAdapterTest {
     void sourceMutationInvalidatesOtherwisePassingCommandEvidence() {
         UUID projectId = UUID.randomUUID();
         Project project = new Project(projectId, "demo", temp.resolve("canonical"),
-                List.of("mutating-check"), Instant.now(), 0);
+                List.of("mutating-check"), Instant.now(), 0, UUID.randomUUID());
         Snapshot base = new Snapshot(UUID.randomUUID(), projectId, "base", temp.resolve("base"),
                 Instant.now(), List.of(), List.of());
         Snapshot result = new Snapshot(UUID.randomUUID(), projectId, "candidate", temp.resolve("result"),
@@ -41,8 +41,9 @@ class TrustedVerificationAdapterTest {
         Experiment experiment = Experiment.create(projectId, UUID.randomUUID(), "task", Instant.now());
         experiment.beginSnapshot();
         experiment.attachBase(base.id(), temp.resolve("workspace"));
-        CommandExecutor command = (value, cwd, timeout, environment) ->
-                new CommandExecutor.CommandExecution(0, "passed", "", Duration.ofMillis(5), false);
+        CommandExecutor command = (value, cwd, timeout, environment, profile) ->
+                new CommandExecutor.CommandExecution(0, "passed", "", Duration.ofMillis(5), false,
+                        false, profile);
         SnapshotPort fingerprint = new SnapshotPort() {
             @Override public Snapshot capture(Project value) { throw new UnsupportedOperationException(); }
             @Override public Snapshot captureWorkspace(Project value, Path workspace, String parent) { throw new UnsupportedOperationException(); }
@@ -60,5 +61,38 @@ class TrustedVerificationAdapterTest {
         assertEquals(1, persisted.size());
         assertFalse(persisted.get(0).trusted());
         assertEquals("VERIFICATION", persisted.get(0).kind());
+    }
+
+    @Test
+    void failedVerificationEvidenceIsNeverTrusted() {
+        UUID projectId = UUID.randomUUID();
+        Project project = new Project(projectId, "demo", temp.resolve("canonical"),
+                List.of("failing-check"), Instant.now(), 0, UUID.randomUUID());
+        Snapshot base = new Snapshot(UUID.randomUUID(), projectId, "base", temp.resolve("base"),
+                Instant.now(), List.of(), List.of());
+        Snapshot result = new Snapshot(UUID.randomUUID(), projectId, "candidate", temp.resolve("result"),
+                Instant.now(), List.of(), List.of());
+        InMemorySnapshotRepository snapshots = new InMemorySnapshotRepository();
+        snapshots.save(base);
+        Experiment experiment = Experiment.create(projectId, UUID.randomUUID(), "task", Instant.now());
+        experiment.beginSnapshot();
+        experiment.attachBase(base.id(), temp.resolve("workspace"));
+        CommandExecutor command = (value, cwd, timeout, environment, profile) ->
+                new CommandExecutor.CommandExecution(1, "", "failed", Duration.ofMillis(5), false,
+                        false, profile);
+        SnapshotPort fingerprint = new SnapshotPort() {
+            @Override public Snapshot capture(Project value) { throw new UnsupportedOperationException(); }
+            @Override public Snapshot captureWorkspace(Project value, Path workspace, String parent) { throw new UnsupportedOperationException(); }
+            @Override public String currentFingerprint(Project value) { throw new UnsupportedOperationException(); }
+            @Override public String fingerprintWorkspace(Project value, Path workspace, String parent) { return result.fingerprint(); }
+        };
+        InMemoryEvidenceRepository evidence = new InMemoryEvidenceRepository();
+        TrustedVerificationAdapter verifier = new TrustedVerificationAdapter(command, evidence, fingerprint, snapshots, 5);
+
+        var verification = verifier.verify(project, experiment, result, temp.resolve("verification"), VerificationPurpose.EXPERIMENT_RESULT);
+
+        assertFalse(verification.passed());
+        assertEquals(1, evidence.findByExperimentId(experiment.id()).size());
+        assertFalse(evidence.findByExperimentId(experiment.id()).getFirst().trusted());
     }
 }

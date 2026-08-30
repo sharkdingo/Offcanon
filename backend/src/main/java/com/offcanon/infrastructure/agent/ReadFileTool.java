@@ -7,6 +7,7 @@ import com.offcanon.port.Tool;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.CharacterCodingException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -35,10 +36,17 @@ public class ReadFileTool implements Tool {
         String requested = ToolArguments.requiredString(arguments, "path");
         Path path = paths.resolve(experiment, requested, false);
         try {
-            if (Files.size(path) > MAX_BYTES) {
+            // Read one byte past the limit instead of relying on a separate
+            // size check. The file may be replaced or grow between metadata
+            // inspection and opening it; the bounded read keeps the tool's
+            // memory use deterministic in that race.
+            byte[] bytes;
+            try (InputStream input = Files.newInputStream(path)) {
+                bytes = input.readNBytes(Math.toIntExact(MAX_BYTES) + 1);
+            }
+            if (bytes.length > MAX_BYTES) {
                 return ToolResult.failure(callId, definition().name(), "File is too large to read safely (limit " + MAX_BYTES + " bytes)");
             }
-            byte[] bytes = Files.readAllBytes(path);
             String content = Utf8Text.decode(bytes);
             if (content.length() > MAX_CHARS) {
                 content = content.substring(0, MAX_CHARS) + "\n...[truncated]";

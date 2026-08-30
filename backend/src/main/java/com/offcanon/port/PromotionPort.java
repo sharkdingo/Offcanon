@@ -9,19 +9,13 @@ import java.util.List;
 import java.util.Map;
 
 public interface PromotionPort {
-    default PromotionPlan plan(Project project, Snapshot base, Experiment experiment, Path candidate) {
-        return new PromotionPlan(List.of(), Map.of(), Map.of());
-    }
+    PromotionPlan plan(Project project, Snapshot base, Experiment experiment, Path candidate);
 
-    PromotionResult apply(Project project, Snapshot base, Experiment experiment, Path candidate);
-
-    default PromotionResult apply(Project project,
-                                  Snapshot base,
-                                  Experiment experiment,
-                                  Path candidate,
-                                  PromotionPlan expectedPlan) {
-        return apply(project, base, experiment, candidate);
-    }
+    PromotionResult apply(Project project,
+                          Snapshot base,
+                          Experiment experiment,
+                          Path candidate,
+                          PromotionPlan expectedPlan);
 
     record PromotionPlan(List<String> touchedFiles,
                          Map<String, String> preimageHashes,
@@ -33,7 +27,7 @@ public interface PromotionPort {
         }
     }
 
-    record PromotionResult(boolean applied, List<String> changedFiles, String resultingFingerprint) {
+    record PromotionResult(boolean applied, List<String> changedFiles) {
         public PromotionResult {
             changedFiles = List.copyOf(changedFiles);
         }

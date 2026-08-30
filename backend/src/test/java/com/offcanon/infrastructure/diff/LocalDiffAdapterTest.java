@@ -1,14 +1,18 @@
 package com.offcanon.infrastructure.diff;
 
 import com.offcanon.workspace.domain.Snapshot;
+import com.offcanon.port.DiffPort;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -39,6 +43,38 @@ class LocalDiffAdapterTest {
         assertTrue(diff.get(0).patch().contains("-two"));
         assertTrue(diff.get(0).patch().contains("+changed"));
         assertTrue(diff.get(0).patch().contains("+three"));
+    }
+
+    @Test
+    void reportsTrackedModeOnlyChanges() throws Exception {
+        Path basePath = temp.resolve("mode-base");
+        Path resultPath = temp.resolve("mode-result");
+        Files.createDirectories(basePath);
+        Files.createDirectories(resultPath);
+        Path baseFile = basePath.resolve("run.sh");
+        Path resultFile = resultPath.resolve("run.sh");
+        Files.writeString(baseFile, "echo run\n");
+        Files.writeString(resultFile, "echo run\n");
+        try {
+            Files.setPosixFilePermissions(baseFile, Set.of(
+                    PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE));
+            Files.setPosixFilePermissions(resultFile, Set.of(
+                    PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE,
+                    PosixFilePermission.OWNER_EXECUTE));
+        } catch (UnsupportedOperationException error) {
+            Assumptions.assumeTrue(false, "POSIX permissions are unavailable on this workstation");
+        }
+        Snapshot base = new Snapshot(UUID.randomUUID(), UUID.randomUUID(), "fingerprint", basePath,
+                Instant.now(), List.of("run.sh"), List.of());
+
+        var diff = new LocalDiffAdapter().compare(base, resultPath);
+
+        assertEquals(1, diff.size());
+        assertEquals(DiffPort.DiffEntry.Change.MODIFIED, diff.getFirst().change());
+        assertEquals(0, diff.getFirst().additions());
+        assertEquals(0, diff.getFirst().deletions());
+        assertTrue(diff.getFirst().patch().contains("old mode 100644"));
+        assertTrue(diff.getFirst().patch().contains("new mode 100755"));
     }
 
     @Test

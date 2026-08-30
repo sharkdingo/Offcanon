@@ -29,11 +29,34 @@ public class InMemoryProjectRepository implements ProjectRepository {
         }
         Project previous = projects.get(project.id());
         if (previous != null) {
-            String previousKey = CanonicalPathIdentity.value(previous.canonicalPath());
-            if (!previousKey.equals(key)) canonicalOwners.remove(previousKey, project.id());
+            if (!previous.equals(project)) {
+                throw new DomainException("PROJECT_IDENTITY_CONFLICT",
+                        "Project identity is already bound to different content: " + project.id());
+            }
+            return previous;
         }
         projects.put(project.id(), project);
         canonicalOwners.put(key, project.id());
+        return project;
+    }
+
+    @Override
+    public synchronized Project update(Project project) {
+        Project previous = projects.get(project.id());
+        if (previous == null) {
+            throw new DomainException("PROJECT_NOT_FOUND", "Project not found: " + project.id());
+        }
+        if (!previous.ownerId().equals(project.ownerId())
+                || !CanonicalPathIdentity.value(previous.canonicalPath())
+                .equals(CanonicalPathIdentity.value(project.canonicalPath()))) {
+            throw new DomainException("PROJECT_IDENTITY_CONFLICT",
+                    "Project identity cannot be changed: " + project.id());
+        }
+        if (project.version() != previous.version() + 1) {
+            throw new DomainException("PROJECT_VERSION_CONFLICT",
+                    "Project was changed by another request: " + project.id());
+        }
+        projects.put(project.id(), project);
         return project;
     }
 

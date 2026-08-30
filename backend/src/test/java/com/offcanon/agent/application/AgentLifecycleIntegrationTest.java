@@ -90,10 +90,12 @@ class AgentLifecycleIntegrationTest {
         InMemorySnapshotRepository snapshotRepository = new InMemorySnapshotRepository();
         InMemoryEvidenceRepository evidence = new InMemoryEvidenceRepository();
         InMemoryEventSink events = new InMemoryEventSink();
-        Project project = projects.save(Project.create("demo", canonical, List.of("mvn -q test"), Instant.now()));
+        InMemoryPromotionLock promotionLock = new InMemoryPromotionLock();
+        Project project = projects.save(Project.create(java.util.UUID.randomUUID(), "demo", canonical, List.of("mvn -q test"), Instant.now()));
         ExperimentApplicationService experimentService = new ExperimentApplicationService(projects, sessions,
-                experiments, snapshotRepository, snapshots, workspaces, new SystemClock());
-        Experiment experiment = experimentService.create(project.id(), null, "demo session", "update service");
+                experiments, snapshotRepository, snapshots, workspaces, new SystemClock(),
+                new InMemorySessionRunLease(), promotionLock);
+        Experiment experiment = experimentService.create(project.ownerId(), project.id(), null, "demo session", "update service");
 
         WorkspacePathResolver paths = new WorkspacePathResolver();
         ToolRegistryImpl registry = new ToolRegistryImpl(List.of(
@@ -104,10 +106,10 @@ class AgentLifecycleIntegrationTest {
                 new LocalCommandExecutor(runner), evidence, snapshots, snapshotRepository, 30);
         ExecutorService executor = Executors.newSingleThreadExecutor();
         AgentApplicationService agent = new AgentApplicationService(experiments, projects, snapshotRepository,
-                snapshots, agentLoop, verification, executor, events, new InMemorySessionRunLease(), workspaces);
+                snapshots, agentLoop, verification, executor, events, new InMemorySessionRunLease(), workspaces, null, evidence, null);
         PromotionApplicationService promotion = new PromotionApplicationService(experiments, projects,
-                snapshotRepository, snapshots, workspaces, new LocalPromotionAdapter(),
-                new InMemoryPromotionLock(), events, verification, new InMemoryPromotionJournal());
+                snapshotRepository, snapshots, workspaces, new LocalPromotionAdapter(promotionLock),
+                promotionLock, events, verification, new InMemoryPromotionJournal());
         try {
             agent.start(experiment.id());
             waitFor(experiments, experiment.id(), ExperimentStatus.VERIFIED);
@@ -135,6 +137,60 @@ class AgentLifecycleIntegrationTest {
             assertTrue(outcome.promoted(), outcome.toString());
             assertEquals("agent result\n", normalized(canonical.resolve("service.txt")));
             assertTrue(Files.notExists(canonical.resolve("target")), "build output leaked into canonical");
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void settlesNonFatalWorkerErrorsInsteadOfLeavingRunRunning() throws Exception {
+        Path canonical = temp.resolve("error-canonical");
+        Files.createDirectories(canonical);
+        run(canonical, "git", "init", "-q");
+        run(canonical, "git", "config", "user.email", "offcanon-test@example.invalid");
+        run(canonical, "git", "config", "user.name", "Offcanon Test");
+        Files.writeString(canonical.resolve("README.md"), "base\n");
+        run(canonical, "git", "add", "README.md");
+        run(canonical, "git", "commit", "-qm", "initial");
+
+        ProcessRunner runner = new ProcessRunner();
+        Path data = temp.resolve("error-data");
+        GitSnapshotAdapter snapshots = new GitSnapshotAdapter(runner, data.toString());
+        LocalWorkspaceAdapter workspaces = new LocalWorkspaceAdapter(data.toString());
+        InMemoryProjectRepository projects = new InMemoryProjectRepository();
+        InMemorySessionRepository sessions = new InMemorySessionRepository();
+        InMemoryExperimentRepository experiments = new InMemoryExperimentRepository();
+        InMemorySnapshotRepository snapshotRepository = new InMemorySnapshotRepository();
+        InMemoryEventSink events = new InMemoryEventSink();
+        Project project = projects.save(Project.create(UUID.randomUUID(), "error", canonical, List.of(), Instant.now()));
+        ExperimentApplicationService experimentService = new ExperimentApplicationService(projects, sessions,
+                experiments, snapshotRepository, snapshots, workspaces, new SystemClock(),
+                new InMemorySessionRunLease(), new com.offcanon.infrastructure.memory.InMemoryPromotionLock());
+        Experiment experiment = experimentService.create(project.ownerId(), project.id(), null, "error session", "trigger error");
+        AgentLoopPort crashingLoop = new AgentLoopPort() {
+            @Override
+            public com.offcanon.agent.domain.AgentRunResult run(Experiment ignored,
+                                                                  com.offcanon.port.CancellationPort cancellation,
+                                                                  java.util.Optional<com.offcanon.agent.domain.SessionContext> context,
+                                                                  java.util.Optional<com.offcanon.agent.domain.AgentRunSettings> settings) {
+                throw new AssertionError("non-fatal worker failure");
+            }
+        };
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        AgentApplicationService agent = new AgentApplicationService(experiments, projects, snapshotRepository,
+                snapshots, crashingLoop, null, executor, events, new InMemorySessionRunLease(), workspaces,
+                null, null, null);
+        try {
+            agent.start(experiment.id());
+            long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+            Experiment current;
+            do {
+                current = experiments.findById(experiment.id()).orElseThrow();
+                if (current.status() == ExperimentStatus.FAILED) break;
+                Thread.sleep(20);
+            } while (System.nanoTime() < deadline);
+            assertEquals(ExperimentStatus.FAILED, current.status());
+            assertTrue(current.failureReason().contains("non-fatal worker failure"));
         } finally {
             executor.shutdownNow();
         }

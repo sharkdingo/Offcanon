@@ -52,22 +52,20 @@ async function submit() {
         <label for="auth-username">{{ isZh ? '用户名' : 'Username' }}</label>
         <input id="auth-username" v-model="username" autofocus autocomplete="username" :placeholder="isZh ? '例如：alex' : 'e.g. alex'" minlength="3" maxlength="64" required />
         <label for="auth-password">{{ isZh ? '密码' : 'Password' }}</label>
-        <input id="auth-password" v-model="password" type="password" autocomplete="current-password" :placeholder="isZh ? '至少 8 位' : 'At least 8 characters'" minlength="8" maxlength="256" required />
+        <input id="auth-password" v-model="password" type="password" :autocomplete="register ? 'new-password' : 'current-password'" :placeholder="isZh ? '至少 8 位' : 'At least 8 characters'" minlength="8" maxlength="256" required />
         <p v-if="error" class="field-error" role="alert">{{ error }}</p>
         <button class="button primary auth-submit" :disabled="submitting">
           <LoaderCircle v-if="submitting" class="spin" :size="16" />
           <LockKeyhole v-else :size="16" />
-          {{ register ? (isZh ? '创建并进入' : 'Create and enter') : (isZh ? '进入工作区' : 'Enter workspace') }}
+          {{ register ? (isZh ? '创建账户' : 'Create account') : (isZh ? '登录' : 'Sign in') }}
           <ArrowRight v-if="!submitting" :size="15" />
         </button>
       </form>
-
-      <p class="auth-footnote"><span class="stream-dot live" />{{ isZh ? '账户数据按用户隔离' : 'Your projects stay scoped to your account' }}</p>
     </section>
     <aside class="auth-aside" :aria-label="isZh ? 'Offcanon 工作流' : 'Offcanon workflow'">
       <div class="auth-aside-line"><span>01</span><strong>{{ isZh ? '隔离' : 'Isolate' }}</strong><small>{{ isZh ? '在主线之外工作' : 'work outside canonical' }}</small></div>
       <div class="auth-aside-line"><span>02</span><strong>{{ isZh ? '验证' : 'Verify' }}</strong><small>{{ isZh ? '让证据跟随结果' : 'keep evidence with the result' }}</small></div>
-      <div class="auth-aside-line"><span>03</span><strong>{{ isZh ? '决策' : 'Decide' }}</strong><small>{{ isZh ? '证据成立后再提升' : 'promote only when the proof holds' }}</small></div>
+      <div class="auth-aside-line"><span>03</span><strong>{{ isZh ? '决策' : 'Decide' }}</strong><small>{{ isZh ? '证据成立后再应用' : 'apply only when the proof holds' }}</small></div>
     </aside>
   </main>
 </template>

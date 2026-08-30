@@ -9,6 +9,8 @@ import java.util.UUID;
 
 public interface ProjectRepository {
     Project save(Project project);
+    /** Persist metadata changes for an existing project using its version. */
+    Project update(Project project);
     Optional<Project> findById(UUID id);
     Optional<Project> findByCanonicalPath(Path canonicalPath);
     List<Project> findAll();

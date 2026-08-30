@@ -91,7 +91,7 @@ class PromotionRecoveryServiceTest {
 
     @Test
     void applyingWithBaseFingerprintCannotLeavePromotedExperimentAsIfItSucceeded() {
-        Project project = projects.save(Project.create("demo", temp.resolve("canonical-promoted"), List.of("mvn test"), NOW));
+        Project project = projects.save(Project.create(java.util.UUID.randomUUID(), "demo", temp.resolve("canonical-promoted"), List.of("mvn test"), NOW));
         UUID experimentId = UUID.randomUUID();
         Experiment experiment = Experiment.restore(experimentId, project.id(), UUID.randomUUID(), "task", NOW.minusSeconds(60),
                 ExperimentStatus.PROMOTED, UUID.randomUUID(), UUID.randomUUID(), temp.resolve("workspace-promoted"),
@@ -119,6 +119,33 @@ class PromotionRecoveryServiceTest {
         PromotionJournal journal = storedJournal(fixture);
         assertEquals(PromotionPhase.RECOVERY_REQUIRED, journal.phase());
         assertEquals("Canonical matches neither promotion base nor candidate", journal.failureReason());
+    }
+
+    @Test
+    void lockLossAfterFingerprintReadDoesNotClassifyOrMutateRecoveryState() {
+        Project project = projects.save(Project.create(UUID.randomUUID(), "lock-loss", temp.resolve("canonical-lock-loss"),
+                List.of("mvn test"), NOW));
+        UUID experimentId = UUID.randomUUID();
+        Experiment experiment = Experiment.restore(experimentId, project.id(), UUID.randomUUID(), "task",
+                NOW.minusSeconds(60), ExperimentStatus.PROMOTING, UUID.randomUUID(), UUID.randomUUID(),
+                temp.resolve("workspace-lock-loss"), "done", VerificationResult.passed(List.of()), null, 0);
+        experiments.save(experiment);
+        PromotionJournal journal = journals.create(PromotionJournal.create(experimentId, project.id(), BASE, CANDIDATE,
+                temp.resolve("candidate-lock-loss"), "worker-1", NOW.minusSeconds(30), NOW.minusSeconds(1)));
+        journal = journals.markApplying(journal, NOW.minusSeconds(10));
+        FixedSnapshotPort snapshots = new FixedSnapshotPort(CANDIDATE);
+        LosingPromotionLock lock = new LosingPromotionLock(4);
+        PromotionRecoveryService service = new PromotionRecoveryService(journals, experiments, projects, snapshots,
+                events, lock);
+
+        service.reconcile(NOW);
+
+        assertEquals(1, snapshots.calls());
+        assertEquals(ExperimentStatus.PROMOTING, experiments.findById(experimentId).orElseThrow().status());
+        PromotionJournal after = journals.findById(journal.promotionId()).orElseThrow();
+        assertEquals(PromotionPhase.APPLYING, after.phase());
+        assertTrue(!"worker-1".equals(after.ownerId()));
+        assertTrue(after.leaseUntil().isAfter(NOW));
     }
 
     @Test
@@ -304,12 +331,57 @@ class PromotionRecoveryServiceTest {
         assertEquals(beforeJournal, storedJournal(fixture));
     }
 
+    @Test
+    void projectStatusExposesUnresolvedJournalEvenWhenExperimentMarkerIsStillVerified() {
+        Fixture fixture = fixture(CANDIDATE, NOW.plusSeconds(30), ExperimentStatus.VERIFIED);
+
+        PromotionRecoveryService.ProjectRecoveryStatus status =
+                fixture.service().status(storedJournal(fixture).projectId());
+
+        assertTrue(status.recoveryRequired());
+        assertEquals(storedJournal(fixture).promotionId(), status.promotionId());
+        assertEquals(fixture.experimentId(), status.experimentId());
+        assertEquals(PromotionPhase.APPLYING.name(), status.journalPhase());
+        assertEquals(1, status.unresolvedCount());
+    }
+
+    @Test
+    void projectReconcileCanRecoverAnExpiredApplyingJournalBeforeExperimentMarkerCatchesUp() {
+        Fixture fixture = fixture(CANDIDATE, NOW.minusSeconds(1), ExperimentStatus.VERIFIED);
+
+        PromotionRecoveryService.ManualReconciliation outcome =
+                fixture.service().reconcileProject(storedJournal(fixture).projectId());
+
+        assertEquals("PROMOTED", outcome.experimentStatus());
+        assertEquals("COMMITTED", outcome.journalPhase());
+        assertEquals(ExperimentStatus.PROMOTED, storedExperiment(fixture).status());
+        assertEquals(PromotionPhase.COMMITTED, storedJournal(fixture).phase());
+    }
+
+    @Test
+    void projectReconcileRepairsRecoveryMarkerWhenJournalWasAlreadyCommitted() {
+        Fixture fixture = fixture(CANDIDATE, NOW.plusSeconds(30), ExperimentStatus.RECOVERY_REQUIRED);
+        PromotionJournal applying = storedJournal(fixture);
+        journals.markCommitted(applying, CANDIDATE, NOW.plusSeconds(1));
+
+        PromotionRecoveryService.ProjectRecoveryStatus status =
+                fixture.service().status(applying.projectId());
+        assertTrue(status.recoveryRequired());
+        assertEquals(PromotionPhase.COMMITTED.name(), status.journalPhase());
+
+        PromotionRecoveryService.ManualReconciliation outcome =
+                fixture.service().reconcileProject(applying.projectId());
+
+        assertEquals("PROMOTED", outcome.experimentStatus());
+        assertEquals(ExperimentStatus.PROMOTED, storedExperiment(fixture).status());
+    }
+
     private Fixture fixture(String currentFingerprint, Instant leaseUntil) {
         return fixture(currentFingerprint, leaseUntil, ExperimentStatus.PROMOTING);
     }
 
     private Fixture fixture(String currentFingerprint, Instant leaseUntil, ExperimentStatus status) {
-        Project project = projects.save(Project.create("demo", temp.resolve("canonical"), List.of("mvn test"), NOW));
+        Project project = projects.save(Project.create(java.util.UUID.randomUUID(), "demo", temp.resolve("canonical"), List.of("mvn test"), NOW));
         UUID experimentId = UUID.randomUUID();
         Experiment experiment = Experiment.restore(experimentId, project.id(), UUID.randomUUID(), "task", NOW.minusSeconds(60),
                 status, UUID.randomUUID(), UUID.randomUUID(), temp.resolve("workspace"),
@@ -329,7 +401,7 @@ class PromotionRecoveryServiceTest {
     }
 
     private Fixture fixturePrepared(String currentFingerprint, Instant leaseUntil) {
-        Project project = projects.save(Project.create("demo", temp.resolve("canonical-prepared"), List.of("mvn test"), NOW));
+        Project project = projects.save(Project.create(java.util.UUID.randomUUID(), "demo", temp.resolve("canonical-prepared"), List.of("mvn test"), NOW));
         UUID experimentId = UUID.randomUUID();
         Experiment experiment = Experiment.restore(experimentId, project.id(), UUID.randomUUID(), "task", NOW.minusSeconds(60),
                 ExperimentStatus.PREPARING_PROMOTION, UUID.randomUUID(), UUID.randomUUID(), temp.resolve("workspace"),
@@ -396,6 +468,27 @@ class PromotionRecoveryServiceTest {
 
         private void setCurrent(String fingerprint) {
             currentFingerprint.set(fingerprint);
+        }
+    }
+
+    private static final class LosingPromotionLock implements com.offcanon.port.PromotionLockPort {
+        private final int failAt;
+        private final AtomicInteger assertions = new AtomicInteger();
+
+        private LosingPromotionLock(int failAt) {
+            this.failAt = failAt;
+        }
+
+        @Override
+        public <T> T withProjectLock(UUID projectId, java.util.function.Supplier<T> action) {
+            return action.get();
+        }
+
+        @Override
+        public void assertHeld(UUID projectId) {
+            if (assertions.incrementAndGet() >= failAt) {
+                throw new DomainException("PROMOTION_LOCK_LOST", "injected recovery lock loss");
+            }
         }
     }
 }

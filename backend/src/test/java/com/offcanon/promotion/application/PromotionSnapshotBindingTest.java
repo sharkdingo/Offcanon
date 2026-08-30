@@ -72,8 +72,8 @@ class PromotionSnapshotBindingTest {
 
     @Test
     void adapterThatReportsNoApplyIsClassifiedFromCanonicalBase() throws Exception {
-        Fixture fixture = fixture(List.of("java -version"), (project, base, experiment, candidate) ->
-                new PromotionPort.PromotionResult(false, List.of(), base.fingerprint()));
+        Fixture fixture = fixture(List.of("java -version"), noApplyAdapter((project, base, candidate) ->
+                new PromotionPort.PromotionResult(false, List.of())));
         Experiment experiment = fixture.verifiedExperiment();
 
         PromotionApplicationService.PromotionOutcome outcome = fixture.promotions.promote(experiment.id());
@@ -86,15 +86,15 @@ class PromotionSnapshotBindingTest {
 
     @Test
     void canonicalFingerprintWinsWhenAdapterReportsNoApplyAfterWritingCandidate() throws Exception {
-        Fixture fixture = fixture(List.of("java -version"), (project, base, experiment, candidate) -> {
+        Fixture fixture = fixture(List.of("java -version"), noApplyAdapter((project, base, candidate) -> {
             try {
                 Files.copy(candidate.resolve("service.txt"), project.canonicalPath().resolve("service.txt"),
                         java.nio.file.StandardCopyOption.REPLACE_EXISTING);
             } catch (java.io.IOException error) {
                 throw new java.io.UncheckedIOException(error);
             }
-            return new PromotionPort.PromotionResult(false, List.of(), base.fingerprint());
-        });
+            return new PromotionPort.PromotionResult(false, List.of());
+        }));
         Experiment experiment = fixture.verifiedExperiment();
 
         PromotionApplicationService.PromotionOutcome outcome = fixture.promotions.promote(experiment.id());
@@ -106,14 +106,14 @@ class PromotionSnapshotBindingTest {
 
     @Test
     void ambiguousCanonicalAfterNoApplyRequiresRecovery() throws Exception {
-        Fixture fixture = fixture(List.of("java -version"), (project, base, experiment, candidate) -> {
+        Fixture fixture = fixture(List.of("java -version"), noApplyAdapter((project, base, candidate) -> {
             try {
                 Files.writeString(project.canonicalPath().resolve("service.txt"), "external\n");
             } catch (java.io.IOException error) {
                 throw new java.io.UncheckedIOException(error);
             }
-            return new PromotionPort.PromotionResult(false, List.of(), base.fingerprint());
-        });
+            return new PromotionPort.PromotionResult(false, List.of());
+        }));
         Experiment experiment = fixture.verifiedExperiment();
 
         PromotionApplicationService.PromotionOutcome outcome = fixture.promotions.promote(experiment.id());
@@ -148,7 +148,7 @@ class PromotionSnapshotBindingTest {
     @Test
     void simultaneousPromotionRequestsEnterTheFinalCriticalSectionOnlyOnceAtATime() throws Exception {
         BarrierPromotionLock lock = new BarrierPromotionLock();
-        Fixture fixture = fixture(List.of("java -version"), new LocalPromotionAdapter(), lock);
+        Fixture fixture = fixture(List.of("java -version"), new LocalPromotionAdapter(lock), lock);
         Experiment experiment = fixture.verifiedExperiment();
         try (var executor = Executors.newFixedThreadPool(2)) {
             var first = executor.submit(() -> fixture.promotions.promote(experiment.id()));
@@ -165,7 +165,8 @@ class PromotionSnapshotBindingTest {
 
     @Test
     void candidateMutationAfterLockRecheckIsRejectedBeforeCanonicalWrite() throws Exception {
-        Fixture fixture = fixture(List.of("java -version"), new MutatingCandidateAdapter());
+        InMemoryPromotionLock lock = new InMemoryPromotionLock();
+        Fixture fixture = fixture(List.of("java -version"), new MutatingCandidateAdapter(lock), lock);
         Experiment experiment = fixture.verifiedExperiment();
 
         PromotionApplicationService.PromotionOutcome outcome = fixture.promotions.promote(experiment.id());
@@ -177,7 +178,8 @@ class PromotionSnapshotBindingTest {
     }
 
     private Fixture fixture(List<String> verificationCommands) throws Exception {
-        return fixture(verificationCommands, new LocalPromotionAdapter(), new InMemoryPromotionLock());
+        InMemoryPromotionLock lock = new InMemoryPromotionLock();
+        return fixture(verificationCommands, new LocalPromotionAdapter(lock), lock);
     }
 
     private Fixture fixture(List<String> verificationCommands, PromotionPort promotionPort) throws Exception {
@@ -206,7 +208,7 @@ class PromotionSnapshotBindingTest {
         InMemoryEvidenceRepository evidence = new InMemoryEvidenceRepository();
         TrustedVerificationAdapter verification = new TrustedVerificationAdapter(
                 new LocalCommandExecutor(runner), evidence, snapshots, snapshotRepository, 10);
-        Project project = projects.save(Project.create("demo", canonical, verificationCommands, Instant.now()));
+        Project project = projects.save(Project.create(java.util.UUID.randomUUID(), "demo", canonical, verificationCommands, Instant.now()));
         PromotionApplicationService promotions = new PromotionApplicationService(experiments, projects,
                 snapshotRepository, snapshots, workspaces, promotionPort,
                 promotionLock, new InMemoryEventSink(), verification, new InMemoryPromotionJournal());
@@ -286,19 +288,23 @@ class PromotionSnapshotBindingTest {
                 }
             });
         }
+
+        @Override
+        public void assertHeld(UUID projectId) {
+            delegate.assertHeld(projectId);
+        }
     }
 
     private static final class MutatingCandidateAdapter implements PromotionPort {
-        private final LocalPromotionAdapter delegate = new LocalPromotionAdapter();
+        private final LocalPromotionAdapter delegate;
+
+        private MutatingCandidateAdapter(PromotionLockPort promotionLock) {
+            this.delegate = new LocalPromotionAdapter(promotionLock);
+        }
 
         @Override
         public PromotionPlan plan(Project project, Snapshot base, Experiment experiment, Path candidate) {
             return delegate.plan(project, base, experiment, candidate);
-        }
-
-        @Override
-        public PromotionResult apply(Project project, Snapshot base, Experiment experiment, Path candidate) {
-            return delegate.apply(project, base, experiment, candidate);
         }
 
         @Override
@@ -314,5 +320,29 @@ class PromotionSnapshotBindingTest {
             }
             return delegate.apply(project, base, experiment, candidate, expectedPlan);
         }
+    }
+
+    private PromotionPort noApplyAdapter(NoApplyBehavior behavior) {
+        LocalPromotionAdapter planner = new LocalPromotionAdapter(new InMemoryPromotionLock());
+        return new PromotionPort() {
+            @Override
+            public PromotionPlan plan(Project project, Snapshot base, Experiment experiment, Path candidate) {
+                return planner.plan(project, base, experiment, candidate);
+            }
+
+            @Override
+            public PromotionResult apply(Project project,
+                                         Snapshot base,
+                                         Experiment experiment,
+                                         Path candidate,
+                                         PromotionPlan expectedPlan) {
+                return behavior.apply(project, base, candidate);
+            }
+        };
+    }
+
+    @FunctionalInterface
+    private interface NoApplyBehavior {
+        PromotionPort.PromotionResult apply(Project project, Snapshot base, Path candidate);
     }
 }

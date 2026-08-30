@@ -13,12 +13,14 @@ import com.offcanon.port.SnapshotPort;
 import com.offcanon.port.SnapshotRepository;
 import com.offcanon.project.domain.Project;
 import com.offcanon.shared.domain.DomainException;
+import com.offcanon.shared.domain.SensitivePathPolicy;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -33,17 +35,21 @@ public class ShellTool implements Tool {
             "(?i)(?:[a-z]:[\\\\/]|(?:^|[\\s\"'=])[a-z]:)");
     private static final Pattern UNC_ABSOLUTE = Pattern.compile("^\\\\\\\\");
     private static final Pattern POSIX_ABSOLUTE = Pattern.compile("(^|[\\s\"'=])/");
-    private static final Pattern SHELL_METACHARACTER = Pattern.compile(
-            "[;&|<>`^%$]|(^|[\\s\"'])~(?=[\\\\/]|$)",
+    private static final Pattern SHELL_EXPANSION = Pattern.compile(
+            "[;<>`^%$]|(^|[\\s\"'])~(?=[\\\\/]|$)",
             Pattern.CASE_INSENSITIVE);
     private static final Pattern DANGEROUS_GIT = Pattern.compile(
-            "(?i)(^|[\\s\\\"'])git(?:\\.exe)?[\\s\\\"']+(reset|clean|restore|checkout|switch|branch|update-ref|config|worktree|gc|submodule|commit|push|fetch|merge|rebase)(?:[\\s\\\"']|$)");
-    private static final Pattern NESTED_INTERPRETER = Pattern.compile(
-            "(?i)(^|[\\s\\\"'])(?:powershell|pwsh|bash|zsh|sh|cmd(?:\\.exe)?|wsl|python(?:3)?|node|perl|ruby)(?:[\\s\\\"']|$)");
+            "(?i)(^|[\\s\\\"'&|])git(?:\\.exe)?[\\s\\\"']+(reset|clean|restore|checkout|switch|branch|update-ref|config|worktree|gc|submodule|commit|push|fetch|pull|clone|ls-remote|merge|rebase)(?:[\\s\\\"'&|]|$)");
+    private static final Pattern NESTED_SHELL = Pattern.compile(
+            "(?i)(^|[\\s\\\"'&|])(?:powershell|pwsh|bash|zsh|sh|cmd(?:\\.exe)?|wsl)(?:[\\s\\\"'&|]|$)");
+    private static final Pattern INLINE_RUNTIME_CODE = Pattern.compile(
+            "(?i)(^|[\\s\\\"'&|])(?:python(?:3)?(?:\\.exe)?[\\s\\\"']+-c|"
+                    + "node(?:\\.exe)?[\\s\\\"']+(?:-e|--eval|-p|--print)|"
+                    + "(?:perl|ruby)(?:\\.exe)?[\\s\\\"']+-e)(?:[=\\s\\\"'&|]|$)");
     private static final Pattern DESTRUCTIVE_COMMAND = Pattern.compile(
-            "(?i)(^|[\\s\\\"'])(?:rm|rmdir|del|erase|format|shutdown|stop-computer|remove-item)(?:[\\s\\\"']|$)");
+            "(?i)(^|[\\s\\\"'&|])(?:rm|rmdir|del|erase|format|shutdown|stop-computer|remove-item)(?:[\\s\\\"'&|]|$)");
     private static final Pattern NETWORK_COMMAND = Pattern.compile(
-            "(?i)(^|[\\s\\\"'])(?:curl|wget|certutil|bitsadmin|invoke-webrequest)(?:[\\s\\\"']|$)");
+            "(?i)(^|[\\s\\\"'&|])(?:curl|wget|certutil|bitsadmin|invoke-webrequest|ssh|scp|sftp|ftp|telnet|nc|ncat)(?:[\\s\\\"'&|]|$)");
     private final CommandExecutor commandExecutor;
     private final ProjectRepository projects;
     private final EvidenceRepository evidence;
@@ -85,9 +91,18 @@ public class ShellTool implements Tool {
 
     @Override
     public ToolDefinition definition() {
-        return new ToolDefinition("shell", "Run a non-interactive command in the experiment workspace.", Map.of(
+        String shell = isWindows() ? "Windows cmd.exe" : "POSIX sh";
+        return new ToolDefinition("shell", "Run a non-interactive command in the experiment workspace using " + shell + ". "
+                + "Normal && and || chaining is supported, as are bounded non-sensitive environment variables. "
+                + "Use read_file, write_file, delete_file, list_files and search_files for workspace edits and inspection. "
+                + "Pipes, background execution, nested shells, inline code, redirection, and canonical paths are blocked by application-level guardrails; this is not an OS sandbox.", Map.of(
                 "type", "object",
-                "properties", Map.of("command", Map.of("type", "string")),
+                "properties", Map.of(
+                        "command", Map.of("type", "string"),
+                        "environment", Map.of(
+                                "type", "object",
+                                "additionalProperties", Map.of("type", "string"),
+                                "maxProperties", ProcessRunner.MAX_REQUESTED_ENVIRONMENT_ENTRIES)),
                 "required", List.of("command")));
     }
 
@@ -95,13 +110,16 @@ public class ShellTool implements Tool {
     public ToolResult execute(Experiment experiment, String callId, Map<String, Object> arguments) {
         String command = ToolArguments.requiredString(arguments, "command");
         try {
+            Map<String, String> requestedEnvironment = requestedEnvironment(arguments);
             Project project = projects == null ? null : projects.findById(experiment.projectId())
                     .orElseThrow(() -> new DomainException("PROJECT_NOT_FOUND", "Project is no longer available"));
             Path canonical = project == null ? null : project.canonicalPath().toAbsolutePath().normalize();
             validateCommand(command, experiment.workspacePath(), canonical);
+            Map<String, String> executionEnvironment = new LinkedHashMap<>(requestedEnvironment);
+            executionEnvironment.put("OFFCANON_EXPERIMENT_ID", experiment.id().toString());
             Instant started = Instant.now();
             CommandExecutor.CommandExecution result = commandExecutor.execute(command, experiment.workspacePath(),
-                    timeout, Map.of("OFFCANON_EXPERIMENT_ID", experiment.id().toString()), "agent-shell");
+                    timeout, executionEnvironment, "agent-shell");
             Instant completed = Instant.now();
             boolean interrupted = Thread.interrupted();
             try {
@@ -157,15 +175,18 @@ public class ShellTool implements Tool {
         String commandView = dequoted.replace("\\", "");
         String pathView = dequoted.replace('\\', '/');
         if (DANGEROUS_GIT.matcher(commandView).find()
-                || NESTED_INTERPRETER.matcher(commandView).find()
+                || NESTED_SHELL.matcher(commandView).find()
+                || INLINE_RUNTIME_CODE.matcher(commandView).find()
                 || DESTRUCTIVE_COMMAND.matcher(commandView).find()
                 || NETWORK_COMMAND.matcher(commandView).find()
+                || SensitivePathPolicy.containsSensitivePathReference(pathView)
                 || commandView.contains("start-process")
                 || commandView.contains("invoke-expression")
                 || commandView.matches(".*(^|[\\s\\\"'])iex(?:[\\s\\\"']|$).*") ) {
             throw new DomainException("DANGEROUS_COMMAND_BLOCKED", "Command is blocked by the experiment policy");
         }
-        if (SHELL_METACHARACTER.matcher(command).find()) {
+        validateShellOperators(command);
+        if (SHELL_EXPANSION.matcher(command).find()) {
             throw new DomainException("DANGEROUS_COMMAND_BLOCKED", "Shell operators, command substitution and environment expansion are blocked by the experiment policy");
         }
         if (PARENT_SEGMENT.matcher(pathView).find()
@@ -183,6 +204,57 @@ public class ShellTool implements Tool {
         if (workspace == null) {
             throw new DomainException("WORKSPACE_NOT_READY", "Experiment workspace is not ready");
         }
+    }
+
+    private Map<String, String> requestedEnvironment(Map<String, Object> arguments) {
+        Object raw = arguments.get("environment");
+        if (raw == null) return Map.of();
+        if (!(raw instanceof Map<?, ?> values)) {
+            throw new DomainException("INVALID_TOOL_ARGUMENTS", "Tool argument 'environment' must be an object of string values");
+        }
+        if (values.size() > ProcessRunner.MAX_REQUESTED_ENVIRONMENT_ENTRIES) {
+            throw new DomainException("INVALID_TOOL_ARGUMENTS", "Tool argument 'environment' has too many entries (maximum "
+                    + ProcessRunner.MAX_REQUESTED_ENVIRONMENT_ENTRIES + ")");
+        }
+        Map<String, String> requested = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> entry : values.entrySet()) {
+            if (!(entry.getKey() instanceof String name) || !(entry.getValue() instanceof String value)) {
+                throw new DomainException("INVALID_TOOL_ARGUMENTS", "Tool argument 'environment' must contain only string names and values");
+            }
+            try {
+                ProcessRunner.validateRequestedEnvironmentEntry(name, value);
+            } catch (IllegalArgumentException error) {
+                throw new DomainException("INVALID_TOOL_ARGUMENTS", error.getMessage());
+            }
+            String normalized = name.toUpperCase(Locale.ROOT);
+            if (requested.keySet().stream().anyMatch(existing -> existing.toUpperCase(Locale.ROOT).equals(normalized))) {
+                throw new DomainException("INVALID_TOOL_ARGUMENTS", "Tool argument 'environment' contains duplicate variable names");
+            }
+            if (normalized.startsWith("GIT_") || normalized.startsWith("OFFCANON_")) {
+                throw new DomainException("INVALID_TOOL_ARGUMENTS", "Tool argument 'environment' cannot override Offcanon or Git control variables");
+            }
+            requested.put(name, value);
+        }
+        return Map.copyOf(requested);
+    }
+
+    private void validateShellOperators(String command) {
+        for (int index = 0; index < command.length(); index++) {
+            char current = command.charAt(index);
+            if (current == '\r' || current == '\n' || current == '(' || current == ')') {
+                throw new DomainException("DANGEROUS_COMMAND_BLOCKED", "Shell operators, command substitution and environment expansion are blocked by the experiment policy");
+            }
+            if (current != '&' && current != '|') continue;
+            if (index + 1 < command.length() && command.charAt(index + 1) == current) {
+                index++;
+                continue;
+            }
+            throw new DomainException("DANGEROUS_COMMAND_BLOCKED", "Shell operators, command substitution and environment expansion are blocked by the experiment policy");
+        }
+    }
+
+    private boolean isWindows() {
+        return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
     }
 
     private String truncate(String value) {

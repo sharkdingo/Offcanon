@@ -39,10 +39,11 @@ class SessionContextIntegrationTest {
         InMemoryExperimentRepository experiments = new InMemoryExperimentRepository();
         InMemoryProjectRepository projects = new InMemoryProjectRepository();
         UUID sessionId = UUID.randomUUID();
-        Project project = projects.save(Project.create("demo", temp, List.of("mvn test"), Instant.now()));
+        Project project = projects.save(Project.create(java.util.UUID.randomUUID(), "demo", temp, List.of("mvn test"), Instant.now()));
         Experiment previous = completedExperiment(experiments, project.id(), sessionId,
                 "keep compatibility", "changed one adapter and verified it", Instant.parse("2026-08-27T10:00:00Z"));
-        Experiment current = Experiment.create(project.id(), sessionId, "add cancellation", Instant.parse("2026-08-27T10:01:00Z"));
+        Experiment current = Experiment.continueFrom(project.id(), sessionId, previous.id(),
+                "add cancellation", Instant.parse("2026-08-27T10:01:00Z"));
         experiments.save(current);
         current.beginSnapshot();
         experiments.save(current);
@@ -53,14 +54,10 @@ class SessionContextIntegrationTest {
         CountDownLatch invoked = new CountDownLatch(1);
         AgentLoopPort loop = new AgentLoopPort() {
             @Override
-            public AgentRunResult run(Experiment experiment, CancellationPort cancellation) {
-                throw new AssertionError("provenance-aware overload was not used");
-            }
-
-            @Override
             public AgentRunResult run(Experiment experiment,
                                       CancellationPort cancellation,
-                                      Optional<SessionContext> sessionContext) {
+                                      Optional<SessionContext> sessionContext,
+                                      Optional<com.offcanon.agent.domain.AgentRunSettings> settings) {
                 captured.set(sessionContext);
                 invoked.countDown();
                 throw new DomainException("EXPECTED_STOP", "stop after capturing context");
@@ -69,7 +66,7 @@ class SessionContextIntegrationTest {
         ExecutorService executor = Executors.newSingleThreadExecutor();
         AgentApplicationService service = new AgentApplicationService(experiments, projects,
                 null, null, loop, null, executor, new InMemoryEventSink(),
-                new InMemorySessionRunLease(), null);
+                new InMemorySessionRunLease(), null, null, null, null);
         try {
             service.start(current.id());
             assertTrue(invoked.await(5, TimeUnit.SECONDS));
@@ -80,6 +77,65 @@ class SessionContextIntegrationTest {
             assertEquals(previous.baseSnapshotId(), context.priorSnapshotId());
             assertEquals("keep compatibility", context.priorTask());
             assertEquals("changed one adapter and verified it", context.priorSummary());
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void continuationCarriesFailedIntentEvenWhenNoAgentSummaryExists() throws Exception {
+        InMemoryExperimentRepository experiments = new InMemoryExperimentRepository();
+        InMemoryProjectRepository projects = new InMemoryProjectRepository();
+        UUID sessionId = UUID.randomUUID();
+        Project project = projects.save(Project.create(java.util.UUID.randomUUID(), "demo", temp, List.of(), Instant.now()));
+        Experiment previous = Experiment.create(project.id(), sessionId, "implement parser", Instant.parse("2026-08-27T10:00:00Z"));
+        experiments.save(previous);
+        previous.beginSnapshot();
+        experiments.save(previous);
+        previous.attachBase(UUID.randomUUID(), temp.resolve("failed-source"));
+        experiments.save(previous);
+        previous.start();
+        experiments.save(previous);
+        previous.fail("MODEL_TRANSIENT_FAILURE: HTTP 429");
+        experiments.save(previous);
+
+        Experiment current = Experiment.continueFrom(project.id(), sessionId, previous.id(),
+                "continue after provider recovery", Instant.parse("2026-08-27T10:01:00Z"));
+        experiments.save(current);
+        current.beginSnapshot();
+        experiments.save(current);
+        current.attachBase(UUID.randomUUID(), temp.resolve("current-failed"));
+        experiments.save(current);
+
+        AtomicReference<Optional<SessionContext>> captured = new AtomicReference<>(Optional.empty());
+        CountDownLatch invoked = new CountDownLatch(1);
+        AgentLoopPort loop = new AgentLoopPort() {
+            @Override
+            public AgentRunResult run(Experiment experiment, CancellationPort cancellation,
+                                      Optional<SessionContext> context,
+                                      Optional<com.offcanon.agent.domain.AgentRunSettings> settings) {
+                captured.set(context);
+                invoked.countDown();
+                throw new DomainException("EXPECTED_STOP", "stop after capturing context");
+            }
+        };
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        AgentApplicationService service = new AgentApplicationService(experiments, projects,
+                null, null, loop, null, executor, new InMemoryEventSink(),
+                new InMemorySessionRunLease(), null, null, null, null);
+        try {
+            service.start(current.id());
+            assertTrue(invoked.await(5, TimeUnit.SECONDS));
+            waitFor(experiments, current.id(), ExperimentStatus.FAILED);
+
+            SessionContext context = captured.get().orElseThrow();
+            assertEquals(1, context.turns().size());
+            SessionContext.HistoricalTurn turn = context.turns().getFirst();
+            assertEquals(previous.id(), turn.experimentId());
+            assertEquals("implement parser", turn.task());
+            assertEquals("FAILED", turn.status());
+            assertEquals("", turn.summary());
+            assertTrue(turn.failureReason().contains("429"));
         } finally {
             executor.shutdownNow();
         }

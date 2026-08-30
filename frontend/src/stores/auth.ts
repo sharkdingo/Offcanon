@@ -1,7 +1,7 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { api, type AuthUser, type UserSettings } from '../api'
-import { setAuthToken } from '../authToken'
+import { AUTH_UNAUTHORIZED_EVENT, getAuthToken, setAuthToken } from '../authToken'
 
 export type AuthMode = 'api'
 export type ThemeMode = 'dark' | 'light' | 'system'
@@ -49,23 +49,41 @@ export const useAuthStore = defineStore('auth', () => {
   const theme = ref<ThemeMode>('system')
   const locale = ref<Locale>('zh-CN')
   const ready = ref(false)
+  let unauthorizedListenerInstalled = false
   const isAuthenticated = computed(() => session.value !== null)
   const needsOnboarding = computed(() => isAuthenticated.value && !onboardingComplete.value)
   const authMode: AuthMode = 'api'
 
-  function applyTheme(next: ThemeMode) {
+  // Account preferences are scoped by user once a session exists. The
+  // unscoped keys remain a small pre-login fallback for first paint only.
+  function preferenceKey(key: string) {
+    return session.value ? `${key}.${session.value.user.id}` : key
+  }
+
+  function readPreference(key: string) {
+    const scoped = savedValue(preferenceKey(key))
+    if (scoped !== null) return scoped
+    // Never fall back to another account's unscoped preference after login.
+    return session.value ? null : savedValue(key)
+  }
+
+  function savePreference(key: string, value: string) {
+    saveValue(preferenceKey(key), value)
+  }
+
+  function applyTheme(next: ThemeMode, persist = true) {
     theme.value = next
     const resolved = next === 'system'
       ? (window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark')
       : next
     document.documentElement.dataset.theme = resolved
-    saveValue(THEME_STORAGE_KEY, next)
+    if (persist) savePreference(THEME_STORAGE_KEY, next)
   }
 
-  function applyLocale(next: Locale) {
+  function applyLocale(next: Locale, persist = true) {
     locale.value = next
     document.documentElement.lang = next
-    saveValue(LOCALE_STORAGE_KEY, next)
+    if (persist) savePreference(LOCALE_STORAGE_KEY, next)
   }
 
   function onboardingKey() {
@@ -73,21 +91,26 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   function hydrateLocalPreferences() {
-    const storedTheme = savedValue(THEME_STORAGE_KEY)
-    applyTheme(storedTheme === 'light' || storedTheme === 'dark' || storedTheme === 'system' ? storedTheme : 'system')
-    const storedLocale = savedValue(LOCALE_STORAGE_KEY)
-    applyLocale(storedLocale === 'en-US' ? 'en-US' : 'zh-CN')
+    const storedTheme = readPreference(THEME_STORAGE_KEY)
+    applyTheme(storedTheme === 'light' || storedTheme === 'dark' || storedTheme === 'system' ? storedTheme : 'system', false)
+    const storedLocale = readPreference(LOCALE_STORAGE_KEY)
+    applyLocale(storedLocale === 'en-US' ? 'en-US' : 'zh-CN', false)
   }
 
   async function initialize() {
     if (ready.value) return
+    if (!unauthorizedListenerInstalled) {
+      window.addEventListener(AUTH_UNAUTHORIZED_EVENT, handleUnauthorized)
+      unauthorizedListenerInstalled = true
+    }
     hydrateLocalPreferences()
     const stored = readJson<AuthSession>(AUTH_STORAGE_KEY)
     if (stored?.token && stored.user?.id && stored.user.username) {
-      setAuthToken(stored.token)
+        setAuthToken(stored.token)
       try {
         const user = await api.me()
         session.value = { ...stored, user, subject: user.id, displayName: user.username }
+        hydrateLocalPreferences()
         await hydrateAccountSettings()
         const onboarding = savedValue(onboardingKey())
         onboardingComplete.value = onboarding === 'complete'
@@ -97,6 +120,17 @@ export const useAuthStore = defineStore('auth', () => {
       }
     }
     ready.value = true
+  }
+
+  function handleUnauthorized(event: Event) {
+    const failedToken = event instanceof CustomEvent && typeof event.detail === 'string' ? event.detail : null
+    // A request started under an older session may finish after a new login.
+    // Only invalidate the session that the server actually rejected.
+    if (!failedToken || getAuthToken() !== failedToken) return
+    setAuthToken(null)
+    session.value = null
+    onboardingComplete.value = false
+    removeValue(AUTH_STORAGE_KEY)
   }
 
   async function signIn(username: string, password: string, register = false) {
@@ -116,6 +150,7 @@ export const useAuthStore = defineStore('auth', () => {
       user: response.user,
     }
     saveValue(AUTH_STORAGE_KEY, JSON.stringify(session.value))
+    hydrateLocalPreferences()
     await hydrateAccountSettings()
     onboardingComplete.value = savedValue(onboardingKey()) === 'complete'
     if (register) {
@@ -139,12 +174,14 @@ export const useAuthStore = defineStore('auth', () => {
     setAuthToken(null)
     session.value = null
     onboardingComplete.value = false
+    applyTheme('system', false)
+    applyLocale('zh-CN', false)
     removeValue(AUTH_STORAGE_KEY)
   }
 
-  function applySettings(settings: UserSettings) {
-    applyTheme(settings.theme)
-    applyLocale(settings.locale)
+  function applySettings(settings: UserSettings, persist = true) {
+    applyTheme(settings.theme, persist)
+    applyLocale(settings.locale, persist)
   }
 
   async function hydrateAccountSettings() {

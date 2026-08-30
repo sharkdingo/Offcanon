@@ -8,18 +8,8 @@ import com.offcanon.experiment.domain.Experiment;
 import java.util.Optional;
 
 public interface AgentLoopPort {
-    AgentRunResult run(Experiment experiment, CancellationPort cancellation);
-
-    default AgentRunResult run(Experiment experiment,
-                               CancellationPort cancellation,
-                               Optional<SessionContext> sessionContext) {
-        return run(experiment, cancellation);
-    }
-
-    default AgentRunResult run(Experiment experiment,
-                               CancellationPort cancellation,
-                               Optional<SessionContext> sessionContext,
-                               AgentRunSettings settings) {
-        return run(experiment, cancellation, sessionContext);
-    }
+    AgentRunResult run(Experiment experiment,
+                       CancellationPort cancellation,
+                       Optional<SessionContext> sessionContext,
+                       Optional<AgentRunSettings> settings);
 }

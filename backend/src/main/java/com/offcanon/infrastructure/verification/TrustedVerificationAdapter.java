@@ -92,7 +92,12 @@ public class TrustedVerificationAdapter implements VerificationPort {
             integrityFailure = error;
         }
         for (PendingEvidence pending : pendingEvidence) {
-            evidenceRepository.save(pending.toEvidence(experiment, verifiedState, purpose, sourceUnchanged));
+            boolean trusted = sourceUnchanged
+                    && !pending.timedOut()
+                    && !pending.cancelled()
+                    && pending.exitCode() == 0
+                    && "trusted-verification".equals(pending.environmentProfile());
+            evidenceRepository.save(pending.toEvidence(experiment, verifiedState, purpose, trusted));
         }
         if (integrityFailure != null) throw integrityFailure;
         return result;

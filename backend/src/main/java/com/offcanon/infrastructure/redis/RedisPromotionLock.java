@@ -24,6 +24,7 @@ public class RedisPromotionLock implements PromotionLockPort {
     private final StringRedisTemplate redis;
     private final Duration waitTimeout;
     private final Duration lease;
+    private final ThreadLocal<LockContext> contexts = new ThreadLocal<>();
 
     public RedisPromotionLock(StringRedisTemplate redis,
                               @Value("${offcanon.redis.lock-wait-seconds:${OFFCANON_REDIS_LOCK_WAIT_SECONDS:10}}") long waitSeconds,
@@ -60,6 +61,9 @@ public class RedisPromotionLock implements PromotionLockPort {
         AtomicBoolean finished = new AtomicBoolean();
         AtomicBoolean lost = new AtomicBoolean();
         Thread owner = Thread.currentThread();
+        LockContext context = new LockContext(projectId, key, token, lost);
+        LockContext previous = contexts.get();
+        contexts.set(context);
         Thread renewer = Thread.ofVirtual().name("offcanon-promotion-lock-renewal").start(() -> {
             long intervalMillis = Math.max(1_000L, lease.toMillis() / 3);
             while (!finished.get()) {
@@ -82,19 +86,65 @@ public class RedisPromotionLock implements PromotionLockPort {
             }
         });
         try {
-            // A completed action may already have atomically committed the lifecycle
-            // and journal. Never overwrite that authoritative outcome after return.
+            // The action is responsible for checking the lease at every
+            // canonical-write boundary. Once it returns, its durable result
+            // (including a committed lifecycle transition) is authoritative;
+            // a renewal failure observed during the final cleanup window must
+            // not overwrite that result with a second, contradictory failure.
             return action.get();
         } finally {
             finished.set(true);
             renewer.interrupt();
             if (lost.get()) Thread.interrupted();
+            if (previous == null) contexts.remove();
+            else contexts.set(previous);
             try {
                 redis.execute(RELEASE, List.of(key), token);
             } catch (RuntimeException ignored) {
                 // The action result is authoritative. A release outage must not turn a
                 // committed promotion into an API-level failure; the lease will expire.
             }
+        }
+    }
+
+    @Override
+    public void assertHeld(UUID projectId) {
+        LockContext context = contexts.get();
+        if (context == null || !context.projectId.equals(projectId) || context.lost.get()
+                || Thread.currentThread().isInterrupted()) {
+            Thread.interrupted();
+            throw lockLost();
+        }
+        String owner;
+        try {
+            owner = redis.opsForValue().get(context.key);
+        } catch (RuntimeException error) {
+            context.lost.set(true);
+            Thread.interrupted();
+            throw lockLost();
+        }
+        if (!context.token.equals(owner)) {
+            context.lost.set(true);
+            Thread.interrupted();
+            throw lockLost();
+        }
+    }
+
+    private DomainException lockLost() {
+        return new DomainException("PROMOTION_LOCK_LOST", "Promotion lock lease was lost during canonical apply");
+    }
+
+    private static final class LockContext {
+        private final UUID projectId;
+        private final String key;
+        private final String token;
+        private final AtomicBoolean lost;
+
+        private LockContext(UUID projectId, String key, String token, AtomicBoolean lost) {
+            this.projectId = projectId;
+            this.key = key;
+            this.token = token;
+            this.lost = lost;
         }
     }
 }

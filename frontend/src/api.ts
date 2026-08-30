@@ -1,4 +1,4 @@
-import { getAuthToken } from './authToken'
+import { getAuthToken, notifyUnauthorized } from './authToken'
 
 export type Project = {
   id: string
@@ -8,10 +8,32 @@ export type Project = {
   createdAt: string
 }
 
+export type DirectoryEntry = {
+  name: string
+  path: string
+}
+
+export type DirectoryLocation = {
+  kind: 'HOME' | 'WORKING_DIRECTORY' | 'FILESYSTEM_ROOT'
+  path: string
+}
+
+export type DirectoryBrowse = {
+  path: string
+  parent: string | null
+  entries: DirectoryEntry[]
+  truncated: boolean
+  gitRoot: string | null
+  suggestedName: string | null
+  suggestedVerificationCommands: string[]
+  locations: DirectoryLocation[]
+}
+
 export type Experiment = {
   id: string
   projectId: string
   sessionId: string
+  continuedFromExperimentId: string | null
   task: string
   status: string
   baseSnapshotId: string | null
@@ -68,6 +90,13 @@ export type PromotionOutcome = {
   fingerprint: string | null
 }
 
+export type PromotionStaleConfirmation = {
+  markedStale: boolean
+  status: string
+  detail: string
+  currentFingerprint: string | null
+}
+
 export type PromotionPreview = {
   baseFingerprint: string | null
   currentFingerprint: string | null
@@ -77,6 +106,9 @@ export type PromotionPreview = {
   conflict: boolean
   blockingReason: string | null
   promotable: boolean
+  recoveryRequired: boolean
+  recoveryJournalPhase: string | null
+  recoveryPromotionId: string | null
 }
 
 export type PromotionReconcile = {
@@ -85,6 +117,17 @@ export type PromotionReconcile = {
   journalPhase: string
   fingerprint: string | null
   detail: string
+}
+
+export type ProjectPromotionRecovery = {
+  projectId: string
+  recoveryRequired: boolean
+  promotionId: string | null
+  experimentId: string | null
+  journalPhase: string | null
+  failureReason: string | null
+  leaseUntil: string | null
+  unresolvedCount: number
 }
 
 export type RunEvent = {
@@ -121,6 +164,33 @@ export type UserSettings = {
   version: number
 }
 
+export type ModelConfigurationStatus = {
+  apiKeyConfigured: boolean
+  defaultEndpointConfigured: boolean
+  defaultModelConfigured: boolean
+  effectiveEndpointConfigured: boolean
+  effectiveModelConfigured: boolean
+  effectiveEndpointAllowed: boolean
+  effectiveEndpoint: string | null
+  effectiveModel: string | null
+  allowedEndpointCount: number
+}
+
+export type ModelTestResponse = {
+  reachable: boolean
+  code: string
+  detail: string
+}
+
+export type RuntimeSettingsPolicy = {
+  defaultMaxSteps: number
+  defaultRunTimeoutSeconds: number
+  defaultContextLimitChars: number
+  maxStepsCeiling: number
+  runTimeoutSecondsCeiling: number
+  contextLimitCharsCeiling: number
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -141,6 +211,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   if (token) headers.set('Authorization', `Bearer ${token}`)
   const response = await fetch(url, { ...init, headers })
   if (!response.ok) {
+    if (response.status === 401) notifyUnauthorized(token)
     const detail = await response.json().catch(() => ({ detail: response.statusText })) as {
       detail?: string
       message?: string
@@ -168,27 +239,48 @@ export const api = {
   me: () => request<AuthUser>('/api/auth/me'),
   logout: () => request<void>('/api/auth/logout', { method: 'POST' }),
   settings: () => request<UserSettings>('/api/settings'),
+  modelStatus: () => request<ModelConfigurationStatus>('/api/settings/model-status'),
+  runtimePolicy: () => request<RuntimeSettingsPolicy>('/api/settings/runtime-policy'),
   updateSettings: (body: Omit<UserSettings, 'userId' | 'updatedAt' | 'version'>) =>
     request<UserSettings>('/api/settings', { method: 'PUT', body: JSON.stringify(body) }),
+  testModel: (body: { modelEndpoint: string; modelName: string }) =>
+    request<ModelTestResponse>('/api/settings/model-test', { method: 'POST', body: JSON.stringify(body) }),
   projects: () => request<Project[]>('/api/projects'),
+  browseDirectories: (path?: string) => {
+    const query = path ? `?path=${encodeURIComponent(path)}` : ''
+    return request<DirectoryBrowse>(`/api/local-directories${query}`)
+  },
   createProject: (body: { name: string; canonicalPath: string; verificationCommands: string[] }) =>
     request<Project>('/api/projects', { method: 'POST', body: JSON.stringify(body) }),
+  updateProject: (projectId: string, body: { name: string; canonicalPath: string; verificationCommands: string[] }) =>
+    request<Project>(`/api/projects/${projectId}`, { method: 'PUT', body: JSON.stringify(body) }),
   experiments: (projectId: string) => request<Experiment[]>(`/api/projects/${projectId}/experiments`),
   sessions: (projectId: string) => request<Session[]>(`/api/projects/${projectId}/sessions`),
   createSession: (projectId: string, title: string) =>
     request<Session>(`/api/projects/${projectId}/sessions`, { method: 'POST', body: JSON.stringify({ title }) }),
   createExperiment: (projectId: string, body: { sessionId?: string | null; sessionTitle?: string; task: string }) =>
     request<Experiment>(`/api/projects/${projectId}/experiments`, { method: 'POST', body: JSON.stringify(body) }),
+  continueExperiment: (experimentId: string, task: string) =>
+    request<Experiment>(`/api/experiments/${experimentId}/continue`, {
+      method: 'POST',
+      body: JSON.stringify({ task }),
+    }),
   startExperiment: (experimentId: string) =>
     request<Experiment>(`/api/experiments/${experimentId}/start`, { method: 'POST' }),
   cancelExperiment: (experimentId: string) =>
     request<Experiment>(`/api/experiments/${experimentId}/cancel`, { method: 'POST' }),
   promoteExperiment: (experimentId: string) =>
     request<PromotionOutcome>(`/api/experiments/${experimentId}/promote`, { method: 'POST' }),
+  confirmExperimentStale: (experimentId: string) =>
+    request<PromotionStaleConfirmation>(`/api/experiments/${experimentId}/stale-confirmation`, { method: 'POST' }),
   promotionPreview: (experimentId: string) =>
     request<PromotionPreview>(`/api/experiments/${experimentId}/promotion-preview`),
   reconcilePromotion: (experimentId: string) =>
     request<PromotionReconcile>(`/api/experiments/${experimentId}/promotion-reconcile`, { method: 'POST' }),
+  promotionRecovery: (projectId: string) =>
+    request<ProjectPromotionRecovery>(`/api/projects/${projectId}/promotion-recovery`),
+  reconcileProjectPromotion: (projectId: string) =>
+    request<PromotionReconcile>(`/api/projects/${projectId}/promotion-reconcile`, { method: 'POST' }),
   evidence: (experimentId: string) => request<Evidence[]>(`/api/experiments/${experimentId}/evidence`),
   diff: (experimentId: string) => request<DiffEntry[]>(`/api/experiments/${experimentId}/diff`),
 }

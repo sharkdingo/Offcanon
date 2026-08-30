@@ -20,15 +20,49 @@ public final class ApiDtos {
         }
     }
 
+    public record UpdateProjectRequest(
+            @NotBlank @Size(max = 200) String name,
+            @NotBlank @Size(max = 4_096) String canonicalPath,
+            @Size(min = 1, max = 20) List<@NotBlank @Size(max = 1_000) String> verificationCommands) {
+        public UpdateProjectRequest {
+            verificationCommands = verificationCommands == null ? List.of() : List.copyOf(verificationCommands);
+        }
+    }
+
     public record CreateExperimentRequest(UUID sessionId,
                                           @Size(max = 200) String sessionTitle,
                                           @NotBlank @Size(max = 20_000) String task) {
+    }
+
+    public record ContinueExperimentRequest(@Size(max = 20_000) String task) {
     }
 
     public record CreateSessionRequest(@NotBlank @Size(max = 200) String title) {
     }
 
     public record ProjectResponse(UUID id, String name, String canonicalPath, List<String> verificationCommands, Instant createdAt) {
+    }
+
+    public record DirectoryBrowseResponse(String path,
+                                          String parent,
+                                          List<DirectoryEntryResponse> entries,
+                                          boolean truncated,
+                                          String gitRoot,
+                                          String suggestedName,
+                                          List<String> suggestedVerificationCommands,
+                                          List<DirectoryLocationResponse> locations) {
+        public DirectoryBrowseResponse {
+            entries = entries == null ? List.of() : List.copyOf(entries);
+            suggestedVerificationCommands = suggestedVerificationCommands == null
+                    ? List.of() : List.copyOf(suggestedVerificationCommands);
+            locations = locations == null ? List.of() : List.copyOf(locations);
+        }
+    }
+
+    public record DirectoryEntryResponse(String name, String path) {
+    }
+
+    public record DirectoryLocationResponse(String kind, String path) {
     }
 
     public record SessionResponse(UUID id, UUID projectId, String title, Instant createdAt) {
@@ -38,6 +72,7 @@ public final class ApiDtos {
             UUID id,
             UUID projectId,
             UUID sessionId,
+            UUID continuedFromExperimentId,
             String task,
             String status,
             UUID baseSnapshotId,
@@ -76,6 +111,13 @@ public final class ApiDtos {
             String fingerprint) {
     }
 
+    public record PromotionStaleConfirmationResponse(
+            boolean markedStale,
+            String status,
+            String detail,
+            String currentFingerprint) {
+    }
+
     public record PromotionPreviewResponse(
             String baseFingerprint,
             String currentFingerprint,
@@ -84,7 +126,21 @@ public final class ApiDtos {
             boolean trustedVerification,
             boolean conflict,
             String blockingReason,
-            boolean promotable) {
+            boolean promotable,
+            boolean recoveryRequired,
+            String recoveryJournalPhase,
+            UUID recoveryPromotionId) {
+        public PromotionPreviewResponse(String baseFingerprint,
+                                         String currentFingerprint,
+                                         String finalCandidateFingerprint,
+                                         String verificationStatus,
+                                         boolean trustedVerification,
+                                         boolean conflict,
+                                         String blockingReason,
+                                         boolean promotable) {
+            this(baseFingerprint, currentFingerprint, finalCandidateFingerprint, verificationStatus,
+                    trustedVerification, conflict, blockingReason, promotable, false, null, null);
+        }
     }
 
     public record PromotionReconcileResponse(

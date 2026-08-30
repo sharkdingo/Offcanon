@@ -9,9 +9,17 @@ import java.util.Objects;
 import java.util.UUID;
 
 public final class Experiment {
+    /**
+     * Keep the durable summary comfortably below MySQL TEXT's byte limit even
+     * when the model uses multi-byte text. The full bounded context remains an
+     * audit concern; this field is the user-facing lifecycle summary.
+     */
+    private static final int MAX_AGENT_SUMMARY_CHARS = 12_000;
+    private static final String SUMMARY_TRUNCATION_MARKER = "\n...[summary truncated]...";
     private final UUID id;
     private final UUID projectId;
     private final UUID sessionId;
+    private final UUID continuedFromExperimentId;
     private final String task;
     private final Instant createdAt;
     private ExperimentStatus status;
@@ -23,10 +31,19 @@ public final class Experiment {
     private String failureReason;
     private long version;
 
-    private Experiment(UUID id, UUID projectId, UUID sessionId, String task, Instant createdAt) {
+    private Experiment(UUID id,
+                       UUID projectId,
+                       UUID sessionId,
+                       UUID continuedFromExperimentId,
+                       String task,
+                       Instant createdAt) {
         this.id = Objects.requireNonNull(id, "id");
         this.projectId = Objects.requireNonNull(projectId, "projectId");
         this.sessionId = Objects.requireNonNull(sessionId, "sessionId");
+        this.continuedFromExperimentId = continuedFromExperimentId;
+        if (id.equals(continuedFromExperimentId)) {
+            throw new IllegalArgumentException("Experiment cannot continue from itself");
+        }
         this.task = Objects.requireNonNull(task, "task");
         this.createdAt = Objects.requireNonNull(createdAt, "createdAt");
         if (task.isBlank()) {
@@ -36,7 +53,16 @@ public final class Experiment {
     }
 
     public static Experiment create(UUID projectId, UUID sessionId, String task, Instant now) {
-        return new Experiment(UUID.randomUUID(), projectId, sessionId, task.trim(), now);
+        return new Experiment(UUID.randomUUID(), projectId, sessionId, null, task.trim(), now);
+    }
+
+    public static Experiment continueFrom(UUID projectId,
+                                          UUID sessionId,
+                                          UUID previousExperimentId,
+                                          String task,
+                                          Instant now) {
+        return new Experiment(UUID.randomUUID(), projectId, sessionId,
+                Objects.requireNonNull(previousExperimentId, "previousExperimentId"), task.trim(), now);
     }
 
     /** Rehydrates persisted state without replaying side effects or lifecycle events. */
@@ -53,7 +79,25 @@ public final class Experiment {
                                      VerificationResult verificationResult,
                                      String failureReason,
                                      long version) {
-        Experiment experiment = new Experiment(id, projectId, sessionId, task, createdAt);
+        return restore(id, projectId, sessionId, null, task, createdAt, status, baseSnapshotId,
+                resultSnapshotId, workspacePath, agentSummary, verificationResult, failureReason, version);
+    }
+
+    public static Experiment restore(UUID id,
+                                     UUID projectId,
+                                     UUID sessionId,
+                                     UUID continuedFromExperimentId,
+                                     String task,
+                                     Instant createdAt,
+                                     ExperimentStatus status,
+                                     UUID baseSnapshotId,
+                                     UUID resultSnapshotId,
+                                     Path workspacePath,
+                                     String agentSummary,
+                                     VerificationResult verificationResult,
+                                     String failureReason,
+                                     long version) {
+        Experiment experiment = new Experiment(id, projectId, sessionId, continuedFromExperimentId, task, createdAt);
         experiment.status = Objects.requireNonNull(status, "status");
         experiment.baseSnapshotId = baseSnapshotId;
         experiment.resultSnapshotId = resultSnapshotId;
@@ -62,7 +106,17 @@ public final class Experiment {
         experiment.verificationResult = verificationResult;
         experiment.failureReason = failureReason;
         experiment.version = version;
+        validateRestoredBindings(experiment);
         return experiment;
+    }
+
+    private static void validateRestoredBindings(Experiment experiment) {
+        if (experiment.resultSnapshotId != null && experiment.baseSnapshotId == null) {
+            throw new IllegalArgumentException("A result snapshot requires a base snapshot");
+        }
+        if (experiment.workspacePath != null && experiment.baseSnapshotId == null) {
+            throw new IllegalArgumentException("An experiment workspace requires a base snapshot");
+        }
     }
 
     public void beginSnapshot() {
@@ -86,7 +140,12 @@ public final class Experiment {
 
     public void markAgentCompleted(String summary) {
         requireStatus(ExperimentStatus.RUNNING);
-        agentSummary = Objects.requireNonNull(summary, "summary").trim();
+        String normalized = Objects.requireNonNull(summary, "summary").trim();
+        if (normalized.length() > MAX_AGENT_SUMMARY_CHARS) {
+            int contentLimit = Math.max(0, MAX_AGENT_SUMMARY_CHARS - SUMMARY_TRUNCATION_MARKER.length());
+            normalized = normalized.substring(0, contentLimit) + SUMMARY_TRUNCATION_MARKER;
+        }
+        agentSummary = normalized;
         status = ExperimentStatus.AGENT_COMPLETED;
         version++;
     }
@@ -214,7 +273,7 @@ public final class Experiment {
 
     /** Resolves a recovery journal after the canonical tree is proven unchanged. */
     public void reconcilePromotionAborted() {
-        if (status == ExperimentStatus.VERIFIED) return;
+        if (status == ExperimentStatus.VERIFIED || status == ExperimentStatus.STALE) return;
         if (status != ExperimentStatus.PREPARING_PROMOTION
                 && status != ExperimentStatus.PROMOTING
                 && status != ExperimentStatus.RECOVERY_REQUIRED) {
@@ -295,6 +354,7 @@ public final class Experiment {
     public UUID id() { return id; }
     public UUID projectId() { return projectId; }
     public UUID sessionId() { return sessionId; }
+    public UUID continuedFromExperimentId() { return continuedFromExperimentId; }
     public String task() { return task; }
     public Instant createdAt() { return createdAt; }
     public ExperimentStatus status() { return status; }

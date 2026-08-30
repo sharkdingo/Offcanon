@@ -11,6 +11,7 @@ import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ExperimentTest {
     @Test
@@ -56,5 +57,18 @@ class ExperimentTest {
 
         assertEquals(ExperimentStatus.REJECTED, experiment.status());
         assertEquals("test command failed", experiment.failureReason());
+    }
+
+    @Test
+    void boundsDurableAgentSummaryBeforePersistence() {
+        Experiment experiment = Experiment.create(UUID.randomUUID(), UUID.randomUUID(), "task", Instant.now());
+        experiment.beginSnapshot();
+        experiment.attachBase(UUID.randomUUID(), Path.of("C:/offcanon/experiment"));
+        experiment.start();
+
+        experiment.markAgentCompleted("结果".repeat(10_000));
+
+        assertTrue(experiment.agentSummary().length() <= 12_000);
+        assertTrue(experiment.agentSummary().endsWith("...[summary truncated]..."));
     }
 }

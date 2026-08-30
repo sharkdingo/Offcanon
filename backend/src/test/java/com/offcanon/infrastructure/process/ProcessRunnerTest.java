@@ -7,6 +7,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.LinkedHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -64,15 +65,51 @@ class ProcessRunnerTest {
                 "PATH", "safe-path",
                 "JAVA_HOME", "safe-java",
                 "DATABASE_URL", "jdbc:mysql://user:secret@localhost/db",
-                "OFFCANON_MODEL_API_KEY", "secret"), Map.of("OFFCANON_EXPERIMENT_ID", "experiment-1"));
+                "OFFCANON_MODEL_API_KEY", "secret"), Map.of(
+                        "GIT_CEILING_DIRECTORIES", temp.toString(),
+                        "OFFCANON_EXPERIMENT_ID", "experiment-1"));
 
         assertEquals("safe-path", sanitized.get("PATH"));
         assertEquals("safe-java", sanitized.get("JAVA_HOME"));
+        assertEquals(temp.toString(), sanitized.get("GIT_CEILING_DIRECTORIES"));
         assertEquals("experiment-1", sanitized.get("OFFCANON_EXPERIMENT_ID"));
         assertFalse(sanitized.containsKey("DATABASE_URL"));
         assertFalse(sanitized.containsKey("OFFCANON_MODEL_API_KEY"));
         assertThrows(IllegalArgumentException.class, () -> runner.sanitizedEnvironment(
                 Map.of(), Map.of("DATABASE_URL", "secret")));
+    }
+
+    @Test
+    void acceptsBoundedNonSensitiveRequestedVariablesAndRejectsInjectionChannels() {
+        ProcessRunner runner = new ProcessRunner();
+
+        Map<String, String> requested = Map.of(
+                "NODE_ENV", "test",
+                "CI", "true",
+                "FEATURE_FLAG", "off");
+        Map<String, String> sanitized = runner.sanitizedEnvironment(Map.of(), requested);
+        assertEquals(requested, sanitized);
+
+        assertThrows(IllegalArgumentException.class, () -> runner.sanitizedEnvironment(
+                Map.of(), Map.of("LD_PRELOAD", "evil.dll")));
+        assertThrows(IllegalArgumentException.class, () -> runner.sanitizedEnvironment(
+                Map.of(), Map.of("NODE_OPTIONS", "--require=evil.js")));
+        assertThrows(IllegalArgumentException.class, () -> runner.sanitizedEnvironment(
+                Map.of(), Map.of("BUILD_MODE", "line1\nline2")));
+        assertThrows(IllegalArgumentException.class, () -> runner.sanitizedEnvironment(
+                Map.of(), Map.of("bad-name", "value")));
+    }
+
+    @Test
+    void boundsRequestedEnvironmentSizeAndValueLength() {
+        ProcessRunner runner = new ProcessRunner();
+        Map<String, String> tooMany = new LinkedHashMap<>();
+        for (int index = 0; index <= ProcessRunner.MAX_REQUESTED_ENVIRONMENT_ENTRIES; index++) {
+            tooMany.put("VAR_" + index, "value");
+        }
+        assertThrows(IllegalArgumentException.class, () -> runner.sanitizedEnvironment(Map.of(), tooMany));
+        assertThrows(IllegalArgumentException.class, () -> runner.sanitizedEnvironment(Map.of(),
+                Map.of("BUILD_MODE", "x".repeat(ProcessRunner.MAX_REQUESTED_ENVIRONMENT_VALUE_LENGTH + 1))));
     }
 
     private List<String> javaCommand(String mode) {

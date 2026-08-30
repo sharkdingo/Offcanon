@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import com.offcanon.shared.domain.DomainException;
 
 @Repository
 @Profile("!mysql")
@@ -17,9 +18,13 @@ public class InMemorySessionRepository implements SessionRepository {
     private final ConcurrentHashMap<UUID, Session> sessions = new ConcurrentHashMap<>();
 
     @Override
-    public Session save(Session session) {
-        sessions.put(session.id(), session);
-        return session;
+    public synchronized Session save(Session session) {
+        Session existing = sessions.putIfAbsent(session.id(), session);
+        if (existing != null && !existing.equals(session)) {
+            throw new DomainException("SESSION_IDENTITY_CONFLICT",
+                    "Session identity is already bound to different content: " + session.id());
+        }
+        return existing == null ? session : existing;
     }
 
     @Override

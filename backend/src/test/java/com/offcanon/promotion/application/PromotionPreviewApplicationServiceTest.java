@@ -42,6 +42,9 @@ class PromotionPreviewApplicationServiceTest {
         assertTrue(preview.trustedVerification());
         assertFalse(preview.conflict());
         assertTrue(preview.promotable());
+        assertFalse(preview.recoveryRequired());
+        assertNull(preview.recoveryJournalPhase());
+        assertNull(preview.recoveryPromotionId());
         assertNull(preview.blockingReason());
         assertEquals(ExperimentStatus.VERIFIED,
                 fixture.experiments.findById(fixture.experiment.id()).orElseThrow().status());
@@ -82,6 +85,9 @@ class PromotionPreviewApplicationServiceTest {
 
         assertFalse(preview.promotable());
         assertEquals("An earlier promotion requires recovery before this project can be changed", preview.blockingReason());
+        assertTrue(preview.recoveryRequired());
+        assertEquals("PREPARED", preview.recoveryJournalPhase());
+        assertTrue(preview.recoveryPromotionId() != null);
     }
 
     @Test
@@ -105,7 +111,7 @@ class PromotionPreviewApplicationServiceTest {
         InMemoryExperimentRepository experiments = new InMemoryExperimentRepository();
         InMemoryProjectRepository projects = new InMemoryProjectRepository();
         InMemorySnapshotRepository snapshots = new InMemorySnapshotRepository();
-        Project project = projects.save(Project.create("preview", temp.resolve("canonical"), List.of("mvn test"), Instant.now()));
+        Project project = projects.save(Project.create(java.util.UUID.randomUUID(), "preview", temp.resolve("canonical"), List.of("mvn test"), Instant.now()));
         Snapshot base = snapshots.save(snapshot(project.id(), baseFingerprint, "base"));
         Snapshot candidate = candidateFingerprint == null ? null
                 : snapshots.save(snapshot(project.id(), candidateFingerprint, "candidate"));

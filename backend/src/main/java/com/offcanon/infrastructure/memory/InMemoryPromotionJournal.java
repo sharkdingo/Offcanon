@@ -33,6 +33,15 @@ public class InMemoryPromotionJournal implements PromotionJournalPort {
     }
 
     @Override
+    public List<PromotionJournal> findByExperimentId(UUID experimentId) {
+        return journals.values().stream()
+                .filter(journal -> journal.experimentId().equals(experimentId))
+                .sorted(Comparator.comparing(PromotionJournal::createdAt)
+                        .thenComparing(PromotionJournal::promotionId))
+                .toList();
+    }
+
+    @Override
     public PromotionJournal markApplying(PromotionJournal journal, Instant now) {
         return transition(journal, PromotionPhase.APPLYING, null, null, now);
     }

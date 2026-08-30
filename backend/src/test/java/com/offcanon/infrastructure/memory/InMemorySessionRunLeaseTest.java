@@ -1,10 +1,11 @@
 package com.offcanon.infrastructure.memory;
 
+import com.offcanon.port.SessionRunLeasePort;
 import org.junit.jupiter.api.Test;
 
 import java.util.UUID;
 
-import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class InMemorySessionRunLeaseTest {
@@ -15,10 +16,20 @@ class InMemorySessionRunLeaseTest {
         UUID first = UUID.randomUUID();
         UUID second = UUID.randomUUID();
 
-        assertTrue(leases.tryAcquire(session, first));
-        assertFalse(leases.tryAcquire(session, first));
-        assertFalse(leases.tryAcquire(session, second));
-        leases.release(session, first);
-        assertTrue(leases.tryAcquire(session, second));
+        SessionRunLeasePort.Lease firstLease = leases.tryAcquire(session, first).orElseThrow();
+        assertTrue(leases.tryAcquire(session, first).isEmpty());
+        assertTrue(leases.tryAcquire(session, second).isEmpty());
+        firstLease.release();
+        SessionRunLeasePort.Lease secondLease = leases.tryAcquire(session, second).orElseThrow();
+        secondLease.assertHeld();
+        assertThrows(com.offcanon.shared.domain.DomainException.class,
+                firstLease::assertHeld);
+
+        firstLease.release();
+        secondLease.assertHeld();
+        leases.revoke(session, first);
+        secondLease.assertHeld();
+        leases.revoke(session, second);
+        assertThrows(com.offcanon.shared.domain.DomainException.class, secondLease::assertHeld);
     }
 }

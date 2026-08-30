@@ -18,6 +18,9 @@ public interface SnapshotPort {
 
     Snapshot capture(Project project);
     Snapshot captureWorkspace(Project project, Path workspace, String parentFingerprint);
+    default void discard(Snapshot snapshot) {
+        // Adapters that materialize temporary snapshots may release them here.
+    }
     String currentFingerprint(Project project);
     String fingerprintWorkspace(Project project, Path workspace, String parentFingerprint);
 }

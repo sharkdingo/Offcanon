@@ -5,6 +5,7 @@ import com.offcanon.agent.domain.ToolResult;
 import com.offcanon.experiment.domain.Experiment;
 import com.offcanon.port.Tool;
 import com.offcanon.shared.domain.DomainException;
+import com.offcanon.shared.domain.SensitivePathPolicy;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
@@ -25,6 +26,10 @@ import java.util.PriorityQueue;
 @Component
 public class ListFilesTool implements Tool {
     private static final int MAX_FILES = 500;
+    /** Covers conventional source roots while keeping accidental deep trees bounded. */
+    private static final int MAX_DEPTH = 16;
+    private static final String DEPTH_LIMIT_MARKER = "...[directory depth limit reached]";
+    private static final String SENSITIVE_LIMIT_MARKER = "...[sensitive files omitted]";
     private final WorkspacePathResolver paths;
 
     public ListFilesTool(WorkspacePathResolver paths) {
@@ -49,11 +54,23 @@ public class ListFilesTool implements Tool {
         try {
             PriorityQueue<String> smallest = new PriorityQueue<>(MAX_FILES, Comparator.reverseOrder());
             int[] seen = {0};
-            Files.walkFileTree(path, EnumSet.noneOf(FileVisitOption.class), 3, new SimpleFileVisitor<>() {
+            boolean[] depthLimited = {false};
+            boolean[] sensitiveOmitted = {false};
+            // Walk one level beyond the public bound so the visitor can emit an explicit marker.
+            Files.walkFileTree(path, EnumSet.noneOf(FileVisitOption.class), MAX_DEPTH + 1, new SimpleFileVisitor<>() {
                 @Override
                 public FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attrs) {
                     checkInterrupted();
+                    String directoryRelative = path.relativize(directory).toString().replace('\\', '/');
+                    if (!directory.equals(path) && SensitivePathPolicy.isSensitiveRelativePath(directoryRelative)) {
+                        sensitiveOmitted[0] = true;
+                        return FileVisitResult.SKIP_SUBTREE;
+                    }
                     if (!directory.equals(path) && isRuntimeDirectory(directory)) {
+                        return FileVisitResult.SKIP_SUBTREE;
+                    }
+                    if (path.relativize(directory).getNameCount() >= MAX_DEPTH) {
+                        depthLimited[0] = true;
                         return FileVisitResult.SKIP_SUBTREE;
                     }
                     return FileVisitResult.CONTINUE;
@@ -63,8 +80,12 @@ public class ListFilesTool implements Tool {
                 public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
                     checkInterrupted();
                     if (!Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) return FileVisitResult.CONTINUE;
-                    seen[0]++;
                     String relative = path.relativize(file).toString().replace('\\', '/');
+                    if (SensitivePathPolicy.isSensitiveRelativePath(relative)) {
+                        sensitiveOmitted[0] = true;
+                        return FileVisitResult.CONTINUE;
+                    }
+                    seen[0]++;
                     if (smallest.size() < MAX_FILES) {
                         smallest.add(relative);
                     } else if (relative.compareTo(smallest.peek()) < 0) {
@@ -77,6 +98,8 @@ public class ListFilesTool implements Tool {
             ArrayList<String> files = new ArrayList<>(smallest);
             files.sort(Comparator.naturalOrder());
             if (seen[0] > MAX_FILES) files.add("...[file limit reached]");
+            if (depthLimited[0]) files.add(DEPTH_LIMIT_MARKER);
+            if (sensitiveOmitted[0]) files.add(SENSITIVE_LIMIT_MARKER);
             return ToolResult.success(callId, definition().name(), String.join("\n", files));
         } catch (IOException error) {
             return ToolResult.failure(callId, definition().name(), "Unable to list " + requested + ": " + error.getMessage());

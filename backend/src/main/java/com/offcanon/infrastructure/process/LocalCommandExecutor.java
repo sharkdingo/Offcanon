@@ -5,6 +5,7 @@ import org.springframework.stereotype.Component;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -18,20 +19,23 @@ public class LocalCommandExecutor implements CommandExecutor {
     }
 
     @Override
-    public CommandExecution execute(String command, Path cwd, Duration timeout, Map<String, String> environment) {
-        return execute(command, cwd, timeout, environment, "controlled-process");
-    }
-
-    @Override
     public CommandExecution execute(String command,
                                     Path cwd,
                                     Duration timeout,
                                     Map<String, String> environment,
                                     String environmentProfile) {
+        Map<String, String> boundedEnvironment = new HashMap<>(environment);
+        Path workspace = cwd.toAbsolutePath().normalize();
+        if (workspace.getParent() != null) {
+            boundedEnvironment.put("GIT_CEILING_DIRECTORIES", workspace.getParent().toString());
+        }
         List<String> processCommand = isWindows()
                 ? List.of("cmd.exe", "/d", "/s", "/c", command)
-                : List.of("sh", "-lc", command);
-        ProcessRunner.ProcessResult result = processRunner.run(processCommand, cwd, environment, timeout);
+                // Do not load the user's login profile for an agent command.
+                // It can execute arbitrary startup code outside the workspace;
+                // ProcessRunner still supplies the explicit bounded environment.
+                : List.of("sh", "-c", command);
+        ProcessRunner.ProcessResult result = processRunner.run(processCommand, cwd, boundedEnvironment, timeout);
         return new CommandExecution(result.exitCode(), result.stdout(), result.stderr(), result.duration(),
                 result.timedOut(), result.cancelled(), environmentProfile);
     }

@@ -2,7 +2,9 @@ package com.offcanon.infrastructure.mysql;
 
 import com.offcanon.identity.domain.AuthSession;
 import com.offcanon.port.AuthSessionRepository;
+import com.offcanon.shared.domain.DomainException;
 import org.springframework.context.annotation.Profile;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 
@@ -10,6 +12,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.Optional;
 
 @Repository
@@ -23,9 +26,27 @@ public class JdbcAuthSessionRepository implements AuthSessionRepository {
 
     @Override
     public AuthSession save(AuthSession session) {
-        jdbc.update("INSERT INTO auth_sessions (token_hash,user_id,created_at,expires_at) VALUES (?,?,?,?)",
-                session.tokenHash(), session.userId().toString(), Timestamp.from(session.createdAt()), Timestamp.from(session.expiresAt()));
-        return session;
+        try {
+            jdbc.update("INSERT INTO auth_sessions (token_hash,user_id,created_at,expires_at) VALUES (?,?,?,?)",
+                    session.tokenHash(), session.userId().toString(), Timestamp.from(session.createdAt()), Timestamp.from(session.expiresAt()));
+            return session;
+        } catch (DuplicateKeyException error) {
+            Optional<AuthSession> existing = findByTokenHash(session.tokenHash());
+            if (existing.isPresent() && sameSession(existing.get(), session)) {
+                return existing.get();
+            }
+            throw new DomainException("AUTH_SESSION_IDENTITY_CONFLICT",
+                    "Authentication session identity is already bound to different content");
+        }
+    }
+
+    private boolean sameSession(AuthSession left, AuthSession right) {
+        return left.tokenHash().equals(right.tokenHash())
+                && left.userId().equals(right.userId())
+                && left.createdAt().truncatedTo(ChronoUnit.MICROS)
+                .equals(right.createdAt().truncatedTo(ChronoUnit.MICROS))
+                && left.expiresAt().truncatedTo(ChronoUnit.MICROS)
+                .equals(right.expiresAt().truncatedTo(ChronoUnit.MICROS));
     }
 
     @Override

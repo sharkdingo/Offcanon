@@ -7,10 +7,13 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
-import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.regex.Pattern;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
@@ -20,6 +23,10 @@ public class ProcessRunner {
     private static final int MAX_CAPTURE_BYTES = 1_000_000;
     private static final int HEAD_CAPTURE_BYTES = MAX_CAPTURE_BYTES / 2;
     private static final int TAIL_CAPTURE_BYTES = MAX_CAPTURE_BYTES - HEAD_CAPTURE_BYTES;
+    public static final int MAX_REQUESTED_ENVIRONMENT_ENTRIES = 16;
+    public static final int MAX_REQUESTED_ENVIRONMENT_NAME_LENGTH = 64;
+    public static final int MAX_REQUESTED_ENVIRONMENT_VALUE_LENGTH = 4_096;
+    private static final Pattern ENVIRONMENT_NAME = Pattern.compile("[A-Za-z_][A-Za-z0-9_]{0,63}");
     private static final Set<String> INHERITED_ENVIRONMENT = Set.of(
             "APPDATA", "CARGO_HOME", "CI", "CLASSPATH", "COLORTERM", "COMSPEC",
             "DOTNET_ROOT", "GOPATH", "GOROOT", "GRADLE_HOME", "GRADLE_USER_HOME",
@@ -30,8 +37,18 @@ public class ProcessRunner {
             "RUSTUP_HOME", "SYSTEMROOT", "TEMP", "TERM", "TMP", "TMPDIR", "TZ",
             "USERPROFILE", "WINDIR");
     private static final Set<String> EXPLICIT_ENVIRONMENT = Set.of(
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_DIR", "GIT_INDEX_FILE",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CEILING_DIRECTORIES", "GIT_DIR", "GIT_INDEX_FILE",
             "GIT_OBJECT_DIRECTORY", "GIT_WORK_TREE", "OFFCANON_EXPERIMENT_ID");
+    private static final Set<String> PROTECTED_ENVIRONMENT = Set.of(
+            "PATH", "PATHEXT", "COMSPEC", "SYSTEMROOT", "WINDIR", "USERPROFILE",
+            "HOMEDRIVE", "HOMEPATH", "HOME", "TEMP", "TMP", "TMPDIR", "PWD", "OLDPWD",
+            "CD", "PROMPT", "PSMODULEPATH", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+            "JAVA_HOME", "MAVEN_HOME", "GRADLE_HOME", "NODE_HOME", "NPM_CONFIG_CACHE",
+            "GOPATH", "GOROOT", "CARGO_HOME", "RUSTUP_HOME", "NODE_OPTIONS", "NODE_PATH",
+            "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "RUBYOPT", "PERL5OPT", "JAVA_TOOL_OPTIONS",
+            "MAVEN_OPTS", "GRADLE_OPTS", "BASH_ENV", "ENV", "LD_PRELOAD", "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "COMPLUS_ReadyToRun",
+            "COR_ENABLE_PROFILING", "CORECLR_ENABLE_PROFILING", "CORECLR_PROFILER", "RUSTC_WRAPPER");
 
     public ProcessResult run(List<String> command, Path cwd, Map<String, String> environment, Duration timeout) {
         long started = System.nanoTime();
@@ -81,16 +98,35 @@ public class ProcessRunner {
 
     Map<String, String> sanitizedEnvironment(Map<String, String> inherited,
                                              Map<String, String> requested) {
-        Map<String, String> safe = new HashMap<>();
-        inherited.forEach((name, value) -> {
+        Map<String, String> safe = new LinkedHashMap<>();
+        Map<String, String> inheritedValues = inherited == null ? Map.of() : inherited;
+        Map<String, String> requestedValues = requested == null ? Map.of() : requested;
+        inheritedValues.forEach((name, value) -> {
+            if (name == null || value == null) return;
             String normalized = name.toUpperCase(Locale.ROOT);
             if (INHERITED_ENVIRONMENT.contains(normalized) && !isSensitiveName(name)) {
                 safe.put(name, value);
             }
         });
-        requested.forEach((name, value) -> {
+        if (requestedValues.size() > MAX_REQUESTED_ENVIRONMENT_ENTRIES) {
+            throw new IllegalArgumentException("Too many requested process environment variables (maximum "
+                    + MAX_REQUESTED_ENVIRONMENT_ENTRIES + ")");
+        }
+        Set<String> normalizedRequested = new HashSet<>();
+        requestedValues.forEach((name, value) -> {
             String normalized = name.toUpperCase(Locale.ROOT);
-            if (!EXPLICIT_ENVIRONMENT.contains(normalized) || isSensitiveName(name)) {
+            if (!normalizedRequested.add(normalized)) {
+                throw new IllegalArgumentException("Duplicate process environment variable: " + name);
+            }
+            if (isInternalEnvironment(normalized)) {
+                validateEnvironmentEntry(name, value);
+                safe.put(name, value);
+                return;
+            }
+            validateRequestedEnvironmentEntry(name, value);
+            if (PROTECTED_ENVIRONMENT.contains(normalized)
+                    || normalized.startsWith("GIT_")
+                    || normalized.startsWith("OFFCANON_")) {
                 throw new IllegalArgumentException("Process environment variable is not allowed: " + name);
             }
             safe.put(name, value);
@@ -98,8 +134,50 @@ public class ProcessRunner {
         return safe;
     }
 
-    private boolean isSensitiveName(String name) {
+    /**
+     * Validates a user-requested environment entry before it reaches a
+     * ProcessBuilder. Internal control variables are intentionally excluded;
+     * callers should only pass those from trusted infrastructure code.
+     */
+    public static void validateRequestedEnvironmentEntry(String name, String value) {
+        validateEnvironmentEntry(name, value);
         String upper = name.toUpperCase(Locale.ROOT);
+        if (PROTECTED_ENVIRONMENT.contains(upper)
+                || upper.startsWith("GIT_")
+                || upper.startsWith("OFFCANON_")) {
+            throw new IllegalArgumentException("Process environment variable is not allowed: " + name);
+        }
+    }
+
+    private static void validateEnvironmentEntry(String name, String value) {
+        if (name == null || value == null || !ENVIRONMENT_NAME.matcher(name).matches()) {
+            throw new IllegalArgumentException("Process environment variable name/value is invalid");
+        }
+        if (name.length() > MAX_REQUESTED_ENVIRONMENT_NAME_LENGTH) {
+            throw new IllegalArgumentException("Process environment variable name is too long: " + name);
+        }
+        if (value.length() > MAX_REQUESTED_ENVIRONMENT_VALUE_LENGTH) {
+            throw new IllegalArgumentException("Process environment variable value is too long: " + name);
+        }
+        if (value.indexOf('\0') >= 0 || value.indexOf('\r') >= 0 || value.indexOf('\n') >= 0) {
+            throw new IllegalArgumentException("Process environment variable contains a control character: " + name);
+        }
+        String upper = name.toUpperCase(Locale.ROOT);
+        if (isSensitiveNameStatic(upper)) {
+            throw new IllegalArgumentException("Process environment variable is not allowed: " + name);
+        }
+    }
+
+    private static boolean isInternalEnvironment(String normalized) {
+        return EXPLICIT_ENVIRONMENT.contains(normalized);
+    }
+
+    private boolean isSensitiveName(String name) {
+        return isSensitiveNameStatic(name.toUpperCase(Locale.ROOT));
+    }
+
+    private static boolean isSensitiveNameStatic(String upper) {
+        Objects.requireNonNull(upper, "upper");
         return upper.contains("API_KEY")
                 || upper.contains("AUTH_TOKEN")
                 || upper.equals("TOKEN")
@@ -108,7 +186,10 @@ public class ProcessRunner {
                 || upper.contains("SECRET")
                 || upper.contains("CREDENTIAL")
                 || upper.contains("PRIVATE_KEY")
+                || upper.contains("ACCESS_KEY")
                 || upper.contains("COOKIE")
+                || upper.equals("DATABASE_URL")
+                || upper.endsWith("_DATABASE_URL")
                 || upper.startsWith("AWS_")
                 || upper.startsWith("AZURE_")
                 || upper.startsWith("GOOGLE_")

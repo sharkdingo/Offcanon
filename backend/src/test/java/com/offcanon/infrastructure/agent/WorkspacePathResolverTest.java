@@ -40,6 +40,21 @@ class WorkspacePathResolverTest {
         assertThrows(DomainException.class, () -> new WorkspacePathResolver().resolve(experiment, ".ENV", true));
     }
 
+    @Test
+    void allowsExplicitEnvironmentTemplatesButRejectsLocalVariants() {
+        Experiment experiment = experiment();
+        WorkspacePathResolver resolver = new WorkspacePathResolver();
+
+        assertEquals(workspace.resolve(".env.example").toAbsolutePath().normalize(),
+                resolver.resolve(experiment, ".env.example", true));
+        assertEquals(workspace.resolve("config/.env.sample").toAbsolutePath().normalize(),
+                resolver.resolve(experiment, "config/.env.sample", true));
+        assertThrows(DomainException.class,
+                () -> resolver.resolve(experiment, ".env.local", true));
+        assertThrows(DomainException.class,
+                () -> resolver.resolve(experiment, ".env.production", false));
+    }
+
     private Experiment experiment() {
         Experiment experiment = Experiment.create(UUID.randomUUID(), UUID.randomUUID(), "task", Instant.now());
         experiment.beginSnapshot();

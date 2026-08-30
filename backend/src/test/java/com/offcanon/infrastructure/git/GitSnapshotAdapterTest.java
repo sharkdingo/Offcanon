@@ -1,16 +1,19 @@
 package com.offcanon.infrastructure.git;
 
 import com.offcanon.infrastructure.process.ProcessRunner;
+import com.offcanon.infrastructure.filesystem.GitFileMode;
 import com.offcanon.project.domain.Project;
 import com.offcanon.shared.domain.DomainException;
 import com.offcanon.workspace.domain.Snapshot;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
+import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -35,11 +38,12 @@ class GitSnapshotAdapterTest {
         Files.writeString(repository.resolve("tracked.txt"), "after\n");
         Files.writeString(repository.resolve("new.txt"), "untracked\n");
         Files.writeString(repository.resolve(".env"), "SECRET=must-not-enter-snapshot\n");
+        Files.writeString(repository.resolve(".env.example"), "SECRET=replace-me\n");
         String statusBefore = run(repository, "git", "status", "--porcelain=v1");
 
         Path dataRoot = temp.resolve("data");
         GitSnapshotAdapter adapter = new GitSnapshotAdapter(new ProcessRunner(), dataRoot.toString());
-        Project project = Project.create("demo", repository, List.of(), Instant.now());
+        Project project = Project.create(java.util.UUID.randomUUID(), "demo", repository, List.of(), Instant.now());
         CanonicalGitState canonicalBefore = canonicalGitState(repository);
         Snapshot snapshot = adapter.capture(project);
 
@@ -51,6 +55,7 @@ class GitSnapshotAdapterTest {
         assertEquals("after\n", Files.readString(snapshot.materializedPath().resolve("tracked.txt")).replace("\r\n", "\n"));
         assertTrue(Files.exists(snapshot.materializedPath().resolve("new.txt")));
         assertFalse(Files.exists(snapshot.materializedPath().resolve(".env")));
+        assertTrue(Files.exists(snapshot.materializedPath().resolve(".env.example")));
         assertEquals(statusBefore, run(repository, "git", "status", "--porcelain=v1"));
     }
 
@@ -64,7 +69,7 @@ class GitSnapshotAdapterTest {
         Files.writeString(repository.resolve("kept.txt"), "dirty working tree\n");
 
         Path dataRoot = temp.resolve("export-ignore-data");
-        Project project = Project.create("demo", repository, List.of(), Instant.now());
+        Project project = Project.create(java.util.UUID.randomUUID(), "demo", repository, List.of(), Instant.now());
         CanonicalGitState canonicalBefore = canonicalGitState(repository);
         Snapshot snapshot = new GitSnapshotAdapter(new ProcessRunner(), dataRoot.toString()).capture(project);
 
@@ -87,10 +92,62 @@ class GitSnapshotAdapterTest {
         run(repository, "git", "commit", "-qm", "initial");
 
         GitSnapshotAdapter adapter = new GitSnapshotAdapter(new ProcessRunner(), temp.resolve("data").toString());
-        Snapshot snapshot = adapter.capture(Project.create("demo", repository, List.of(), Instant.now()));
+        Snapshot snapshot = adapter.capture(Project.create(java.util.UUID.randomUUID(), "demo", repository, List.of(), Instant.now()));
         Files.writeString(snapshot.materializedPath().resolve("file.txt"), "experiment\n");
 
         assertEquals("canonical\n", Files.readString(repository.resolve("file.txt")));
+    }
+
+    @Test
+    void materializesTheExecutableBitRecordedByTheGitTree() throws Exception {
+        Path repository = initialise("executable-repo");
+        Path script = repository.resolve("run.sh");
+        Files.writeString(script, "#!/bin/sh\necho run\n");
+        try {
+            Files.setPosixFilePermissions(script, java.util.Set.of(
+                    java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                    java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+                    java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE));
+        } catch (UnsupportedOperationException error) {
+            Assumptions.assumeTrue(false, "POSIX permissions are unavailable on this workstation");
+        }
+        run(repository, "git", "config", "core.filemode", "true");
+        run(repository, "git", "add", "run.sh");
+        assertEquals("100755", run(repository, "git", "ls-files", "--stage").split(" ")[0]);
+        run(repository, "git", "commit", "-qm", "executable script");
+
+        GitSnapshotAdapter adapter = new GitSnapshotAdapter(new ProcessRunner(), temp.resolve("executable-data").toString());
+        Snapshot snapshot = adapter.capture(Project.create(UUID.randomUUID(), "demo", repository, List.of(), Instant.now()));
+
+        assertEquals(GitFileMode.EXECUTABLE, GitFileMode.read(snapshot.materializedPath().resolve("run.sh")));
+        assertTrue(Files.isExecutable(snapshot.materializedPath().resolve("run.sh")));
+    }
+
+    @Test
+    void capturesModeChangesWhenRepositoryDisablesGitFilemodeDetection() throws Exception {
+        Path repository = initialise("filemode-disabled-repo");
+        Path script = repository.resolve("run.sh");
+        Files.writeString(script, "#!/bin/sh\necho run\n");
+        try {
+            Files.setPosixFilePermissions(script, java.util.Set.of(
+                    java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                    java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,
+                    java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE));
+        } catch (UnsupportedOperationException error) {
+            Assumptions.assumeTrue(false, "POSIX permissions are unavailable on this workstation");
+        }
+        run(repository, "git", "config", "core.filemode", "true");
+        run(repository, "git", "add", "run.sh");
+        run(repository, "git", "commit", "-qm", "executable script");
+        run(repository, "git", "config", "core.filemode", "false");
+        Files.setPosixFilePermissions(script, java.util.Set.of(
+                java.nio.file.attribute.PosixFilePermission.OWNER_READ,
+                java.nio.file.attribute.PosixFilePermission.OWNER_WRITE));
+
+        Snapshot snapshot = new GitSnapshotAdapter(new ProcessRunner(), temp.resolve("filemode-disabled-data").toString())
+                .capture(Project.create(UUID.randomUUID(), "demo", repository, List.of(), Instant.now()));
+
+        assertEquals(GitFileMode.REGULAR, GitFileMode.read(snapshot.materializedPath().resolve("run.sh")));
     }
 
     @Test
@@ -106,7 +163,7 @@ class GitSnapshotAdapterTest {
         run(repository, "git", "commit", "-qm", "initial");
 
         GitSnapshotAdapter adapter = new GitSnapshotAdapter(new ProcessRunner(), temp.resolve("tracked-sensitive-data").toString());
-        Snapshot snapshot = adapter.capture(Project.create("demo", repository, List.of(), Instant.now()));
+        Snapshot snapshot = adapter.capture(Project.create(java.util.UUID.randomUUID(), "demo", repository, List.of(), Instant.now()));
 
         assertFalse(Files.exists(snapshot.materializedPath().resolve(".env")));
         assertTrue(Files.exists(snapshot.materializedPath().resolve("safe.txt")));
@@ -124,7 +181,7 @@ class GitSnapshotAdapterTest {
         run(repository, "git", "commit", "-qm", "initial");
 
         GitSnapshotAdapter adapter = new GitSnapshotAdapter(new ProcessRunner(), temp.resolve("result-data").toString());
-        Project project = Project.create("demo", repository, List.of(), Instant.now());
+        Project project = Project.create(java.util.UUID.randomUUID(), "demo", repository, List.of(), Instant.now());
         CanonicalGitState canonicalBeforeBase = canonicalGitState(repository);
         Snapshot base = adapter.capture(project);
         assertEquals(canonicalBeforeBase, canonicalGitState(repository));
@@ -154,7 +211,7 @@ class GitSnapshotAdapterTest {
         run(repository, "git", "commit", "-qm", "initial");
 
         Snapshot snapshot = new GitSnapshotAdapter(new ProcessRunner(), temp.resolve("ignored-data").toString())
-                .capture(Project.create("demo", repository, List.of(), Instant.now()));
+                .capture(Project.create(java.util.UUID.randomUUID(), "demo", repository, List.of(), Instant.now()));
 
         assertTrue(snapshot.excludedFiles().stream().anyMatch(item -> item.path().equals("debug.log")
                 && item.reason().equals("git ignored")));
@@ -177,7 +234,7 @@ class GitSnapshotAdapterTest {
 
         DomainException error = assertThrows(DomainException.class, () ->
                 new GitSnapshotAdapter(new ProcessRunner(), temp.resolve("nested-data").toString())
-                        .capture(Project.create("demo", repository, List.of(), Instant.now())));
+                        .capture(Project.create(java.util.UUID.randomUUID(), "demo", repository, List.of(), Instant.now())));
 
         assertEquals("SNAPSHOT_GITLINK_UNSUPPORTED", error.code());
     }
@@ -192,7 +249,7 @@ class GitSnapshotAdapterTest {
         GitSnapshotAdapter lfsAdapter = new GitSnapshotAdapter(new ProcessRunner(), temp.resolve("lfs-data").toString());
 
         assertEquals("SNAPSHOT_LFS_UNSUPPORTED", assertThrows(DomainException.class,
-                () -> lfsAdapter.capture(Project.create("lfs", lfsRepository, List.of(), Instant.now()))).code());
+                () -> lfsAdapter.capture(Project.create(java.util.UUID.randomUUID(), "lfs", lfsRepository, List.of(), Instant.now()))).code());
         assertTrue(directoryIsEmpty(temp.resolve("lfs-data").resolve("snapshots")));
 
         Path largeRepository = initialise("large-repo");
@@ -202,7 +259,7 @@ class GitSnapshotAdapterTest {
         GitSnapshotAdapter largeAdapter = new GitSnapshotAdapter(new ProcessRunner(), temp.resolve("large-data").toString());
 
         assertEquals("SNAPSHOT_FILE_TOO_LARGE", assertThrows(DomainException.class,
-                () -> largeAdapter.capture(Project.create("large", largeRepository, List.of(), Instant.now()))).code());
+                () -> largeAdapter.capture(Project.create(java.util.UUID.randomUUID(), "large", largeRepository, List.of(), Instant.now()))).code());
         assertTrue(directoryIsEmpty(temp.resolve("large-data").resolve("snapshots")));
     }
 
@@ -248,7 +305,7 @@ class GitSnapshotAdapterTest {
 
         DomainException error = assertThrows(DomainException.class, () ->
                 new GitSnapshotAdapter(mutating, temp.resolve("race-data").toString())
-                        .capture(Project.create("race", repository, List.of(), Instant.now())));
+                        .capture(Project.create(java.util.UUID.randomUUID(), "race", repository, List.of(), Instant.now())));
 
         assertEquals("SNAPSHOT_RACED", error.code());
     }

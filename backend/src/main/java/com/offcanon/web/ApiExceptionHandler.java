@@ -12,6 +12,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
 import org.springframework.web.context.request.async.AsyncRequestTimeoutException;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -57,6 +58,11 @@ public class ApiExceptionHandler {
     @ExceptionHandler(IllegalArgumentException.class)
     public ProblemDetail invalidArgument(IllegalArgumentException error) {
         return problem(HttpStatus.BAD_REQUEST, "INVALID_ARGUMENT", error.getMessage(), Map.of());
+    }
+
+    @ExceptionHandler(NoResourceFoundException.class)
+    public ProblemDetail resourceNotFound(NoResourceFoundException error) {
+        return problem(HttpStatus.NOT_FOUND, "NOT_FOUND", "Resource not found: " + error.getResourcePath(), Map.of());
     }
 
     @ExceptionHandler({AsyncRequestTimeoutException.class, AsyncRequestNotUsableException.class})
