@@ -218,7 +218,14 @@ public class ProcessRunner {
     }
 
     private CompletableFuture<String> readAsync(InputStream stream) {
-        return CompletableFuture.supplyAsync(() -> {
+        // Process output is blocking I/O.  Do not consume the common
+        // ForkJoinPool here: several concurrent experiments can otherwise
+        // occupy every shared worker while waiting for child processes, which
+        // in turn prevents their pipes from being drained.  A short-lived
+        // virtual thread keeps the reader isolated without creating a
+        // platform-thread per command.
+        CompletableFuture<String> result = new CompletableFuture<>();
+        Thread.ofVirtual().name("offcanon-process-output").start(() -> {
             try (stream) {
                 ByteArrayOutputStream head = new ByteArrayOutputStream(Math.min(HEAD_CAPTURE_BYTES, 8192));
                 byte[] tail = new byte[TAIL_CAPTURE_BYTES];
@@ -254,16 +261,20 @@ public class ProcessRunner {
                 String headText = new String(headBytes, StandardCharsets.UTF_8);
                 String tailText = new String(tailBytes, StandardCharsets.UTF_8);
                 if (total > MAX_CAPTURE_BYTES) {
-                    return headText + "\n...[process output truncated; head/tail retained]...\n" + tailText;
+                    result.complete(headText + "\n...[process output truncated; head/tail retained]...\n" + tailText);
+                    return;
                 }
                 ByteArrayOutputStream output = new ByteArrayOutputStream(headBytes.length + tailBytes.length);
                 output.write(headBytes);
                 output.write(tailBytes);
-                return output.toString(StandardCharsets.UTF_8);
+                result.complete(output.toString(StandardCharsets.UTF_8));
             } catch (IOException e) {
-                throw new IllegalStateException("Unable to read process output", e);
+                result.completeExceptionally(new IllegalStateException("Unable to read process output", e));
+            } catch (RuntimeException e) {
+                result.completeExceptionally(e);
             }
         });
+        return result;
     }
 
     public record ProcessResult(

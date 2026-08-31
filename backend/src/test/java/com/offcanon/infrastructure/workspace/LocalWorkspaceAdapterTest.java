@@ -2,9 +2,11 @@ package com.offcanon.infrastructure.workspace;
 
 import com.offcanon.infrastructure.process.ProcessRunner;
 import com.offcanon.experiment.domain.Experiment;
+import com.offcanon.shared.domain.DomainException;
 import com.offcanon.workspace.domain.Snapshot;
 import com.offcanon.project.domain.Project;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
@@ -160,6 +162,28 @@ class LocalWorkspaceAdapterTest {
                 .resolve(experiment.id().toString())).isEmpty());
         assertTrue(children(temp.resolve("failed-derived-data").resolve("promotion-candidates")
                 .resolve(experiment.id().toString())).isEmpty());
+    }
+
+    @Test
+    void rejectsSymlinkedManagedRuntimeRoot() throws Exception {
+        Path data = Files.createDirectories(temp.resolve("symlink-data"));
+        Path outside = Files.createDirectories(temp.resolve("outside-runtime"));
+        try {
+            Files.createSymbolicLink(data.resolve("experiments"), outside);
+        } catch (Exception error) {
+            Assumptions.assumeTrue(false, "Directory symlinks are unavailable on this workstation");
+        }
+
+        Path source = Files.createDirectories(temp.resolve("symlink-source"));
+        Files.writeString(source.resolve("check.txt"), "content\n");
+        Snapshot snapshot = new Snapshot(UUID.randomUUID(), UUID.randomUUID(), "base", source,
+                Instant.now(), List.of("check.txt"), List.of());
+
+        DomainException error = assertThrows(DomainException.class,
+                () -> new LocalWorkspaceAdapter(data.toString()).materialize(snapshot, UUID.randomUUID()));
+
+        assertEquals("WORKSPACE_DESTINATION_INVALID", error.code());
+        assertTrue(children(outside).isEmpty(), "a symlinked runtime root must never receive files");
     }
 
     private List<Path> children(Path root) throws Exception {

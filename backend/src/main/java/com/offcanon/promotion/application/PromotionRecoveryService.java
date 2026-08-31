@@ -242,6 +242,31 @@ public class PromotionRecoveryService {
 
             String current = snapshots.currentFingerprint(project);
             assertPromotionLockHeld(project.id());
+            // A no-op promotion has identical base and candidate
+            // fingerprints. When its journal is still PREPARED, matching that
+            // fingerprint proves canonical was never changed; do not classify
+            // the experiment as stale just because the candidate equals base.
+            if (journal.phase() == PromotionPhase.PREPARED
+                    && journal.baseFingerprint().equals(current)) {
+                if (experiment.status() == ExperimentStatus.PROMOTED) {
+                    // A terminal PROMOTED marker contradicts a PREPARED
+                    // no-op journal. Preserve that inconsistency for an
+                    // explicit recovery decision instead of attempting an
+                    // illegal downgrade to VERIFIED.
+                    states.requireRecovery(experiment, journal,
+                            "Promotion is marked PROMOTED while its PREPARED journal still matches base", now);
+                    return new ManualReconciliation(journal.promotionId(),
+                            "RECOVERY_REQUIRED", "RECOVERY_REQUIRED", current,
+                            "Promotion state is inconsistent; manual reconciliation is required");
+                }
+                states.abortToBase(experiment, journal,
+                        "Canonical still matches the promotion base; no apply was observed", now);
+                Experiment settled = experiments.findById(experimentId).orElse(experiment);
+                return new ManualReconciliation(journal.promotionId(),
+                        settled.status() == ExperimentStatus.STALE ? "STALE" : settled.status().name(),
+                        "ABORTED", current,
+                        "Canonical matches the promotion base; no apply was observed");
+            }
             if (journal.candidateFingerprint().equals(current)) {
                 if (journal.phase() == PromotionPhase.PREPARED) {
                     // PREPARED proves that canonical apply had not started;
@@ -328,6 +353,40 @@ public class PromotionRecoveryService {
             // recovery worker still owns the project lock. Do not classify a
             // journal from a read that raced with lock expiry.
             assertPromotionLockHeld(project.id());
+            // For a PREPARED no-op journal, base equality is evidence that no
+            // canonical apply occurred. Handle it before the candidate check,
+            // since the candidate fingerprint is identical in that case.
+            if (journal.phase() == PromotionPhase.PREPARED
+                    && journal.baseFingerprint().equals(current)) {
+                if (experiment.status() == ExperimentStatus.PROMOTED) {
+                    // A terminal PROMOTED marker contradicts a PREPARED
+                    // no-op journal. Keep the ambiguity visible for manual
+                    // reconciliation instead of silently downgrading it.
+                    assertPromotionLockHeld(project.id());
+                    states.requireRecovery(experiment, journal,
+                            "Promotion is marked PROMOTED while its PREPARED journal still matches base", now);
+                    assertPromotionLockHeld(project.id());
+                    publish("PROMOTION_RECOVERY_REQUIRED", journal,
+                            Map.of("status", "RECOVERY_REQUIRED", "fingerprint", current));
+                    return;
+                }
+                if (experiment.status() == ExperimentStatus.VERIFIED
+                        || experiment.status() == ExperimentStatus.PREPARING_PROMOTION
+                        || experiment.status() == ExperimentStatus.PROMOTING
+                        || experiment.status() == ExperimentStatus.RECOVERY_REQUIRED
+                        || experiment.status() == ExperimentStatus.STALE) {
+                    assertPromotionLockHeld(project.id());
+                    states.abortToBase(experiment, journal,
+                            "Canonical still matches the promotion base; no apply was observed", now);
+                    assertPromotionLockHeld(project.id());
+                    Experiment settled = experiments.findById(experiment.id()).orElse(experiment);
+                    publish("PROMOTION_RECOVERED", journal,
+                            Map.of("status", settled.status().name(), "fingerprint", current));
+                    return;
+                }
+                throw new DomainException("PROMOTION_STATE_MISMATCH",
+                        "Cannot reconcile PREPARED promotion from " + experiment.status());
+            }
             if (journal.phase() == PromotionPhase.APPLYING && journal.candidateFingerprint().equals(current)) {
                 assertPromotionLockHeld(project.id());
                 states.commit(experiment, journal, current, now);

@@ -86,7 +86,11 @@ public class LocalDiffAdapter implements DiffPort {
     private Map<String, FileEntry> files(Path root) {
         Map<String, FileEntry> result = new HashMap<>();
         try {
-            if (root == null || !Files.isDirectory(root)) {
+            // The root itself is a capability boundary.  Files.isDirectory
+            // follows links by default; accepting a swapped root symlink would
+            // make an otherwise owner-scoped diff walk an unrelated tree.
+            if (root == null || Files.isSymbolicLink(root)
+                    || !Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)) {
                 throw new DomainException("DIFF_WORKSPACE_MISSING", "Diff workspace does not exist: " + root);
             }
             Files.walkFileTree(root, new SimpleFileVisitor<>() {

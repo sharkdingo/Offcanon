@@ -1,6 +1,7 @@
 package com.offcanon.identity.domain;
 
 import com.offcanon.shared.domain.ModelEndpointPolicy;
+import com.offcanon.shared.domain.ModelApiKeyPolicy;
 import com.offcanon.shared.domain.RuntimeSettingsPolicy;
 
 import java.time.Instant;
@@ -31,7 +32,7 @@ public record UserSettings(UUID userId,
         locale = locale.trim();
         modelEndpoint = modelEndpoint.trim();
         modelName = modelName.trim();
-        modelApiKey = modelApiKey.trim();
+        modelApiKey = ModelApiKeyPolicy.normalize(modelApiKey);
         if (!theme.equals("system") && !theme.equals("light") && !theme.equals("dark")) {
             throw new IllegalArgumentException("Theme must be system, light or dark");
         }
@@ -43,7 +44,6 @@ public record UserSettings(UUID userId,
             throw new IllegalArgumentException("Model endpoint must be an HTTP(S) URL without credentials, query or fragment");
         }
         if (modelName.length() > 200) throw new IllegalArgumentException("Model name is too long");
-        if (modelApiKey.length() > 4096) throw new IllegalArgumentException("Model API key is too long");
         if (agentMaxSteps < 1 || agentMaxSteps > 100) throw new IllegalArgumentException("Agent max steps must be between 1 and 100");
         if (agentRunTimeoutSeconds < 10 || agentRunTimeoutSeconds > 86_400) {
             throw new IllegalArgumentException("Agent run timeout must be between 10 and 86400 seconds");
@@ -83,4 +83,5 @@ public record UserSettings(UUID userId,
         return new UserSettings(userId, theme, locale, modelEndpoint, modelName, nextApiKey,
                 agentMaxSteps, agentRunTimeoutSeconds, contextLimitChars, now, version + 1);
     }
+
 }

@@ -14,6 +14,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
@@ -73,10 +74,16 @@ public class GitSnapshotAdapter implements SnapshotPort {
 
     @Override
     public void discard(Snapshot snapshot) {
+        if (snapshot == null || snapshot.id() == null || snapshot.materializedPath() == null) {
+            throw new DomainException("SNAPSHOT_DISCARD_REJECTED",
+                    "Temporary snapshot identity is missing");
+        }
         Path expected = dataRoot.resolve("snapshots").resolve(snapshot.id().toString())
                 .toAbsolutePath().normalize();
         Path actual = snapshot.materializedPath().toAbsolutePath().normalize();
-        if (!actual.equals(expected) || Files.isSymbolicLink(actual)) {
+        if (!actual.equals(expected) || Files.isSymbolicLink(actual)
+                || !hasNoSymbolicComponents(expected)
+                || !hasNoSymbolicComponents(actual)) {
             throw new DomainException("SNAPSHOT_DISCARD_REJECTED",
                     "Temporary snapshot is outside the managed snapshot directory");
         }
@@ -98,7 +105,14 @@ public class GitSnapshotAdapter implements SnapshotPort {
         Path snapshotPath = dataRoot.resolve("snapshots").resolve(snapshotId.toString());
         boolean completed = false;
         try {
-            Files.createDirectories(snapshotPath.getParent());
+            ensureManagedDirectory(snapshotPath.getParent());
+            if (Files.exists(snapshotPath, LinkOption.NOFOLLOW_LINKS)) {
+                throw new DomainException("SNAPSHOT_DESTINATION_INVALID",
+                        "Snapshot destination already exists");
+            }
+            // Reserve the leaf atomically before any content is copied.  This
+            // prevents a pre-existing link or directory from being reused.
+            Files.createDirectory(snapshotPath);
             Set<String> ignored = gitIgnored(project, source);
             String rawBefore = rawFingerprint(source, ignored);
             String before = fingerprint.get();
@@ -134,7 +148,8 @@ public class GitSnapshotAdapter implements SnapshotPort {
 
     private Path requireWorkspace(Path path) {
         if (path == null || Files.isSymbolicLink(path)
-                || !Files.isDirectory(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                || !Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)
+                || !hasNoSymbolicComponents(path)) {
             throw new DomainException("WORKSPACE_SOURCE_MISSING", "Workspace is not a directory: " + path);
         }
         try {
@@ -250,7 +265,20 @@ public class GitSnapshotAdapter implements SnapshotPort {
         Path objectDirectory = dataRoot.resolve("git-objects").resolve(project.id().toString())
                 .toAbsolutePath().normalize();
         try {
+            ensureManagedDirectory(objectDirectory.getParent());
+            if (Files.exists(objectDirectory, LinkOption.NOFOLLOW_LINKS)
+                    && (Files.isSymbolicLink(objectDirectory)
+                    || !Files.isDirectory(objectDirectory, LinkOption.NOFOLLOW_LINKS)
+                    || !hasNoSymbolicComponents(objectDirectory))) {
+                throw new DomainException("SNAPSHOT_OBJECT_STORE_INVALID",
+                        "Snapshot object storage must be a real directory");
+            }
             Files.createDirectories(objectDirectory);
+            if (!Files.isDirectory(objectDirectory, LinkOption.NOFOLLOW_LINKS)
+                    || !hasNoSymbolicComponents(objectDirectory)) {
+                throw new DomainException("SNAPSHOT_OBJECT_STORE_INVALID",
+                        "Snapshot object storage must be a real directory");
+            }
             ProcessRunner.ProcessResult commonDirResult = runGit(gitRoot, List.of("rev-parse", "--git-common-dir"));
             if (commonDirResult.exitCode() != 0 || commonDirResult.stdout().isBlank()) {
                 throw gitFailure("Unable to resolve canonical Git common directory", commonDirResult);
@@ -435,9 +463,18 @@ public class GitSnapshotAdapter implements SnapshotPort {
                                       Path destination,
                                       List<TreeEntry> treeFiles,
                                       List<String> included) throws IOException {
-        Files.createDirectories(destination);
+        if (Files.isSymbolicLink(destination)
+                || !Files.isDirectory(destination, LinkOption.NOFOLLOW_LINKS)
+                || !hasNoSymbolicComponents(destination)) {
+            throw new DomainException("SNAPSHOT_DESTINATION_INVALID",
+                    "Snapshot destination must be a real directory");
+        }
         Path realSource = source.toRealPath();
         Path realDestination = destination.toRealPath();
+        if (!realDestination.equals(destination.toAbsolutePath().normalize())) {
+            throw new DomainException("SNAPSHOT_PATH_ESCAPE",
+                    "Snapshot destination resolves outside its managed path");
+        }
         for (TreeEntry entry : treeFiles) {
             String relative = entry.relative();
             Path original = source.resolve(relative).normalize();
@@ -450,7 +487,7 @@ public class GitSnapshotAdapter implements SnapshotPort {
                 throw new DomainException("SNAPSHOT_PATH_ESCAPE", "Snapshot source path escapes workspace: " + relative);
             }
             validateSnapshotFile(original, relative);
-            Files.createDirectories(target.getParent());
+            createSafeDirectories(target.getParent(), destination);
             if (!target.getParent().toRealPath().startsWith(realDestination)
                     || (Files.exists(target, java.nio.file.LinkOption.NOFOLLOW_LINKS)
                     && (Files.isSymbolicLink(target) || !target.toRealPath().startsWith(realDestination)))) {
@@ -458,6 +495,11 @@ public class GitSnapshotAdapter implements SnapshotPort {
             }
             Files.copy(original, target, StandardCopyOption.REPLACE_EXISTING,
                     StandardCopyOption.COPY_ATTRIBUTES);
+            if (Files.isSymbolicLink(target)
+                    || !target.toRealPath().startsWith(realDestination)) {
+                throw new DomainException("SNAPSHOT_PATH_ESCAPE",
+                        "Snapshot target resolves outside destination: " + relative);
+            }
             // COPY_ATTRIBUTES is provider-dependent; apply the Git bit
             // explicitly so the materialized tree agrees with its tree hash.
             GitFileMode.apply(target, entry.mode());
@@ -605,8 +647,11 @@ public class GitSnapshotAdapter implements SnapshotPort {
     }
 
     private void deleteRecursively(Path path) throws IOException {
-        if (!Files.exists(path)) {
+        if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
             return;
+        }
+        if (Files.isSymbolicLink(path) || !hasNoSymbolicComponents(path)) {
+            throw new IOException("Refusing to delete a symbolic-link snapshot path");
         }
         Files.walkFileTree(path, new SimpleFileVisitor<>() {
             @Override
@@ -629,6 +674,56 @@ public class GitSnapshotAdapter implements SnapshotPort {
         } catch (IOException ignored) {
             // Best-effort cleanup. The immutable snapshot remains outside canonical.
         }
+    }
+
+    private void ensureManagedDirectory(Path directory) throws IOException {
+        if (directory == null || !hasNoSymbolicComponents(directory)) {
+            throw new DomainException("SNAPSHOT_DESTINATION_INVALID",
+                    "Snapshot runtime directory must not contain symbolic links");
+        }
+        Files.createDirectories(directory);
+        if (Files.isSymbolicLink(directory)
+                || !Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)
+                || !hasNoSymbolicComponents(directory)) {
+            throw new DomainException("SNAPSHOT_DESTINATION_INVALID",
+                    "Snapshot runtime directory must be a real directory");
+        }
+    }
+
+    private void createSafeDirectories(Path directory, Path root) throws IOException {
+        Path normalizedRoot = root.toAbsolutePath().normalize();
+        Path normalized = directory.toAbsolutePath().normalize();
+        if (!normalized.startsWith(normalizedRoot)
+                || !hasNoSymbolicComponents(normalizedRoot)) {
+            throw new DomainException("SNAPSHOT_PATH_ESCAPE",
+                    "Snapshot target escapes destination");
+        }
+        Path current = normalizedRoot;
+        Path relative = normalizedRoot.relativize(normalized);
+        for (Path part : relative) {
+            current = current.resolve(part.toString());
+            if (Files.exists(current, LinkOption.NOFOLLOW_LINKS)) {
+                if (Files.isSymbolicLink(current)
+                        || !Files.isDirectory(current, LinkOption.NOFOLLOW_LINKS)) {
+                    throw new DomainException("SNAPSHOT_PATH_ESCAPE",
+                            "Snapshot target contains an invalid directory component");
+                }
+            } else {
+                Files.createDirectory(current);
+            }
+        }
+    }
+
+    private boolean hasNoSymbolicComponents(Path path) {
+        Path current = path.toAbsolutePath().normalize();
+        while (current != null) {
+            if (Files.exists(current, LinkOption.NOFOLLOW_LINKS)
+                    && Files.isSymbolicLink(current)) {
+                return false;
+            }
+            current = current.getParent();
+        }
+        return true;
     }
 
     private record GitObjectStore(Path objectDirectory, Path canonicalObjects) {

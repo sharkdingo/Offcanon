@@ -1,10 +1,10 @@
 # Offcanon
 
-Offcanon is a local, experiment-first coding agent. It never gives an agent a writable handle to the canonical repository. Work happens in an isolated experiment workspace, the result is sealed, trusted checks run against that result, and only then can the user promote it to the canonical project.
+Offcanon is a local, experiment-first coding agent. It never gives an agent a writable handle to the canonical repository. Work happens in an isolated experiment workspace, the result is sealed, trusted checks run against that result, and only then can the user promote it to the canonical project. The desktop service is a single local instance with multiple application accounts; each account owns its projects, settings, experiments, and history, while all accounts still share the operating-system permissions of the user running the service.
 
 ## Storage
 
-Offcanon is a single-user desktop service with one application-owned SQLite database. On first start it creates:
+Offcanon is a single-instance desktop service with one application-owned SQLite database. On first start it creates:
 
 ```text
 %USERPROFILE%\.offcanon\
@@ -19,7 +19,7 @@ Offcanon is a single-user desktop service with one application-owned SQLite data
 
 SQLite is the only persistence engine; there are no storage profiles, external database services, `.env` files, or user-facing environment-variable configuration. SQLite is opened with WAL mode, foreign-key enforcement, and a busy timeout. Flyway owns the schema version; a new schema change is an explicit migration under `backend/src/main/resources/db/migration`.
 
-The database stores users, sessions, account settings, projects, experiments, evidence, run events, task-memory revisions, snapshots and promotion journals. Snapshot/workspace bytes remain on the local filesystem because they are large, disposable artifacts rather than relational data. The canonical repository remains in the directory selected by the user.
+The database stores users, sessions, account settings, projects, experiments, evidence, run events, task-memory revisions, snapshots and promotion journals. Snapshot/workspace bytes remain on the local filesystem because they are large, disposable artifacts rather than relational data. The canonical repository remains in the directory selected by the user. The Settings export is account-scoped, excludes passwords, session credentials and model keys, and redacts secret-looking values in command output and event payloads; intentionally bounded exports return a clear error when a collection exceeds the safety limit.
 
 ## User Configuration
 
@@ -30,7 +30,7 @@ Everything a normal user needs is available in the Settings screen:
 - theme, language, and bounded run defaults;
 - password rotation, non-secret history export, and cleanup of rebuildable runtime files.
 
-The server validates the Endpoint as an HTTP(S) base URL for OpenAI-compatible Chat Completions and appends `/chat/completions`; it sends the account's key only to that saved Endpoint. Data-directory and database-engine details are application-owned so a user does not need to install or administer infrastructure.
+The server validates the Endpoint as an HTTP(S) base URL for OpenAI-compatible Chat Completions and appends `/chat/completions`; it sends the account's key only to that saved Endpoint. Local/private endpoints are supported for local model servers such as Ollama. Keep the service bound to loopback unless you have an explicit network access policy, because an endpoint can intentionally target any address the host can reach. Data-directory and database-engine details are application-owned so a user does not need to install or administer infrastructure.
 
 ## Run Locally
 

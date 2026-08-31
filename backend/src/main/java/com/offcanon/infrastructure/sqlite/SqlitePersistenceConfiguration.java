@@ -11,7 +11,10 @@ import org.springframework.transaction.PlatformTransactionManager;
 
 import javax.sql.DataSource;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
+import java.util.EnumSet;
 
 /** Application-owned SQLite persistence. There is no external database to configure. */
 @Configuration
@@ -22,7 +25,21 @@ public class SqlitePersistenceConfiguration {
         try {
             java.util.Objects.requireNonNull(instanceLock, "instanceLock");
             Path root = Path.of(dataRoot).toAbsolutePath().normalize();
+            if (Files.isSymbolicLink(root)) {
+                throw new IllegalStateException("Offcanon data directory must not be a symbolic link");
+            }
             Files.createDirectories(root);
+            if (Files.isSymbolicLink(root) || !Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)) {
+                throw new IllegalStateException("Offcanon data directory must be a real directory");
+            }
+            try {
+                Files.setPosixFilePermissions(root, EnumSet.of(
+                        PosixFilePermission.OWNER_READ,
+                        PosixFilePermission.OWNER_WRITE,
+                        PosixFilePermission.OWNER_EXECUTE));
+            } catch (UnsupportedOperationException | java.io.IOException ignored) {
+                // Windows and other providers rely on inherited ACLs.
+            }
             HikariConfig config = new HikariConfig();
             config.setPoolName("offcanon-sqlite");
             config.setDriverClassName("org.sqlite.JDBC");

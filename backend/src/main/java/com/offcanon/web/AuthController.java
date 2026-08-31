@@ -2,7 +2,6 @@ package com.offcanon.web;
 
 import com.offcanon.identity.application.AuthApplicationService;
 import com.offcanon.identity.domain.User;
-import com.offcanon.identity.domain.UserSettings;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
@@ -28,24 +27,49 @@ public class AuthController {
 
     @PostMapping("/register")
     @ResponseStatus(HttpStatus.CREATED)
-    public AuthResponse register(@Valid @RequestBody CredentialsRequest request, HttpServletResponse servletResponse) {
+    public AuthResponse register(@Valid @RequestBody CredentialsRequest request,
+                                 HttpServletRequest servletRequest,
+                                 HttpServletResponse servletResponse) {
         AuthApplicationService.AuthResult result = auth.register(request.username(), request.password());
-        addSessionCookie(servletResponse, result);
+        addSessionCookie(servletRequest, servletResponse, result);
         return response(result);
     }
 
+    /** Package/test convenience overload for callers without an HTTP request. */
+    AuthResponse register(CredentialsRequest request, HttpServletResponse servletResponse) {
+        return register(request, null, servletResponse);
+    }
+
     @PostMapping("/login")
-    public AuthResponse login(@Valid @RequestBody CredentialsRequest request, HttpServletResponse servletResponse) {
+    public AuthResponse login(@Valid @RequestBody CredentialsRequest request,
+                              HttpServletRequest servletRequest,
+                              HttpServletResponse servletResponse) {
         AuthApplicationService.AuthResult result = auth.login(request.username(), request.password());
-        addSessionCookie(servletResponse, result);
+        addSessionCookie(servletRequest, servletResponse, result);
         return response(result);
+    }
+
+    /** Package/test convenience overload for callers without an HTTP request. */
+    AuthResponse login(CredentialsRequest request, HttpServletResponse servletResponse) {
+        return login(request, null, servletResponse);
     }
 
     @PostMapping("/logout")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void logout(HttpServletRequest request, HttpServletResponse servletResponse) {
-        auth.logout(authorization(request));
-        servletResponse.addHeader("Set-Cookie", "OFFCANON_SESSION=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict");
+        try {
+            // Logout is intentionally idempotent from the browser's point of
+            // view. An expired/revoked cookie must still be removed locally,
+            // rather than turning a harmless sign-out click into a 401.
+            try {
+                auth.logout(cookieAuthorizationOrNull(request));
+            } catch (com.offcanon.shared.web.UnauthorizedException ignored) {
+                // The session is already invalid; clearing the browser cookie
+                // is the only useful outcome.
+            }
+        } finally {
+            clearSessionCookie(request, servletResponse);
+        }
     }
 
     @GetMapping("/me")
@@ -59,7 +83,7 @@ public class AuthController {
                                HttpServletResponse servletResponse) {
         AuthApplicationService.AuthResult result = auth.changePassword(auth.authenticate(cookieAuthorization(servletRequest)),
                 request.currentPassword(), request.newPassword());
-        addSessionCookie(servletResponse, result);
+        addSessionCookie(servletRequest, servletResponse, result);
         return response(result);
     }
 
@@ -71,25 +95,58 @@ public class AuthController {
         return new UserResponse(user.id(), user.username(), user.createdAt());
     }
 
-    private void addSessionCookie(HttpServletResponse response, AuthApplicationService.AuthResult result) {
+    private void addSessionCookie(HttpServletRequest request,
+                                  HttpServletResponse response,
+                                  AuthApplicationService.AuthResult result) {
         long maxAge = Math.max(1, java.time.Duration.between(java.time.Instant.now(), result.expiresAt()).toSeconds());
         response.addHeader("Set-Cookie", "OFFCANON_SESSION=" + result.token()
-                + "; Max-Age=" + maxAge + "; Path=/; HttpOnly; SameSite=Strict");
+                + "; Max-Age=" + maxAge + "; Path=/; HttpOnly; SameSite=Strict"
+                + (request != null && request.isSecure() ? "; Secure" : ""));
     }
 
     private String cookieAuthorization(HttpServletRequest request) {
+        String token = null;
+        boolean found = false;
         if (request.getCookies() != null) {
             for (var cookie : request.getCookies()) {
-                if ("OFFCANON_SESSION".equals(cookie.getName()) && cookie.getValue() != null && !cookie.getValue().isBlank()) {
-                    return "Bearer " + cookie.getValue();
+                if ("OFFCANON_SESSION".equals(cookie.getName())) {
+                    if (found) {
+                        throw new com.offcanon.shared.web.UnauthorizedException("Session is invalid or expired");
+                    }
+                    found = true;
+                    if (cookie.getValue() != null && !cookie.getValue().isBlank()) {
+                        token = cookie.getValue();
+                    }
                 }
             }
         }
+        if (token != null) return "Bearer " + token;
         throw new com.offcanon.shared.web.UnauthorizedException("Authentication is required");
     }
 
     private String authorization(HttpServletRequest request) {
         return cookieAuthorization(request);
+    }
+
+    private String cookieAuthorizationOrNull(HttpServletRequest request) {
+        if (request.getCookies() == null) return null;
+        String token = null;
+        boolean found = false;
+        for (var cookie : request.getCookies()) {
+            if ("OFFCANON_SESSION".equals(cookie.getName())) {
+                if (found) return null;
+                found = true;
+                if (cookie.getValue() != null && !cookie.getValue().isBlank()) {
+                    token = cookie.getValue();
+                }
+            }
+        }
+        return token == null ? null : "Bearer " + token;
+    }
+
+    private void clearSessionCookie(HttpServletRequest request, HttpServletResponse response) {
+        response.addHeader("Set-Cookie", "OFFCANON_SESSION=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict"
+                + (request != null && request.isSecure() ? "; Secure" : ""));
     }
 
     public record CredentialsRequest(@NotBlank @Size(min = 3, max = 64) String username,

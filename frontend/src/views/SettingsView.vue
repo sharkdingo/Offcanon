@@ -17,11 +17,16 @@ const saving = ref(false)
 const saved = ref(false)
 const error = ref<string | null>(null)
 const modelStatus = ref<ModelConfigurationStatus | null>(null)
+const modelStatusLoading = ref(false)
+let modelStatusRequest = 0
 const runtimePolicy = ref<RuntimeSettingsPolicy | null>(null)
 const modelStatusError = ref<string | null>(null)
 const modelTest = ref<ModelTestResponse | null>(null)
 const testingModel = ref(false)
 const testedModelFingerprint = ref<string | null>(null)
+// Incrementing this revision keeps test results bound to the exact draft key
+// that was used without retaining the secret in a diagnostic fingerprint.
+const modelKeyRevision = ref(0)
 const savedSettings = ref<Pick<UserSettings, 'theme' | 'locale' | 'modelEndpoint' | 'modelName' | 'agentMaxSteps' | 'agentRunTimeoutSeconds' | 'contextLimitChars'> | null>(null)
 const modelApiKeyDraft = ref('')
 const modelApiKeyConfigured = ref(false)
@@ -32,9 +37,17 @@ const storageBusy = ref(false)
 const passwordForm = reactive({ currentPassword: '', newPassword: '', confirmPassword: '' })
 const passwordSaving = ref(false)
 const passwordMessage = ref<string | null>(null)
+const signingOut = ref(false)
 const showLeaveConfirm = ref(false)
 const showCleanupConfirm = ref(false)
+const showClearModelConfirm = ref(false)
 let pendingRoute: { path: string; replace?: boolean } | null = null
+const pendingSignOut = ref(false)
+// Re-showing the first-run guide is a navigation intent too. Keep it pending
+// until the user explicitly saves or discards the settings draft, so opening
+// the guide cannot mutate state behind the leave-confirmation dialog.
+const pendingOnboardingReset = ref(false)
+let allowRouteLeave = false
 const form = reactive({
   theme: 'system' as ThemeMode,
   locale: 'zh-CN' as 'zh-CN' | 'en-US',
@@ -46,7 +59,7 @@ const form = reactive({
 })
 
 function modelFingerprint(endpoint: string, model: string) {
-  return `${endpoint.trim()}\u0000${model.trim()}\u0000${modelApiKeyConfigured.value ? 'configured' : 'missing'}\u0000${modelApiKeyDraft.value ? 'draft' : 'saved'}`
+  return `${endpoint.trim()}\u0000${model.trim()}\u0000${modelApiKeyConfigured.value ? 'configured' : 'missing'}\u0000${modelKeyRevision.value}`
 }
 
 function applyForm(settings: UserSettings, persistAppearance = true) {
@@ -83,10 +96,18 @@ async function load() {
 }
 
 async function loadModelStatus() {
+  const requestId = ++modelStatusRequest
+  modelStatusError.value = null
+  modelStatusLoading.value = true
   try {
-    modelStatus.value = await api.modelStatus()
+    const status = await api.modelStatus()
+    if (requestId === modelStatusRequest) modelStatus.value = status
   } catch (cause) {
-    modelStatusError.value = formatError(cause, '无法读取模型状态。', 'Unable to read model status.')
+    if (requestId === modelStatusRequest) {
+      modelStatusError.value = formatError(cause, '无法读取模型状态。', 'Unable to read model status.')
+    }
+  } finally {
+    if (requestId === modelStatusRequest) modelStatusLoading.value = false
   }
 }
 
@@ -162,8 +183,14 @@ async function exportData() {
     const link = document.createElement('a')
     link.href = url
     link.download = 'offcanon-export-' + new Date().toISOString().slice(0, 10) + '.json'
+    document.body.appendChild(link)
     link.click()
-    URL.revokeObjectURL(url)
+    // Let the browser begin the download before removing the anchor or
+    // releasing the object URL.
+    window.setTimeout(() => {
+      link.remove()
+      URL.revokeObjectURL(url)
+    }, 0)
   } catch (cause) {
     error.value = formatError(cause, '无法导出数据。', 'Unable to export data.')
   } finally {
@@ -184,6 +211,7 @@ function setLocale(locale: 'zh-CN' | 'en-US') {
 }
 
 async function save() {
+  if (saving.value || modelApiKeySaving.value || !loaded.value || !settingsDirty.value) return
   saving.value = true
   saved.value = false
   error.value = null
@@ -203,21 +231,30 @@ async function save() {
 }
 
 async function testModel() {
+  if (testingModel.value || saving.value || modelApiKeySaving.value || !loaded.value) return
   testingModel.value = true
   modelTest.value = null
   modelStatusError.value = null
+  const requestFingerprint = modelFingerprint(form.modelEndpoint, form.modelName)
   try {
-    modelTest.value = await api.testModel({
+    const result = await api.testModel({
       modelEndpoint: form.modelEndpoint,
       modelName: form.modelName,
       apiKey: modelApiKeyDraft.value.trim() || undefined,
     })
-    testedModelFingerprint.value = modelFingerprint(form.modelEndpoint, form.modelName)
+    // A user can edit fields while a provider request is in flight. Never
+    // attach the response to a different draft than the one that was tested.
+    if (requestFingerprint === modelFingerprint(form.modelEndpoint, form.modelName)) {
+      modelTest.value = result
+      testedModelFingerprint.value = requestFingerprint
+    }
   } catch (cause) {
-    modelTest.value = {
-      reachable: false,
-      code: 'MODEL_CONNECTION_FAILED',
-      detail: formatError(cause, '模型连接测试失败。', 'The model connection test failed.'),
+    if (requestFingerprint === modelFingerprint(form.modelEndpoint, form.modelName)) {
+      modelTest.value = {
+        reachable: false,
+        code: 'MODEL_CONNECTION_FAILED',
+        detail: formatError(cause, '模型连接测试失败。', 'The model connection test failed.'),
+      }
     }
   } finally {
     testingModel.value = false
@@ -226,6 +263,7 @@ async function testModel() {
 
 async function clearModelApiKey() {
   if (!modelApiKeyConfigured.value || modelApiKeySaving.value || saving.value) return
+  showClearModelConfirm.value = false
   modelApiKeySaving.value = true
   error.value = null
   try {
@@ -234,6 +272,7 @@ async function clearModelApiKey() {
     modelApiKeyDraft.value = ''
     modelTest.value = null
     testedModelFingerprint.value = null
+    saved.value = false
     await loadModelStatus()
   } catch (cause) {
     error.value = formatError(cause, '无法清除模型密钥。', 'Unable to clear model key.')
@@ -242,7 +281,14 @@ async function clearModelApiKey() {
   }
 }
 
+function requestClearModelApiKey() {
+  if (!modelApiKeyConfigured.value || modelApiKeySaving.value || saving.value) return
+  showClearModelConfirm.value = true
+}
+
 const modelReady = computed(() => Boolean(modelStatus.value?.apiKeyConfigured
+  && !modelStatusLoading.value
+  && !modelStatusError.value
   && modelStatus.value.endpointConfigured
   && modelStatus.value.modelConfigured
   && modelStatus.value.endpointValid))
@@ -271,6 +317,7 @@ const modelReadyForDraft = computed(() => modelReady.value && !modelDraftChanged
 const modelTestIsCurrent = computed(() => testedModelFingerprint.value === modelFingerprint(form.modelEndpoint, form.modelName))
 
 function resetDraft() {
+  if (saving.value || modelApiKeySaving.value || passwordSaving.value || storageBusy.value) return
   const baseline = savedSettings.value
   if (!baseline) return
   form.theme = baseline.theme
@@ -292,14 +339,52 @@ watch(() => [form.modelEndpoint, form.modelName, modelApiKeyDraft.value], () => 
   if (!modelTestIsCurrent.value) modelTest.value = null
 })
 
+watch(modelApiKeyDraft, (next, previous) => {
+  if (next === previous) return
+  modelKeyRevision.value += 1
+  modelTest.value = null
+  testedModelFingerprint.value = null
+})
+
 function resetOnboarding() {
+  if (saving.value || modelApiKeySaving.value || passwordSaving.value || storageBusy.value || signingOut.value) return
+  if (settingsDirty.value) {
+    pendingRoute = null
+    pendingSignOut.value = false
+    pendingOnboardingReset.value = true
+    showLeaveConfirm.value = true
+    return
+  }
+  performOnboardingReset()
+}
+
+function performOnboardingReset() {
   auth.resetOnboarding()
   void router.replace({ name: 'home' })
 }
 
-async function signOut() {
-  await auth.signOut()
-  await router.replace({ name: 'home' })
+async function performSignOut() {
+  if (signingOut.value) return
+  signingOut.value = true
+  pendingSignOut.value = false
+  try {
+    await auth.signOut()
+    await router.replace({ name: 'home' })
+  } finally {
+    signingOut.value = false
+  }
+}
+
+function requestSignOut() {
+  if (saving.value || modelApiKeySaving.value || passwordSaving.value || storageBusy.value || signingOut.value) return
+  if (settingsDirty.value) {
+    pendingRoute = null
+    pendingSignOut.value = true
+    pendingOnboardingReset.value = false
+    showLeaveConfirm.value = true
+    return
+  }
+  void performSignOut()
 }
 
 function toggleLocale() {
@@ -310,6 +395,8 @@ function backToWorkspace() {
   if (settingsDirty.value) {
     showLeaveConfirm.value = true
     pendingRoute = null
+    pendingSignOut.value = false
+    pendingOnboardingReset.value = false
     return
   }
   void router.push(workspaceTarget())
@@ -325,31 +412,80 @@ function workspaceTarget() {
 
 function discardAndLeave() {
   const target = pendingRoute
+  const signOutAfter = pendingSignOut.value
+  const resetOnboardingAfter = pendingOnboardingReset.value
   pendingRoute = null
+  pendingSignOut.value = false
+  pendingOnboardingReset.value = false
   showLeaveConfirm.value = false
   resetDraft()
-  void router.push(target?.path ?? router.resolve(workspaceTarget()).fullPath)
+  if (signOutAfter) {
+    void performSignOut()
+    return
+  }
+  if (resetOnboardingAfter) {
+    performOnboardingReset()
+    return
+  }
+  allowRouteLeave = true
+  void router.push(target?.path ?? router.resolve(workspaceTarget()).fullPath).finally(() => { allowRouteLeave = false })
 }
 
 function saveAndLeave() {
+  if (saving.value || modelApiKeySaving.value || passwordSaving.value || storageBusy.value) return
   const target = pendingRoute
-  pendingRoute = null
+  const signOutAfter = pendingSignOut.value
+  const resetOnboardingAfter = pendingOnboardingReset.value
   showLeaveConfirm.value = false
   void save().then(() => {
-    if (!error.value) void router.push(target?.path ?? router.resolve(workspaceTarget()).fullPath)
-    else showLeaveConfirm.value = true
+    if (!error.value) {
+      pendingRoute = null
+      pendingSignOut.value = false
+      pendingOnboardingReset.value = false
+      if (signOutAfter) {
+        void performSignOut()
+        return
+      }
+      if (resetOnboardingAfter) {
+        performOnboardingReset()
+        return
+      }
+      allowRouteLeave = true
+      void router.push(target?.path ?? router.resolve(workspaceTarget()).fullPath).finally(() => { allowRouteLeave = false })
+    } else {
+      // Keep the original destination so a failed save can be retried without
+      // silently changing where the user intended to go.
+      pendingRoute = target
+      pendingSignOut.value = signOutAfter
+      pendingOnboardingReset.value = resetOnboardingAfter
+      showLeaveConfirm.value = true
+    }
   })
 }
 
 onBeforeRouteLeave((to) => {
-  if (!settingsDirty.value || showLeaveConfirm.value) return true
+  if (allowRouteLeave) {
+    allowRouteLeave = false
+    return true
+  }
+  // A save or credential deletion owns the current draft until it settles.
+  // Block browser-back and programmatic navigation rather than opening a
+  // second leave decision that could discard a request still in flight.
+  if (saving.value || modelApiKeySaving.value || passwordSaving.value || storageBusy.value || signingOut.value) return false
+  // Keep any existing modal decision in place. A browser-back action must not
+  // stack a second dialog behind the cleanup/key-confirmation dialog.
+  if (showLeaveConfirm.value || showCleanupConfirm.value || showClearModelConfirm.value) return false
+  if (!settingsDirty.value) return true
   showLeaveConfirm.value = true
   pendingRoute = { path: to.fullPath }
   return false
 })
 
-function leaveToPendingRoute() {
-  discardAndLeave()
+function stayOnSettings() {
+  showLeaveConfirm.value = false
+  pendingRoute = null
+  pendingSignOut.value = false
+  pendingOnboardingReset.value = false
 }
 
 function handleBeforeUnload(event: BeforeUnloadEvent) {
@@ -369,7 +505,7 @@ onBeforeUnmount(() => {
   // A settings draft previews appearance locally, but leaving without saving
   // must not leak that preview into the next screen or account.
   const baseline = savedSettings.value
-  if (baseline) {
+  if (baseline && auth.isAuthenticated) {
     auth.applyTheme(baseline.theme, false)
     auth.applyLocale(baseline.locale, false)
   }
@@ -379,13 +515,13 @@ onBeforeUnmount(() => {
 <template>
   <div class="settings-shell">
     <header class="settings-topbar">
-        <button class="brand-lockup" :aria-label="isZh ? '返回工作区' : 'Back to workspace'" :title="isZh ? '返回工作区' : 'Back to workspace'" @click="backToWorkspace">
+        <button class="brand-lockup" :disabled="saving || modelApiKeySaving || passwordSaving || storageBusy || signingOut" :aria-label="isZh ? '返回工作区' : 'Back to workspace'" :title="isZh ? '返回工作区' : 'Back to workspace'" @click="backToWorkspace">
         <span class="brand-mark">O</span>
         <span><strong>Offcanon</strong><small>{{ isZh ? '项目列表' : 'project list' }}</small></span>
       </button>
       <div class="settings-topbar-actions">
-        <button class="icon-button" :aria-label="isZh ? '切换语言' : 'Switch language'" :title="isZh ? 'English' : '中文'" @click="toggleLocale"><Languages :size="16" /></button>
-        <button class="icon-button" :aria-label="isZh ? '返回工作区' : 'Back to workspace'" :title="isZh ? '返回工作区' : 'Back to workspace'" @click="backToWorkspace"><ArrowLeft :size="17" /></button>
+        <button class="icon-button" :disabled="saving || modelApiKeySaving || passwordSaving || storageBusy || signingOut" :aria-label="isZh ? '切换语言' : 'Switch language'" :title="isZh ? 'English' : '中文'" @click="toggleLocale"><Languages :size="16" /></button>
+        <button class="icon-button" :disabled="saving || modelApiKeySaving || passwordSaving || storageBusy || signingOut" :aria-label="isZh ? '返回工作区' : 'Back to workspace'" :title="isZh ? '返回工作区' : 'Back to workspace'" @click="backToWorkspace"><ArrowLeft :size="17" /></button>
       </div>
     </header>
 
@@ -411,6 +547,7 @@ onBeforeUnmount(() => {
       </section>
 
       <form @submit.prevent="save">
+      <fieldset class="settings-fields" :disabled="!loaded || saving || modelApiKeySaving">
       <section class="settings-section" aria-labelledby="appearance-heading">
         <div class="settings-section-heading"><Sun :size="17" /><div><h2 id="appearance-heading">{{ isZh ? '外观与语言' : 'Appearance & language' }}</h2></div></div>
         <div class="settings-control-row">
@@ -443,25 +580,27 @@ onBeforeUnmount(() => {
       <section class="settings-section" aria-labelledby="model-heading">
         <div class="settings-section-heading"><KeyRound :size="17" /><div><h2 id="model-heading">{{ isZh ? '模型连接' : 'Model connection' }}</h2><p>{{ isZh ? '使用 OpenAI 兼容的 Chat Completions 服务；Endpoint、模型名和 API key 都保存在当前账户中。' : 'Use an OpenAI-compatible Chat Completions service; the endpoint, model name, and API key are saved to this account.' }}</p></div></div>
         <div class="settings-form-grid model-grid">
-          <label><span>{{ isZh ? 'OpenAI 兼容 Endpoint' : 'OpenAI-compatible Endpoint' }} <small>{{ isZh ? '服务端会请求 /chat/completions' : 'the server calls /chat/completions' }}</small></span><input v-model.trim="form.modelEndpoint" type="url" autocomplete="url" placeholder="https://provider.example/v1" /></label>
+          <label><span>{{ isZh ? 'OpenAI 兼容 Endpoint' : 'OpenAI-compatible Endpoint' }} <small>{{ isZh ? '服务端会请求 /chat/completions' : 'the server calls /chat/completions' }}</small></span><input v-model.trim="form.modelEndpoint" type="url" autocomplete="url" maxlength="2048" placeholder="https://provider.example/v1" /></label>
           <label><span>Model <small>{{ isZh ? '要使用的模型标识' : 'model identifier to use' }}</small></span><input v-model.trim="form.modelName" autocomplete="off" placeholder="provider-model-id" maxlength="200" /></label>
-          <label><span>API key <small>{{ isZh ? '仅显示输入框，不会回显已保存密钥' : 'saved securely; never echoed back' }}</small></span><input v-model="modelApiKeyDraft" type="password" autocomplete="new-password" :placeholder="modelApiKeyConfigured ? (isZh ? '已配置，输入新密钥可替换' : 'Configured; enter a new key to replace') : (isZh ? '输入服务商密钥' : 'Enter provider key')" /></label>
+          <label><span>API key <small>{{ isZh ? '仅显示输入框，不会回显已保存密钥' : 'saved securely; never echoed back' }}</small></span><input v-model="modelApiKeyDraft" type="password" autocomplete="new-password" maxlength="4096" :placeholder="modelApiKeyConfigured ? (isZh ? '已配置，输入新密钥可替换' : 'Configured; enter a new key to replace') : (isZh ? '输入服务商密钥' : 'Enter provider key')" /></label>
         </div>
-        <p class="field-help model-input-help">{{ isZh ? 'Endpoint 必须是 HTTP(S) 基础地址，不能包含凭据、查询参数或片段；服务端会向它追加 /chat/completions。API key 仅在后端加密保存，并只发送到你选择的 Endpoint。' : 'Use an HTTP(S) base URL without credentials, query parameters, or fragments; the server appends /chat/completions. The API key is encrypted on the server and sent only to your selected endpoint.' }}</p>
+        <p class="field-help model-input-help">{{ isZh ? 'Endpoint 必须是 HTTP(S) 基础地址，不能包含凭据、查询参数或片段；服务端会向它追加 /chat/completions。API key 仅在后端加密保存，使用可发送的 ASCII 字符，并只发送到你选择的 Endpoint。' : 'Use an HTTP(S) base URL without credentials, query parameters, or fragments; the server appends /chat/completions. The API key is encrypted on the server, must use printable ASCII characters, and is sent only to your selected endpoint.' }}</p>
         <div class="settings-model-actions">
-          <button type="button" class="button danger-ghost" :disabled="!modelApiKeyConfigured || modelApiKeySaving || saving" @click="clearModelApiKey"><Trash2 :size="15" />{{ isZh ? '清除 API key' : 'Clear API key' }}</button>
+          <button type="button" class="button danger-ghost" :disabled="!modelApiKeyConfigured || modelApiKeySaving || saving" @click="requestClearModelApiKey"><Trash2 :size="15" />{{ isZh ? '清除 API key' : 'Clear API key' }}</button>
         </div>
-        <dl v-if="modelStatus" class="settings-details model-effective-details">
+        <dl v-if="modelStatus && !modelStatusLoading && !modelStatusError" class="settings-details model-effective-details">
           <div><dt>{{ isZh ? '当前生效 Endpoint' : 'Effective endpoint' }}</dt><dd><code>{{ modelStatus.endpoint || (isZh ? '未配置' : 'Not configured') }}</code></dd></div>
           <div><dt>{{ isZh ? '当前生效模型' : 'Effective model' }}</dt><dd><code>{{ modelStatus.model || (isZh ? '未配置' : 'Not configured') }}</code></dd></div>
           <div><dt>{{ isZh ? '密钥状态' : 'API key' }}</dt><dd>{{ modelStatus.apiKeyConfigured ? (isZh ? '已配置' : 'Configured') : (isZh ? '未配置' : 'Not configured') }}</dd></div>
         </dl>
         <div class="settings-gate" :class="{ ready: modelReadyForDraft, error: modelStatusError || (modelTest && !modelTest.reachable) }" role="status">
-          <ShieldCheck v-if="modelReadyForDraft" :size="17" />
+          <LoaderCircle v-if="modelStatusLoading" class="spin" :size="17" />
+          <ShieldCheck v-else-if="modelReadyForDraft" :size="17" />
           <AlertTriangle v-else :size="17" />
           <div>
             <strong>{{ modelReadyForDraft ? (isZh ? '模型配置可用' : 'Model configuration is ready') : (isZh ? '模型配置尚未就绪' : 'Model configuration needs attention') }}</strong>
-            <span v-if="modelStatusError">{{ modelStatusError }}</span>
+            <span v-if="modelStatusLoading">{{ isZh ? '正在读取服务端配置。' : 'Reading server configuration.' }}</span>
+            <span v-else-if="modelStatusError">{{ modelStatusError }}</span>
             <span v-else-if="!modelStatus">{{ isZh ? '正在读取服务端配置。' : 'Reading server configuration.' }}</span>
             <span v-else-if="!modelStatus.apiKeyConfigured">{{ isZh ? '请在此处保存模型 API key。' : 'Save a model API key here.' }}</span>
             <span v-else-if="!modelStatus.endpointConfigured || !modelStatus.modelConfigured">{{ isZh ? '请填写 endpoint 和模型名。' : 'Set an endpoint and model name.' }}</span>
@@ -473,7 +612,7 @@ onBeforeUnmount(() => {
         </div>
         <p v-if="modelDraftChanged" class="field-help model-draft-help">{{ isZh ? '模型草稿尚未保存；当前生效状态仍以上方已保存配置为准。' : 'The model draft is not saved; the effective status above still reflects the saved configuration.' }}</p>
         <div class="settings-model-actions">
-          <button type="button" class="button secondary" :disabled="testingModel || !loaded" @click="testModel">
+          <button type="button" class="button secondary" :disabled="testingModel || saving || modelApiKeySaving || !loaded" @click="testModel">
             <LoaderCircle v-if="testingModel" class="spin" :size="15" /><RefreshCw v-else :size="15" />
             {{ testingModel ? (isZh ? '测试中...' : 'Testing...') : (isZh ? '测试模型连接' : 'Test model connection') }}
           </button>
@@ -481,8 +620,9 @@ onBeforeUnmount(() => {
           <span v-else-if="modelTest" class="settings-model-result error" role="status">{{ isZh ? '模型字段已变化，请重新测试。' : 'Model fields changed; test again.' }}</span>
         </div>
       </section>
+      </fieldset>
 
-      <div class="settings-save-row"><button type="button" class="button secondary" :disabled="saving || !loaded || !settingsDirty" @click="resetDraft"><RotateCcw :size="15" />{{ isZh ? '撤销草稿' : 'Discard draft' }}</button><button type="submit" class="button primary" :disabled="saving || !loaded || !settingsDirty"><Save :size="15" />{{ saving ? (isZh ? '保存中...' : 'Saving...') : (isZh ? '保存设置' : 'Save settings') }}</button></div>
+      <div class="settings-save-row"><button type="button" class="button secondary" :disabled="saving || modelApiKeySaving || !loaded || !settingsDirty" @click="resetDraft"><RotateCcw :size="15" />{{ isZh ? '撤销草稿' : 'Discard draft' }}</button><button type="submit" class="button primary" :disabled="saving || modelApiKeySaving || !loaded || !settingsDirty"><Save :size="15" />{{ saving ? (isZh ? '保存中...' : 'Saving...') : (isZh ? '保存设置' : 'Save settings') }}</button></div>
       </form>
 
       <section class="settings-section" aria-labelledby="security-heading">
@@ -497,35 +637,37 @@ onBeforeUnmount(() => {
       </section>
 
       <section class="settings-section" aria-labelledby="storage-heading">
-        <div class="settings-section-heading"><Database :size="17" /><div><h2 id="storage-heading">{{ isZh ? '数据与存储' : 'Data & storage' }}</h2><p>{{ isZh ? '历史记录保存在本机；导出不包含模型 API key。' : 'History is stored on this machine; exports never include the model API key.' }}</p></div></div>
+        <div class="settings-section-heading"><Database :size="17" /><div><h2 id="storage-heading">{{ isZh ? '数据与存储' : 'Data & storage' }}</h2><p>{{ isZh ? '历史记录保存在本机；导出会移除密钥并对敏感输出脱敏。' : 'History is stored on this machine; exports omit keys and redact sensitive output.' }}</p></div></div>
         <dl v-if="storage" class="settings-details storage-details">
           <div><dt>{{ isZh ? '项目' : 'Projects' }}</dt><dd>{{ storage.projects }}</dd></div>
           <div><dt>{{ isZh ? '会话 / 实验' : 'Sessions / experiments' }}</dt><dd>{{ storage.sessions }} / {{ storage.experiments }}</dd></div>
           <div><dt>{{ isZh ? '验证证据 / 活动' : 'Evidence / events' }}</dt><dd>{{ storage.evidence }} / {{ storage.events }}</dd></div>
           <div><dt>{{ isZh ? '任务记忆修订' : 'Memory revisions' }}</dt><dd>{{ storage.memoryRevisions }}</dd></div>
+          <div><dt>{{ isZh ? '历史快照' : 'Historical snapshots' }}</dt><dd>{{ storage.snapshots }}</dd></div>
         </dl>
         <p v-else-if="storageLoading" class="field-help">{{ isZh ? '正在读取数据概览...' : 'Reading data summary...' }}</p>
-        <p class="field-help storage-help">{{ isZh ? '“清理运行文件”只移除可重建的临时工作区，不会删除项目、实验、证据或审计历史。' : 'Clean runtime files removes only rebuildable temporary workspaces; projects, experiments, evidence, and audit history stay intact.' }}</p>
+        <p class="field-help storage-help">{{ isZh ? '“清理运行文件”只移除可重建的临时工作区，不会删除项目、实验、证据、快照或审计历史。导出有安全大小上限，过大时会明确提示，不会截断成看似完整的文件。' : 'Clean runtime files removes only rebuildable temporary workspaces; projects, experiments, evidence, snapshots, and audit history stay intact. Exports have a safety size limit and fail clearly instead of producing a misleading partial file.' }}</p>
         <div class="settings-action-row storage-actions"><button type="button" class="button secondary" :disabled="storageBusy" @click="exportData"><Download :size="15" />{{ isZh ? '导出历史 JSON' : 'Export history JSON' }}</button><button type="button" class="button danger-ghost" :disabled="storageBusy" @click="requestCleanupRuntime"><Trash2 :size="15" />{{ isZh ? '清理运行文件' : 'Clean runtime files' }}</button></div>
       </section>
       <section class="settings-section settings-actions" aria-labelledby="first-run-heading">
         <div class="settings-section-heading"><RotateCcw :size="17" /><div><h2 id="first-run-heading">{{ isZh ? '首次使用' : 'First run' }}</h2><p>{{ isZh ? '重新显示首次使用引导。' : 'Show the first-run guide again.' }}</p></div></div>
         <div class="settings-action-row">
           <button class="button secondary" @click="resetOnboarding"><RotateCcw :size="15" /> {{ isZh ? '重新查看引导' : 'Show first-run guide' }}</button>
-          <button class="button danger-ghost" @click="signOut"><LogOut :size="15" /> {{ isZh ? '退出登录' : 'Sign out' }}</button>
+          <button class="button danger-ghost" :disabled="saving || modelApiKeySaving || passwordSaving || storageBusy || signingOut" @click="requestSignOut"><LoaderCircle v-if="signingOut" class="spin" :size="15" /><LogOut v-else :size="15" /> {{ signingOut ? (isZh ? '退出中...' : 'Signing out...') : (isZh ? '退出登录' : 'Sign out') }}</button>
         </div>
       </section>
     </main>
-    <BaseDialog v-if="showLeaveConfirm" labelled-by="settings-leave-title" described-by="settings-leave-description" @close="showLeaveConfirm = false">
+    <BaseDialog v-if="showLeaveConfirm" labelled-by="settings-leave-title" described-by="settings-leave-description" @close="stayOnSettings">
       <div class="dialog-form">
         <header class="dialog-header">
-          <div class="dialog-heading"><span class="dialog-icon warning"><AlertTriangle :size="17" /></span><div><p class="eyebrow">{{ isZh ? '未保存草稿' : 'UNSAVED DRAFT' }}</p><h2 id="settings-leave-title">{{ isZh ? '离开设置？' : 'Leave Settings?' }}</h2></div></div>
+          <div class="dialog-heading"><span class="dialog-icon warning"><AlertTriangle :size="17" /></span><div><p class="eyebrow">{{ pendingSignOut ? (isZh ? '退出登录' : 'SIGN OUT') : pendingOnboardingReset ? (isZh ? '首次使用' : 'FIRST RUN') : (isZh ? '未保存草稿' : 'UNSAVED DRAFT') }}</p><h2 id="settings-leave-title">{{ pendingSignOut ? (isZh ? '退出并处理草稿？' : 'Sign out with this draft?') : pendingOnboardingReset ? (isZh ? '显示引导并处理草稿？' : 'Show the guide with this draft?') : (isZh ? '离开设置？' : 'Leave Settings?') }}</h2></div></div>
         </header>
-        <p id="settings-leave-description" class="dialog-description">{{ isZh ? '你对设置的修改尚未保存。选择保存后离开、放弃更改，或留在此页继续编辑。' : 'Your settings changes are not saved. Save and leave, discard them, or stay to keep editing.' }}</p>
+        <p id="settings-leave-description" class="dialog-description">{{ pendingSignOut ? (isZh ? '你对设置的修改尚未保存。选择保存并退出、放弃更改并退出，或留在此页继续编辑。' : 'Your settings changes are not saved. Save and sign out, discard them and sign out, or stay to keep editing.') : pendingOnboardingReset ? (isZh ? '你对设置的修改尚未保存。选择保存并显示引导、放弃更改并显示引导，或留在此页继续编辑。' : 'Your settings changes are not saved. Save and show the guide, discard them and show the guide, or stay to keep editing.') : (isZh ? '你对设置的修改尚未保存。选择保存后离开、放弃更改，或留在此页继续编辑。' : 'Your settings changes are not saved. Save and leave, discard them, or stay to keep editing.') }}</p>
+        <p v-if="error" class="field-error" role="alert">{{ error }}</p>
         <div class="dialog-actions settings-leave-actions">
-          <button type="button" class="button secondary" autofocus @click="showLeaveConfirm = false">{{ isZh ? '留在此页' : 'Stay' }}</button>
-          <button type="button" class="button danger-ghost" @click="discardAndLeave">{{ isZh ? '放弃更改' : 'Discard changes' }}</button>
-          <button type="button" class="button primary" :disabled="saving" @click="saveAndLeave"><Save :size="15" />{{ saving ? (isZh ? '保存中...' : 'Saving...') : (isZh ? '保存并离开' : 'Save and leave') }}</button>
+          <button type="button" class="button secondary" autofocus @click="stayOnSettings">{{ isZh ? '留在此页' : 'Stay' }}</button>
+          <button type="button" class="button danger-ghost" @click="discardAndLeave">{{ pendingSignOut ? (isZh ? '放弃并退出' : 'Discard & sign out') : pendingOnboardingReset ? (isZh ? '放弃并显示引导' : 'Discard & show guide') : (isZh ? '放弃更改' : 'Discard changes') }}</button>
+          <button type="button" class="button primary" :disabled="saving || modelApiKeySaving" @click="saveAndLeave"><Save :size="15" />{{ saving ? (isZh ? '保存中...' : 'Saving...') : pendingSignOut ? (isZh ? '保存并退出' : 'Save & sign out') : pendingOnboardingReset ? (isZh ? '保存并显示引导' : 'Save & show guide') : (isZh ? '保存并离开' : 'Save and leave') }}</button>
         </div>
       </div>
     </BaseDialog>
@@ -534,10 +676,22 @@ onBeforeUnmount(() => {
         <header class="dialog-header">
           <div class="dialog-heading"><span class="dialog-icon warning"><Trash2 :size="17" /></span><div><p class="eyebrow">{{ isZh ? '数据与存储' : 'DATA & STORAGE' }}</p><h2 id="settings-cleanup-title">{{ isZh ? '清理运行文件？' : 'Clean runtime files?' }}</h2></div></div>
         </header>
-        <p id="settings-cleanup-description" class="dialog-description">{{ isZh ? '这只会移除可重建的临时隔离工作区和运行文件。项目、会话、实验、证据、活动记录和任务记忆都会保留。' : 'This removes only rebuildable temporary workspaces and runtime files. Projects, sessions, experiments, evidence, activity, and task memory are kept.' }}</p>
+        <p id="settings-cleanup-description" class="dialog-description">{{ isZh ? '这只会移除可重建的临时隔离工作区和运行文件。项目、会话、实验、证据、历史快照、活动记录和任务记忆都会保留。' : 'This removes only rebuildable temporary workspaces and runtime files. Projects, sessions, experiments, evidence, historical snapshots, activity, and task memory are kept.' }}</p>
         <div class="dialog-actions settings-leave-actions">
           <button type="button" class="button secondary" autofocus @click="showCleanupConfirm = false">{{ isZh ? '取消' : 'Cancel' }}</button>
           <button type="button" class="button danger-ghost" @click="cleanupRuntime"><Trash2 :size="15" />{{ isZh ? '确认清理' : 'Clean files' }}</button>
+        </div>
+      </div>
+    </BaseDialog>
+    <BaseDialog v-if="showClearModelConfirm" labelled-by="settings-clear-model-title" described-by="settings-clear-model-description" @close="showClearModelConfirm = false">
+      <div class="dialog-form">
+        <header class="dialog-header">
+          <div class="dialog-heading"><span class="dialog-icon warning"><Trash2 :size="17" /></span><div><p class="eyebrow">{{ isZh ? '模型连接' : 'MODEL CONNECTION' }}</p><h2 id="settings-clear-model-title">{{ isZh ? '清除 API key？' : 'Clear API key?' }}</h2></div></div>
+        </header>
+        <p id="settings-clear-model-description" class="dialog-description">{{ isZh ? '清除后，新实验和尚未启动的任务将无法调用模型，直到你重新输入并保存 API key。当前项目和历史记录不会受到影响。' : 'New experiments and runs that have not started cannot call the model until you enter and save an API key again. Existing projects and history are not affected.' }}</p>
+        <div class="dialog-actions settings-leave-actions">
+          <button type="button" class="button secondary" autofocus @click="showClearModelConfirm = false">{{ isZh ? '取消' : 'Cancel' }}</button>
+          <button type="button" class="button danger-ghost" :disabled="modelApiKeySaving" @click="clearModelApiKey"><Trash2 :size="15" />{{ modelApiKeySaving ? (isZh ? '清除中...' : 'Clearing...') : (isZh ? '确认清除' : 'Clear key') }}</button>
         </div>
       </div>
     </BaseDialog>

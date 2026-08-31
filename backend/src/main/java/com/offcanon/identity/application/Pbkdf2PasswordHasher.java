@@ -44,11 +44,16 @@ public final class Pbkdf2PasswordHasher implements PasswordHasher {
         try {
             String[] pieces = encoded.split("\\$", -1);
             if (pieces.length != 4 || !PREFIX.equals(pieces[0])) return false;
+            // Reject oversized encoded fields before Base64 decoding. The
+            // stored hash is application-owned; bounding it here prevents a
+            // corrupted database row from turning a login attempt into an
+            // unbounded allocation or PBKDF2 derivation.
+            if (pieces[2].length() > 128 || pieces[3].length() > 256) return false;
             int iterations = Integer.parseInt(pieces[1]);
             if (iterations < 100_000 || iterations > 2_000_000) return false;
             byte[] salt = Base64.getUrlDecoder().decode(pieces[2]);
             byte[] expected = Base64.getUrlDecoder().decode(pieces[3]);
-            if (salt.length < 16 || expected.length == 0) return false;
+            if (salt.length != SALT_BYTES || expected.length != KEY_BITS / 8) return false;
             byte[] actual = derive(password, salt, iterations, expected.length * 8);
             return MessageDigest.isEqual(actual, expected);
         } catch (RuntimeException error) {

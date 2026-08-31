@@ -9,6 +9,7 @@ import com.offcanon.port.UserRepository;
 import com.offcanon.port.UserSettingsRepository;
 import com.offcanon.shared.domain.DomainException;
 import com.offcanon.shared.domain.ModelEndpointPolicy;
+import com.offcanon.shared.domain.ModelApiKeyPolicy;
 import com.offcanon.shared.domain.RuntimeSettingsPolicy;
 import com.offcanon.shared.web.UnauthorizedException;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -179,11 +180,12 @@ public class AuthApplicationService {
     }
 
     private String normalizeModelApiKey(String apiKey) {
-        String normalized = apiKey == null ? "" : apiKey.trim();
-        if (normalized.length() > 4096) {
-            throw new DomainException("MODEL_API_KEY_INVALID", "Model API key is too long");
+        try {
+            return ModelApiKeyPolicy.normalize(apiKey);
+        } catch (IllegalArgumentException error) {
+            throw new DomainException("MODEL_API_KEY_INVALID",
+                    "Model API key must contain printable ASCII characters and be at most 4096 characters");
         }
-        return normalized;
     }
 
     /**

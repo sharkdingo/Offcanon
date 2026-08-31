@@ -218,7 +218,9 @@ export class ApiError extends Error {
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers)
   if (!headers.has('Content-Type') && init?.body) headers.set('Content-Type', 'application/json')
-  const response = await fetch(url, { ...init, headers, credentials: 'same-origin' })
+  // Every API response is account-scoped. Explicitly bypass the browser
+  // cache so a local account switch cannot reuse a prior user's GET body.
+  const response = await fetch(url, { ...init, headers, credentials: 'same-origin', cache: 'no-store' })
   if (!response.ok) {
     if (response.status === 401) notifyUnauthorized()
     const detail = await response.json().catch(() => ({ detail: response.statusText })) as {

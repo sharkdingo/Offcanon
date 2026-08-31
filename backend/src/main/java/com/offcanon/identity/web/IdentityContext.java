@@ -27,13 +27,26 @@ public class IdentityContext {
     }
 
     private String authorization(HttpServletRequest request) {
+        String token = null;
+        boolean found = false;
         if (request.getCookies() != null) {
             for (var cookie : request.getCookies()) {
-                if ("OFFCANON_SESSION".equals(cookie.getName()) && cookie.getValue() != null && !cookie.getValue().isBlank()) {
-                    return "Bearer " + cookie.getValue();
+                if ("OFFCANON_SESSION".equals(cookie.getName())) {
+                    // Duplicate cookie names are ambiguous (for example when
+                    // a stale path-scoped cookie shadows the current one).
+                    // Reject them instead of trusting whichever order the
+                    // servlet container happens to expose.
+                    if (found) {
+                        throw new UnauthorizedException("Session is invalid or expired");
+                    }
+                    found = true;
+                    if (cookie.getValue() != null && !cookie.getValue().isBlank()) {
+                        token = cookie.getValue();
+                    }
                 }
             }
         }
+        if (token != null) return "Bearer " + token;
         throw new UnauthorizedException("Authentication is required");
     }
 }

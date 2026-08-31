@@ -7,6 +7,7 @@ import com.offcanon.identity.application.AuthApplicationService;
 import com.offcanon.identity.web.IdentityContext;
 import com.offcanon.port.ModelPort;
 import com.offcanon.shared.domain.DomainException;
+import com.offcanon.shared.domain.ModelApiKeyPolicy;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Size;
@@ -49,6 +50,12 @@ public class ModelConfigurationController {
         String modelName = body == null || body.modelName() == null ? "" : body.modelName().trim();
         String apiKey = body == null || body.apiKey() == null || body.apiKey().isBlank()
                 ? userSettingsApiKey(user) : body.apiKey().trim();
+        try {
+            apiKey = ModelApiKeyPolicy.normalize(apiKey);
+        } catch (IllegalArgumentException error) {
+            return new ModelTestResponse(false, "MODEL_API_KEY_INVALID",
+                    "Model API key must contain printable ASCII characters and be at most 4096 characters");
+        }
         try {
             auth.validateModelEndpoint(user, endpoint);
             ModelRequest modelRequest = new ModelRequest(

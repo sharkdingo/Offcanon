@@ -56,6 +56,21 @@ class PromotionSnapshotBindingTest {
     }
 
     @Test
+    void promotionPreparingEventReportsTheDurablePromotingState() throws Exception {
+        Fixture fixture = fixture(List.of("java -version"));
+        Experiment experiment = fixture.verifiedExperiment();
+
+        PromotionApplicationService.PromotionOutcome outcome = fixture.promotions.promote(experiment.id());
+
+        assertTrue(outcome.promoted(), outcome.toString());
+        var event = fixture.events.after(experiment.id(), 0).stream()
+                .filter(item -> item.type().equals("PROMOTION_PREPARING"))
+                .findFirst()
+                .orElseThrow();
+        assertEquals("PROMOTING", event.payload().get("status"));
+    }
+
+    @Test
     void failedCandidateVerificationLeavesCanonicalUntouched() throws Exception {
         Fixture fixture = fixture(List.of("java -offcanon-invalid-option"));
         Experiment experiment = fixture.verifiedExperiment();
@@ -153,8 +168,11 @@ class PromotionSnapshotBindingTest {
         try (var executor = Executors.newFixedThreadPool(2)) {
             var first = executor.submit(() -> fixture.promotions.promote(experiment.id()));
             var second = executor.submit(() -> fixture.promotions.promote(experiment.id()));
+            // Promotion preparation re-fingerprints isolated Git trees and
+            // reruns trusted verification; allow the Windows subprocess path
+            // enough time without weakening the final-section assertion.
             List<PromotionApplicationService.PromotionOutcome> outcomes = List.of(
-                    first.get(20, TimeUnit.SECONDS), second.get(20, TimeUnit.SECONDS));
+                    first.get(120, TimeUnit.SECONDS), second.get(120, TimeUnit.SECONDS));
 
             assertEquals(1, outcomes.stream().filter(PromotionApplicationService.PromotionOutcome::promoted).count());
             assertEquals(1, lock.maxActive.get());
@@ -206,13 +224,15 @@ class PromotionSnapshotBindingTest {
         InMemorySnapshotRepository snapshotRepository = new InMemorySnapshotRepository();
         InMemoryExperimentRepository experiments = new InMemoryExperimentRepository();
         InMemoryEvidenceRepository evidence = new InMemoryEvidenceRepository();
+        InMemoryEventSink events = new InMemoryEventSink();
         TrustedVerificationAdapter verification = new TrustedVerificationAdapter(
                 new LocalCommandExecutor(runner), evidence, snapshots, snapshotRepository, 10);
         Project project = projects.save(Project.create(java.util.UUID.randomUUID(), "demo", canonical, verificationCommands, Instant.now()));
         PromotionApplicationService promotions = new PromotionApplicationService(experiments, projects,
                 snapshotRepository, snapshots, workspaces, promotionPort,
-                promotionLock, new InMemoryEventSink(), verification, new InMemoryPromotionJournal());
-        return new Fixture(canonical, project, snapshots, workspaces, snapshotRepository, experiments, evidence, promotions);
+                promotionLock, events, verification, new InMemoryPromotionJournal());
+        return new Fixture(canonical, project, snapshots, workspaces, snapshotRepository, experiments,
+                evidence, events, promotions);
     }
 
     private String normalized(Path path) throws Exception {
@@ -228,10 +248,11 @@ class PromotionSnapshotBindingTest {
                            Project project,
                            GitSnapshotAdapter snapshots,
                            LocalWorkspaceAdapter workspaces,
-                           InMemorySnapshotRepository snapshotRepository,
-                           InMemoryExperimentRepository experiments,
-                           InMemoryEvidenceRepository evidence,
-                           PromotionApplicationService promotions) {
+                            InMemorySnapshotRepository snapshotRepository,
+                            InMemoryExperimentRepository experiments,
+                            InMemoryEvidenceRepository evidence,
+                            InMemoryEventSink events,
+                            PromotionApplicationService promotions) {
         Path snapshotsPath(UUID snapshotId) {
             return snapshotRepository.findById(snapshotId).orElseThrow().materializedPath();
         }

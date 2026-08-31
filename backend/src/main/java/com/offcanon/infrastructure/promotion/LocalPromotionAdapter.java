@@ -12,6 +12,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.beans.factory.annotation.Autowired;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -33,6 +34,7 @@ import java.util.Set;
 @Component
 public class LocalPromotionAdapter implements PromotionPort {
     private static final String ABSENT = "ABSENT";
+    private static final long MAX_FILE_BYTES = 20L * 1024 * 1024;
     private final PromotionLockPort promotionLock;
 
     @Autowired
@@ -219,7 +221,7 @@ public class LocalPromotionAdapter implements PromotionPort {
                                 "Refusing protected path in promotion candidate: " + relative);
                     }
                     if (isRuntimePath(relative)) return FileVisitResult.CONTINUE;
-                    result.put(relative, new FileState(Files.readAllBytes(file), GitFileMode.read(file)));
+                    result.put(relative, new FileState(readBounded(file), GitFileMode.read(file)));
                     return FileVisitResult.CONTINUE;
                 }
             });
@@ -232,11 +234,36 @@ public class LocalPromotionAdapter implements PromotionPort {
     private boolean sameState(Path path, FileState expected) {
         if (expected == null) return !Files.exists(path, LinkOption.NOFOLLOW_LINKS);
         try {
-            return Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)
-                    && expected.mode() == GitFileMode.read(path)
-                    && Arrays.equals(expected.content(), Files.readAllBytes(path));
+            if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)
+                    || expected.mode() != GitFileMode.read(path)) return false;
+            // Never let a concurrent replacement turn this precondition check
+            // into an unbounded read.  Snapshot files are capped at 20 MiB;
+            // requiring the same byte length before a bounded stream read also
+            // makes a changed large file fail closed.
+            if (Files.size(path) != expected.content().length) return false;
+            try (InputStream input = Files.newInputStream(path)) {
+                byte[] actual = input.readNBytes(expected.content().length + 1);
+                return actual.length == expected.content().length
+                        && Arrays.equals(expected.content(), actual);
+            }
         } catch (IOException error) {
             return false;
+        }
+    }
+
+    private byte[] readBounded(Path file) throws IOException {
+        long size = Files.size(file);
+        if (size > MAX_FILE_BYTES) {
+            throw new DomainException("PROMOTION_FILE_TOO_LARGE",
+                    "Promotion file exceeds 20 MiB safety limit: " + file.getFileName());
+        }
+        try (InputStream input = Files.newInputStream(file)) {
+            byte[] content = input.readNBytes((int) MAX_FILE_BYTES + 1);
+            if (content.length > MAX_FILE_BYTES) {
+                throw new DomainException("PROMOTION_FILE_TOO_LARGE",
+                        "Promotion file exceeds 20 MiB safety limit: " + file.getFileName());
+            }
+            return content;
         }
     }
 

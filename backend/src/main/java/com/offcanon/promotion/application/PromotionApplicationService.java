@@ -199,11 +199,23 @@ public class PromotionApplicationService {
                 }
                 promotionLock.assertHeld(project.id());
                 var applyingJournal = states.beginApplying(lockedExperiment, preparedJournal, Instant.now());
-                publishBestEffort(experimentId, "PROMOTION_PREPARING", java.util.Map.of("status", experiment.status().name()));
+                // The coordinator may have advanced the detached lifecycle
+                // object through PREPARING_PROMOTION -> PROMOTING while it
+                // repaired a partially persisted state.  Re-read the durable
+                // row before emitting telemetry; publishing the original
+                // VERIFIED status makes the UI/audit stream contradict the
+                // state machine and can trigger an incorrect retry decision.
+                Experiment applyingExperiment = experiments.findById(experimentId).orElse(lockedExperiment);
+                publishBestEffort(experimentId, "PROMOTION_PREPARING", java.util.Map.of(
+                        "status", applyingExperiment.status().name()));
                 boolean canonicalUpdated = false;
                 try {
                     promotionLock.assertHeld(project.id());
-                    PromotionPort.PromotionResult result = promotionPort.apply(project, base, experiment, candidate, promotionPlan);
+                    // Pass the lifecycle object reloaded after the durable
+                    // transition, rather than the detached VERIFIED object
+                    // captured before lock acquisition. Adapters may use the
+                    // status as a guard and must never observe a stale phase.
+                    PromotionPort.PromotionResult result = promotionPort.apply(project, base, applyingExperiment, candidate, promotionPlan);
                     canonicalUpdated = result.applied();
                     if (!result.applied()) {
                         throw new DomainException("PROMOTION_APPLY_FAILED", "Promotion adapter did not apply the candidate");

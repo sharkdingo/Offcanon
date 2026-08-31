@@ -129,6 +129,11 @@ public class OpenAiCompatibleModelAdapter implements ModelPort {
             }
         } catch (DomainException error) {
             throw error;
+        } catch (IllegalArgumentException error) {
+            // Header/URI builders reject malformed credentials and endpoints
+            // differently across JDK versions. Keep the failure inside the
+            // model boundary so a bad setting cannot become an API 500.
+            throw new DomainException("MODEL_REQUEST_INVALID", "Model request could not be created");
         } catch (IOException e) {
             throw new ModelTransientException("Model request failed before a response was received");
         } catch (InterruptedException e) {
@@ -206,7 +211,7 @@ public class OpenAiCompatibleModelAdapter implements ModelPort {
         try {
             long seconds = Long.parseLong(value);
             return seconds < 0 ? null : Duration.ofSeconds(seconds);
-        } catch (NumberFormatException ignored) {
+        } catch (NumberFormatException | ArithmeticException ignored) {
             try {
                 Instant retryAt = ZonedDateTime.parse(value, DateTimeFormatter.RFC_1123_DATE_TIME).toInstant();
                 Duration delay = Duration.between(Instant.now(), retryAt);

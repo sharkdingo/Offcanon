@@ -5,6 +5,7 @@ import {
   ArrowUp,
   Check,
   CheckCircle2,
+  CircleDot,
   Eye,
   FlaskConical,
   LoaderCircle,
@@ -98,7 +99,9 @@ const workingStatuses = new Set([
 // while it is running. Keep the conversation controls in sync with that API.
 const cancellableStatuses = new Set(['READY_TO_RUN', 'RUNNING', 'AGENT_COMPLETED', 'VERIFYING'])
 const composerAvailable = computed(() => !latest.value || continuableStatuses.has(latest.value.status))
-const modelReady = computed(() => Boolean(modelStatus.value?.apiKeyConfigured
+const modelReady = computed(() => !modelStatusLoading.value
+  && !modelStatusError.value
+  && Boolean(modelStatus.value?.apiKeyConfigured
   && modelStatus.value.endpointConfigured
   && modelStatus.value.modelConfigured
   && modelStatus.value.endpointValid))
@@ -153,6 +156,12 @@ function submit() {
   if (!canSubmit.value) return
   submittedForProject.value = props.project?.id ?? null
   emit('submit', draft.value.trim())
+}
+
+function selectTurn(event: MouseEvent, experimentId: string) {
+  const target = event.target
+  if (target instanceof Element && target.closest('a,button,input,textarea,select,summary')) return
+  emit('select', experimentId)
 }
 
 function onKeydown(event: KeyboardEvent) {
@@ -250,7 +259,9 @@ function failureText(experiment: Experiment) {
   const reason = experiment.failureReason ?? ''
   if (reason.includes('MODEL_NOT_CONFIGURED')) return text('尚未配置模型服务，请先完成设置', 'Model service is not configured; open Settings first')
   if (reason.includes('MODEL_ENDPOINT_INVALID')) return text('当前模型服务地址不可用，请检查设置', 'The model service endpoint is not usable; check Settings')
+  if (reason.includes('MODEL_API_KEY_INVALID')) return text('模型 API key 格式不可用，请在设置中重新输入', 'The model API key is not usable; enter it again in Settings')
   if (reason.includes('MODEL_REQUEST_FAILED')) return text('模型服务拒绝了请求，请测试模型连接', 'The model service rejected the request; test the connection')
+  if (reason.includes('MODEL_REQUEST_INVALID')) return text('模型请求配置无效，请检查设置', 'The model request is invalid; check Settings')
   if (reason.includes('MODEL_TRANSIENT_FAILURE')) return text('模型服务暂时不可用', 'The model service was temporarily unavailable')
   if (reason.includes('AGENT_TIMEOUT')) return text('运行超时，可以再次运行或缩小任务范围', 'The run timed out; retry or narrow the task')
   if (reason.includes('MAX_STEPS_EXCEEDED')) return text('运行达到步数上限，可以再次运行或缩小任务范围', 'The run reached its step limit; retry or narrow the task')
@@ -269,7 +280,7 @@ function canRetry(experiment: Experiment) {
 }
 
 function needsModelSettings(experiment: Experiment) {
-  return ['MODEL_NOT_CONFIGURED', 'MODEL_ENDPOINT_INVALID', 'MODEL_REQUEST_FAILED']
+  return ['MODEL_NOT_CONFIGURED', 'MODEL_ENDPOINT_INVALID', 'MODEL_API_KEY_INVALID', 'MODEL_REQUEST_INVALID', 'MODEL_REQUEST_FAILED']
     .includes(failureCode(experiment))
 }
 
@@ -333,7 +344,7 @@ defineExpose({ focusComposer })
       </div>
       <div v-if="session" class="thread-actions">
         <span class="thread-guard"><ShieldCheck :size="14" />{{ text('实验隔离', 'Experiment isolated') }}</span>
-        <button class="button secondary compact" @click="emit('newTask')"><Wrench :size="14" />{{ text('新任务', 'New task') }}</button>
+        <button class="button secondary compact" :aria-label="text('新任务', 'New task')" :title="text('新任务', 'New task')" @click="emit('newTask')"><Wrench :size="14" />{{ text('新任务', 'New task') }}</button>
       </div>
     </header>
 
@@ -357,7 +368,7 @@ defineExpose({ focusComposer })
         :key="experiment.id"
         class="conversation-turn"
         :class="{ selected: experiment.id === selectedExperimentId, [`tone-${statusTone(experiment.status)}`]: true }"
-        @click="emit('select', experiment.id)"
+        @click="selectTurn($event, experiment.id)"
       >
         <div class="turn-user">
           <span class="turn-label">{{ text('你', 'You') }}</span>
@@ -368,7 +379,22 @@ defineExpose({ focusComposer })
         <div class="turn-agent">
           <div class="agent-avatar">O</div>
           <div class="agent-body">
-            <div class="agent-meta"><strong>Offcanon</strong><span class="turn-state" :class="statusTone(experiment.status)">{{ statusHeadline(experiment) }}</span></div>
+            <div class="agent-meta">
+              <strong>Offcanon</strong>
+              <span class="turn-state" :class="statusTone(experiment.status)">{{ statusHeadline(experiment) }}</span>
+              <button
+                type="button"
+                class="turn-select-button"
+                :data-turn-select="experiment.id"
+                :aria-pressed="experiment.id === selectedExperimentId ? 'true' : 'false'"
+                :aria-label="text(`选择任务：${statusHeadline(experiment)}`, `Select task: ${statusHeadline(experiment)}`)"
+                :title="text('选择此任务', 'Select this task')"
+                @click.stop="emit('select', experiment.id)"
+              >
+                <CheckCircle2 v-if="experiment.id === selectedExperimentId" :size="15" />
+                <CircleDot v-else :size="15" />
+              </button>
+            </div>
             <MarkdownContent v-if="experiment.agentSummary && !workingStatuses.has(experiment.status)" class="agent-summary" :source="experiment.agentSummary" />
             <p v-else-if="['FAILED', 'REJECTED', 'STALE', 'CANCELLED'].includes(experiment.status)" class="agent-summary failure-copy">{{ failureText(experiment) }}</p>
             <div v-else-if="workingStatuses.has(experiment.status)" class="working-row">
@@ -416,7 +442,7 @@ defineExpose({ focusComposer })
 
     <footer class="composer-wrap">
       <form class="agent-composer" @submit.prevent="submit">
-        <textarea ref="composer" v-model="draft" :placeholder="placeholder" :disabled="!project || !composerAvailable || actionBusy" rows="1" :aria-label="text('任务输入', 'Task input')" @input="resizeComposer" @keydown="onKeydown" />
+        <textarea ref="composer" v-model="draft" :placeholder="placeholder" :disabled="!project || !composerAvailable || actionBusy" rows="1" maxlength="20000" :aria-label="text('任务输入', 'Task input')" @input="resizeComposer" @keydown="onKeydown" />
         <div class="composer-bottom">
           <span class="composer-hint"><ShieldCheck :size="13" />{{ session?.title ?? text('新任务', 'New task') }}</span>
           <button type="submit" class="send-button" :disabled="!canSubmit" :aria-label="text('发送任务', 'Send task')" :title="text('发送任务', 'Send task')"><ArrowUp :size="17" /></button>

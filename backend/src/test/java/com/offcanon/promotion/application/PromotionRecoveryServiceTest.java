@@ -90,6 +90,16 @@ class PromotionRecoveryServiceTest {
     }
 
     @Test
+    void preparedNoOpPromotionWithBaseFingerprintIsAbortedNotMarkedStale() {
+        Fixture fixture = fixturePrepared(BASE, NOW.minusSeconds(1));
+
+        fixture.service().reconcile(NOW);
+
+        assertEquals(ExperimentStatus.VERIFIED, storedExperiment(fixture).status());
+        assertEquals(PromotionPhase.ABORTED, storedJournal(fixture).phase());
+    }
+
+    @Test
     void applyingWithBaseFingerprintCannotLeavePromotedExperimentAsIfItSucceeded() {
         Project project = projects.save(Project.create(java.util.UUID.randomUUID(), "demo", temp.resolve("canonical-promoted"), List.of("mvn test"), NOW));
         UUID experimentId = UUID.randomUUID();

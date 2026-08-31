@@ -18,8 +18,8 @@ const canConfirm = (preview: PromotionPreview) => !preview.recoveryRequired && (
 </script>
 
 <template>
-  <BaseDialog labelled-by="promotion-dialog-title" described-by="promotion-dialog-description" @close="emit('close')">
-    <form class="dialog-form promotion-confirm" @submit.prevent="emit('confirm')">
+  <BaseDialog labelled-by="promotion-dialog-title" described-by="promotion-dialog-description" :close-disabled="busy" @close="emit('close')">
+    <form class="dialog-form promotion-confirm" @submit.prevent="canConfirm(preview) && emit('confirm')">
       <header class="dialog-header">
         <div class="dialog-heading">
           <span class="dialog-icon" :class="preview.recoveryRequired || preview.conflict ? 'warning' : 'verified'">
@@ -31,7 +31,7 @@ const canConfirm = (preview: PromotionPreview) => !preview.recoveryRequired && (
             <h2 id="promotion-dialog-title">{{ preview.recoveryRequired ? text('请先恢复项目状态', 'Recover project state first') : preview.conflict ? text('项目主线已变化', 'The project changed') : text('将改动应用到项目？', 'Apply changes to your project?') }}</h2>
           </div>
         </div>
-        <button type="button" class="icon-button" :aria-label="text('关闭对话框', 'Close dialog')" :title="text('关闭', 'Close')" @click="emit('close')"><X :size="17" /></button>
+        <button type="button" class="icon-button" :aria-label="text('关闭对话框', 'Close dialog')" :title="text('关闭', 'Close')" :disabled="busy" @click="emit('close')"><X :size="17" /></button>
       </header>
       <p id="promotion-dialog-description" class="dialog-description">
         {{ preview.recoveryRequired
@@ -67,7 +67,7 @@ const canConfirm = (preview: PromotionPreview) => !preview.recoveryRequired && (
           : text('该实验结果已通过验收证据检查；写回后请自行检查并提交 Git。', 'Acceptance evidence passed; inspect the written files and create a Git commit yourself.') }}</span>
       </div>
       <footer class="dialog-actions">
-        <button type="button" class="button secondary" @click="emit('close')">{{ text('保持隔离', 'Keep isolated') }}</button>
+        <button type="button" class="button secondary" :disabled="busy" @click="emit('close')">{{ text('保持隔离', 'Keep isolated') }}</button>
         <button class="button" :class="preview.conflict || preview.recoveryRequired ? 'warning' : 'success'" :disabled="busy || !canConfirm(preview)">
           <LoaderCircle v-if="busy" class="spin" :size="16" />
           {{ preview.recoveryRequired ? text('需要恢复', 'Recovery required') : preview.conflict ? text('标记为已过期', 'Mark out of date') : text('应用到主线', 'Apply to canonical') }}

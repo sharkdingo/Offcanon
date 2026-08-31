@@ -278,6 +278,52 @@ class GitSnapshotAdapterTest {
     }
 
     @Test
+    void rejectsSymlinkedSnapshotRuntimeRoot() throws Exception {
+        Path repository = initialise("symlink-snapshot-repo");
+        Files.writeString(repository.resolve("safe.txt"), "safe\n");
+        run(repository, "git", "add", "safe.txt");
+        run(repository, "git", "commit", "-qm", "initial");
+
+        Path data = Files.createDirectories(temp.resolve("symlink-snapshot-data"));
+        Path outside = Files.createDirectories(temp.resolve("outside-snapshot"));
+        try {
+            Files.createSymbolicLink(data.resolve("snapshots"), outside);
+        } catch (Exception error) {
+            Assumptions.assumeTrue(false, "Directory symlinks are unavailable on this workstation");
+        }
+
+        DomainException error = assertThrows(DomainException.class,
+                () -> new GitSnapshotAdapter(new ProcessRunner(), data.toString())
+                        .capture(Project.create(UUID.randomUUID(), "symlink", repository, List.of(), Instant.now())));
+
+        assertEquals("SNAPSHOT_DESTINATION_INVALID", error.code());
+        assertTrue(directoryIsEmpty(outside), "a symlinked snapshots root must never receive files");
+    }
+
+    @Test
+    void rejectsSymlinkedObjectStoreRoot() throws Exception {
+        Path repository = initialise("symlink-object-repo");
+        Files.writeString(repository.resolve("safe.txt"), "safe\n");
+        run(repository, "git", "add", "safe.txt");
+        run(repository, "git", "commit", "-qm", "initial");
+
+        Path data = Files.createDirectories(temp.resolve("symlink-object-data"));
+        Path outside = Files.createDirectories(temp.resolve("outside-object"));
+        try {
+            Files.createSymbolicLink(data.resolve("git-objects"), outside);
+        } catch (Exception error) {
+            Assumptions.assumeTrue(false, "Directory symlinks are unavailable on this workstation");
+        }
+
+        DomainException error = assertThrows(DomainException.class,
+                () -> new GitSnapshotAdapter(new ProcessRunner(), data.toString())
+                        .capture(Project.create(UUID.randomUUID(), "symlink-object", repository, List.of(), Instant.now())));
+
+        assertEquals("SNAPSHOT_DESTINATION_INVALID", error.code());
+        assertTrue(directoryIsEmpty(outside), "a symlinked object store must never receive files");
+    }
+
+    @Test
     void detectsWorkspaceMutationDuringCapture() throws Exception {
         Path repository = initialise("racing-repo");
         Path file = repository.resolve("service.txt");

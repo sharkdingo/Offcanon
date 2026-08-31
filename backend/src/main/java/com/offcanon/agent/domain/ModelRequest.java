@@ -3,6 +3,7 @@ package com.offcanon.agent.domain;
 import java.util.List;
 import java.util.Objects;
 import java.time.Duration;
+import com.offcanon.shared.domain.ModelApiKeyPolicy;
 
 public record ModelRequest(List<ModelMessage> messages,
                            List<ToolDefinition> tools,
@@ -16,7 +17,7 @@ public record ModelRequest(List<ModelMessage> messages,
         Objects.requireNonNull(timeout, "timeout");
         modelEndpoint = modelEndpoint == null ? "" : modelEndpoint.trim();
         modelName = modelName == null ? "" : modelName.trim();
-        modelApiKey = modelApiKey == null ? "" : modelApiKey.trim();
+        modelApiKey = ModelApiKeyPolicy.normalize(modelApiKey);
         if (timeout.isNegative() || timeout.isZero()) timeout = Duration.ofMillis(1);
     }
 

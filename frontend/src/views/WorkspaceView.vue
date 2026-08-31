@@ -239,9 +239,12 @@ async function selectExperiment(experimentId: string) {
 }
 
 async function closeReview() {
+  if (showPromotionDialog.value && actionBusy.value) return
+  const returnFocus = reviewReturnFocus.value
   showReview.value = false
   await nextTick()
-  reviewReturnFocus.value?.focus()
+  if (returnFocus && document.contains(returnFocus)) returnFocus.focus()
+  else document.querySelector<HTMLElement>('[data-turn-select][aria-pressed="true"]')?.focus()
   reviewReturnFocus.value = null
   if (store.selectedProjectId) await router.push({ name: 'project', params: { projectId: store.selectedProjectId } })
 }
@@ -390,7 +393,15 @@ async function runAction(action: () => Promise<void>, closePromotion = false) {
 async function confirmPromotionDecision() {
   const experiment = store.selectedExperiment
   const preview = store.promotionPreview
-  if (!experiment || !preview) return
+  // The review action is intentionally fail-closed. A detail request can fail
+  // after the confirmation dialog opens, and applying without a complete
+  // review would break the user's evidence-first decision model.
+  if (!experiment || experiment.status !== 'VERIFIED' || !preview
+    || preview.recoveryRequired || (!preview.promotable && !preview.conflict)
+    || store.evidenceError || store.diffError || store.promotionPreviewError || store.promotionRecoveryError) {
+    showPromotionDialog.value = false
+    return
+  }
   await runAction(() => preview.conflict
     ? store.confirmExperimentStale(experiment.id)
     : store.promoteExperiment(experiment.id), true)
@@ -410,20 +421,27 @@ async function refresh() {
 
 function handleGlobalKeydown(event: KeyboardEvent) {
   if (showReview.value && event.key === 'Tab') {
+    // A native confirmation dialog (for example promotion) owns the top-layer
+    // focus cycle. Do not let the drawer-level trap steal its Tab events.
+    if (document.querySelector('dialog[open]')) return
     const root = reviewDrawer.value
     if (!root) return
-    const focusable = Array.from(root.querySelectorAll<HTMLElement>('button, a[href], input, textarea, select, [tabindex]:not([tabindex="-1"])'))
+    const focusable = Array.from(root.querySelectorAll<HTMLElement>('button, a[href], input, textarea, select, summary, [contenteditable="true"], [tabindex]:not([tabindex="-1"])'))
       .filter((item) => !item.hasAttribute('disabled') && item.offsetParent !== null)
     if (focusable.length) {
       const first = focusable[0]
       const last = focusable[focusable.length - 1]
+      if (!root.contains(document.activeElement)) { event.preventDefault(); first.focus(); return }
       if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); return }
       if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); return }
     }
     return
   }
   if (event.key !== 'Escape') return
-  if (showPromotionDialog.value) showPromotionDialog.value = false
+  if (showPromotionDialog.value) {
+    if (!actionBusy.value) showPromotionDialog.value = false
+    return
+  }
   else if (showReview.value) void closeReview()
   else closeMobileNav()
 }
@@ -465,6 +483,12 @@ watch(() => store.selectedExperimentId, () => {
   // while the user navigates to another historical turn.
   showPromotionDialog.value = false
 })
+watch(() => store.selectedExperiment?.status, (status) => {
+  // A background refresh or another tab can advance the experiment while the
+  // confirmation dialog is open. Do not leave an apply action mounted for a
+  // candidate that is no longer in the VERIFIED state.
+  if (showPromotionDialog.value && status !== 'VERIFIED') showPromotionDialog.value = false
+})
 
 onMounted(async () => {
   // Pinia stores outlive this view. Clear the previous account's project and
@@ -494,24 +518,25 @@ onUnmounted(() => {
 
 <template>
   <div class="agent-shell">
-    <header class="agent-topbar">
+    <header class="agent-topbar" :inert="showReview ? true : undefined" :aria-hidden="showReview ? 'true' : undefined">
       <button class="brand-lockup" :aria-label="text('打开项目列表', 'Open project list')" :title="text('打开项目列表', 'Open project list')" @click="router.push({ name: 'home' })">
         <span class="brand-mark">O</span>
         <span><strong>Offcanon</strong><small>{{ text('Coding Agent', 'Coding Agent') }}</small></span>
       </button>
-       <div class="topbar-project" v-if="store.selectedProject"><span class="topbar-project-dot" />{{ store.selectedProject.name }}<button class="icon-button small" :aria-label="text('编辑项目', 'Edit project')" :title="text('编辑项目', 'Edit project')" @click="editSelectedProject"><Edit3 :size="13" /></button></div>
+      <div class="topbar-project" v-if="store.selectedProject"><span class="topbar-project-dot" />{{ store.selectedProject.name }}<button class="icon-button small" :aria-label="text('编辑项目', 'Edit project')" :title="text('编辑项目', 'Edit project')" @click="editSelectedProject"><Edit3 :size="13" /></button></div>
       <div class="topbar-context">
         <span v-if="store.selectedExperimentId" class="connection-state" :class="streamState"><span class="stream-dot" :class="streamState" />{{ connectionLabel }}</span>
+        <button v-if="store.selectedProject" class="icon-button small mobile-project-edit" :aria-label="text('编辑项目', 'Edit project')" :title="text('编辑项目', 'Edit project')" @click="editSelectedProject"><Edit3 :size="14" /></button>
         <button class="icon-button" :aria-label="text('刷新', 'Refresh')" :title="text('刷新', 'Refresh')" :disabled="store.loading" @click="refresh"><RefreshCw :class="{ spin: store.loading }" :size="16" /></button>
         <button class="account-button" :aria-label="text('打开设置', 'Open settings')" :title="text('设置', 'Settings')" @click="openSettings"><span>{{ accountInitials }}</span><Settings :size="14" /></button>
       </div>
     </header>
 
-    <div v-if="store.error" class="global-alert" role="alert">
+    <div v-if="store.error" class="global-alert" :inert="showReview ? true : undefined" :aria-hidden="showReview ? 'true' : undefined" role="alert">
       <CircleDot :size="16" /><span>{{ store.error }}</span><button class="icon-button small" :aria-label="text('关闭错误', 'Dismiss error')" :title="text('关闭', 'Dismiss')" @click="store.error = null"><X :size="15" /></button>
     </div>
 
-    <div v-if="store.selectedProject && store.promotionRecovery?.recoveryRequired" class="project-recovery-banner" role="alert">
+    <div v-if="store.selectedProject && store.promotionRecovery?.recoveryRequired" class="project-recovery-banner" :inert="showReview ? true : undefined" :aria-hidden="showReview ? 'true' : undefined" role="alert">
       <AlertTriangle :size="17" />
       <div>
         <strong>{{ text('项目需要恢复', 'Project recovery required') }}</strong>
@@ -519,7 +544,7 @@ onUnmounted(() => {
       </div>
       <button class="button warning compact" :disabled="actionBusy" @click="reconcileProject"><RefreshCw :class="{ spin: actionBusy }" :size="14" />{{ text('恢复项目', 'Reconcile project') }}</button>
     </div>
-    <div v-else-if="store.selectedProject && store.promotionRecoveryError" class="project-recovery-banner error" role="alert">
+    <div v-else-if="store.selectedProject && store.promotionRecoveryError" class="project-recovery-banner error" :inert="showReview ? true : undefined" :aria-hidden="showReview ? 'true' : undefined" role="alert">
       <AlertTriangle :size="17" />
       <div>
         <strong>{{ text('无法确认项目写回状态', 'Project write-back state is unknown') }}</strong>
@@ -576,7 +601,7 @@ onUnmounted(() => {
 
     <Transition name="drawer">
       <div v-if="showReview && store.selectedExperiment" class="review-overlay">
-        <button class="review-overlay-scrim" :aria-label="text('关闭审阅', 'Close review')" @click="closeReview" />
+        <div class="review-overlay-scrim" aria-hidden="true" @click="closeReview" />
         <aside ref="reviewDrawer" class="review-drawer" role="dialog" aria-modal="true" aria-labelledby="review-drawer-title">
           <header class="review-drawer-header">
             <div><span id="review-drawer-title">{{ text('任务审阅', 'TASK REVIEW') }}</span><strong>EXP-{{ store.selectedExperiment.id.slice(0, 8).toUpperCase() }}</strong></div>

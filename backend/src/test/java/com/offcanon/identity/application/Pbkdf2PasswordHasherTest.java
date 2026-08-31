@@ -27,4 +27,15 @@ class Pbkdf2PasswordHasherTest {
         assertThrows(IllegalArgumentException.class, () -> hasher.hash("short"));
         assertFalse(hasher.matches("correct horse battery staple", "not-a-pbkdf2-value"));
     }
+
+    @Test
+    void rejectsMalformedOversizedDigestsWithoutDerivingThem() {
+        String valid = hasher.hash("correct horse battery staple");
+        String[] pieces = valid.split("\\$", -1);
+        pieces[3] = "A".repeat(257);
+        assertFalse(hasher.matches("correct horse battery staple", String.join("$", pieces)));
+        pieces = valid.split("\\$", -1);
+        pieces[2] = "A".repeat(129);
+        assertFalse(hasher.matches("correct horse battery staple", String.join("$", pieces)));
+    }
 }

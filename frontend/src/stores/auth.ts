@@ -1,6 +1,6 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
-import { api, type AuthUser, type UserSettings } from '../api'
+import { api, ApiError, type AuthUser, type UserSettings } from '../api'
 import { AUTH_UNAUTHORIZED_EVENT } from '../authToken'
 
 export type AuthMode = 'api'
@@ -108,15 +108,38 @@ export const useAuthStore = defineStore('auth', () => {
     hydrateLocalPreferences()
     for (const key of STALE_AUTH_STORAGE_KEYS) removeValue(key)
     const stored = readJson<Pick<AuthSession, 'subject' | 'displayName' | 'mode' | 'signedInAt' | 'expiresAt' | 'user'>>(AUTH_STORAGE_KEY)
-    if (stored?.user?.id && stored.user.username) {
-      try {
-        const user = await api.me()
-        session.value = { ...stored, user, subject: user.id, displayName: user.username }
+    try {
+      // The HttpOnly cookie is authoritative. Local storage is only a paint
+      // cache for timestamps and must never decide whether a cookie session is
+      // still valid (it may have been cleared, disabled, or edited).
+      const user = await api.me()
+      const metadata = stored?.user?.id === user.id && stored.user.username ? stored : null
+      const now = new Date().toISOString()
+      session.value = {
+        subject: user.id,
+        displayName: user.username,
+        mode: 'api',
+        signedInAt: metadata?.signedInAt ?? now,
+        // /me intentionally does not expose an expiry. Keep a cached value
+        // when available; an empty value is safer than inventing a deadline.
+        expiresAt: metadata?.expiresAt ?? '',
+        user,
+      }
+      saveValue(AUTH_STORAGE_KEY, JSON.stringify(session.value))
+      hydrateLocalPreferences()
+      await hydrateAccountSettings()
+      const onboarding = savedValue(onboardingKey())
+      onboardingComplete.value = onboarding === 'complete'
+    } catch (cause) {
+      // A transient backend outage should not turn a still-valid browser
+      // session into an apparent sign-out. A confirmed 401, however, must
+      // clear the local cache and return to the login screen.
+      if (!(cause instanceof ApiError && cause.status === 401)
+        && stored?.user?.id && stored.user.username) {
+        session.value = { ...stored, mode: 'api' }
         hydrateLocalPreferences()
-        await hydrateAccountSettings()
-        const onboarding = savedValue(onboardingKey())
-        onboardingComplete.value = onboarding === 'complete'
-      } catch {
+        onboardingComplete.value = savedValue(onboardingKey()) === 'complete'
+      } else {
         removeValue(AUTH_STORAGE_KEY)
       }
     }

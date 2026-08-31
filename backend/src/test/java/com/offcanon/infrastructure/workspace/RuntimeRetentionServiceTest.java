@@ -11,6 +11,7 @@ import com.offcanon.port.PromotionJournalPort;
 import com.offcanon.project.domain.Project;
 import com.offcanon.promotion.domain.PromotionJournal;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
@@ -23,6 +24,7 @@ import java.util.Map;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.atLeastOnce;
@@ -213,6 +215,60 @@ class RuntimeRetentionServiceTest {
         service.cleanup(now);
 
         assertTrue(Files.exists(sourceWorkspace));
+    }
+
+    @Test
+    void scopedCleanupCannotRemoveAnotherOwnersRuntimeWorkspace() throws Exception {
+        Instant now = Instant.parse("2026-08-28T12:00:00Z");
+        InMemoryProjectRepository projects = new InMemoryProjectRepository();
+        InMemoryExperimentRepository experiments = new InMemoryExperimentRepository();
+        InMemoryPromotionJournal journals = new InMemoryPromotionJournal();
+        UUID owner = UUID.randomUUID();
+        UUID otherOwner = UUID.randomUUID();
+        Project ownedProject = projects.save(Project.create(owner, "owned", temp.resolve("owned-canonical"), List.of(), now));
+        Project otherProject = projects.save(Project.create(otherOwner, "other", temp.resolve("other-canonical"), List.of(), now));
+        UUID ownedId = UUID.randomUUID();
+        UUID otherId = UUID.randomUUID();
+        Path ownedWorkspace = oldDirectory(temp.resolve("data/experiments").resolve(ownedId.toString()), now);
+        Path otherWorkspace = oldDirectory(temp.resolve("data/experiments").resolve(otherId.toString()), now);
+        experiments.save(Experiment.restore(ownedId, ownedProject.id(), UUID.randomUUID(),
+                "owned", now.minus(Duration.ofDays(2)), ExperimentStatus.PROMOTED,
+                UUID.randomUUID(), UUID.randomUUID(), ownedWorkspace, "done", null, null, 0));
+        experiments.save(Experiment.restore(otherId, otherProject.id(), UUID.randomUUID(),
+                "other", now.minus(Duration.ofDays(2)), ExperimentStatus.PROMOTED,
+                UUID.randomUUID(), UUID.randomUUID(), otherWorkspace, "done", null, null, 0));
+
+        RuntimeRetentionService service = new RuntimeRetentionService(temp.resolve("data"), projects,
+                experiments, journals, Duration.ZERO, Duration.ZERO, Duration.ZERO, Duration.ZERO);
+        RuntimeRetentionService.CleanupReport report = service.cleanupForOwner(now, owner);
+
+        assertTrue(report.experimentWorkspaces() >= 1);
+        assertTrue(Files.notExists(ownedWorkspace));
+        assertTrue(Files.exists(otherWorkspace));
+    }
+
+    @Test
+    void ignoresSymlinkedRuntimeRoot() throws Exception {
+        Instant now = Instant.parse("2026-08-28T12:00:00Z");
+        InMemoryProjectRepository projects = new InMemoryProjectRepository();
+        InMemoryExperimentRepository experiments = new InMemoryExperimentRepository();
+        InMemoryPromotionJournal journals = new InMemoryPromotionJournal();
+
+        Path data = Files.createDirectories(temp.resolve("symlink-retention-data"));
+        Path outside = oldDirectory(temp.resolve("outside-retention"), now);
+        try {
+            Files.createSymbolicLink(data.resolve("experiments"), outside);
+        } catch (Exception error) {
+            Assumptions.assumeTrue(false, "Directory symlinks are unavailable on this workstation");
+        }
+
+        RuntimeRetentionService service = new RuntimeRetentionService(data, projects,
+                experiments, journals, Duration.ZERO, Duration.ZERO, Duration.ZERO, Duration.ZERO);
+        RuntimeRetentionService.CleanupReport report = service.cleanup(now);
+
+        assertEquals(0, report.experimentWorkspaces());
+        assertTrue(Files.exists(outside.resolve("marker.txt")),
+                "retention must not traverse a symlinked managed root");
     }
 
     private Path oldDirectory(Path path, Instant now) throws Exception {

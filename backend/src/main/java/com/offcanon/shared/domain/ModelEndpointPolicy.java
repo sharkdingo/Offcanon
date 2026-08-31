@@ -30,6 +30,8 @@ public final class ModelEndpointPolicy {
                     || uri.getUserInfo() != null
                     || uri.getQuery() != null
                     || uri.getFragment() != null
+                    || containsControlCharacter(uri.getPath())
+                    || containsAmbiguousPathSyntax(uri.getPath())
                     || !("http".equalsIgnoreCase(uri.getScheme())
                     || "https".equalsIgnoreCase(uri.getScheme()))) {
                 return null;
@@ -54,6 +56,25 @@ public final class ModelEndpointPolicy {
 
     public static boolean isValid(String value) {
         return normalize(value) != null;
+    }
+
+    private static boolean containsControlCharacter(String value) {
+        if (value == null) return false;
+        for (int index = 0; index < value.length(); index++) {
+            char current = value.charAt(index);
+            if (Character.isISOControl(current) || current == '\u2028' || current == '\u2029') return true;
+        }
+        return false;
+    }
+
+    /** Reject encoded query/fragment markers and dot segments after URI decoding. */
+    private static boolean containsAmbiguousPathSyntax(String path) {
+        if (path == null) return false;
+        if (path.indexOf('?') >= 0 || path.indexOf('#') >= 0) return true;
+        for (String segment : path.split("/", -1)) {
+            if (segment.equals(".") || segment.equals("..")) return true;
+        }
+        return false;
     }
 
 }

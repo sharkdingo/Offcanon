@@ -1,6 +1,7 @@
 package com.offcanon.agent.domain;
 
 import com.offcanon.identity.domain.UserSettings;
+import com.offcanon.shared.domain.ModelApiKeyPolicy;
 
 /** Per-run controls resolved from the authenticated user's settings. */
 public record AgentRunSettings(int maxSteps,
@@ -15,12 +16,12 @@ public record AgentRunSettings(int maxSteps,
         if (contextLimitChars < 8_000 || contextLimitChars > 1_000_000) throw new IllegalArgumentException("Agent context limit must be between 8000 and 1000000 characters");
         modelEndpoint = modelEndpoint == null ? "" : modelEndpoint.trim();
         modelName = modelName == null ? "" : modelName.trim();
-        modelApiKey = modelApiKey == null ? "" : modelApiKey.trim();
-        if (modelApiKey.length() > 4096) throw new IllegalArgumentException("Model API key is too long");
+        modelApiKey = ModelApiKeyPolicy.normalize(modelApiKey);
     }
 
     public static AgentRunSettings from(UserSettings settings) {
         return new AgentRunSettings(settings.agentMaxSteps(), settings.agentRunTimeoutSeconds(),
                 settings.contextLimitChars(), settings.modelEndpoint(), settings.modelName(), settings.modelApiKey());
     }
+
 }

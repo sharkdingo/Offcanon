@@ -123,13 +123,29 @@ public class RuntimeRetentionService {
 
     /** Runs one idempotent best-effort cleanup pass. */
     public CleanupReport cleanup(Instant now) {
+        return cleanupInternal(now, null);
+    }
+
+    /**
+     * Runs a cleanup pass limited to runtime materializations owned by one
+     * account.  Interactive settings actions use this boundary so one local
+     * account cannot remove (or infer the count of) another account's
+     * disposable workspaces.  Unknown/orphan paths are intentionally skipped
+     * for a scoped pass; only the scheduler's global pass may reclaim them.
+     */
+    public CleanupReport cleanupForOwner(Instant now, UUID ownerId) {
+        if (ownerId == null) return CleanupReport.empty();
+        return cleanupInternal(now, ownerId);
+    }
+
+    private CleanupReport cleanupInternal(Instant now, UUID ownerId) {
         if (!running.compareAndSet(false, true)) {
             return CleanupReport.empty();
         }
         try {
             RetentionContext context;
             try {
-                context = loadContext();
+                context = loadContext(ownerId);
             } catch (RuntimeException error) {
                 // Protection data is authoritative. If it cannot be read, do
                 // not guess and risk removing an artifact still needed for a
@@ -142,7 +158,11 @@ public class RuntimeRetentionService {
             cleanupVerificationWorkspaces(context, now, counter);
             cleanupPromotionCandidates(context, now, counter);
             cleanupExperimentWorkspaces(context, now, counter);
-            cleanupSnapshots(context, now, counter);
+            // A user-triggered cleanup is account-scoped. Snapshot directory
+            // names do not carry ownership, and the repository port does not
+            // expose an unambiguous owner index for orphaned materializations;
+            // leave that cache to the scheduler's protected global pass.
+            if (!context.scoped()) cleanupSnapshots(context, now, counter);
             CleanupReport report = counter.report();
             if (report.total() > 0) {
                 log.info("Runtime retention removed {} verification workspaces, {} promotion candidates, "
@@ -156,11 +176,16 @@ public class RuntimeRetentionService {
         }
     }
 
-    private RetentionContext loadContext() {
+    private RetentionContext loadContext(UUID ownerId) {
         Map<UUID, Experiment> known = new HashMap<>();
+        Set<UUID> ownedExperiments = new HashSet<>();
         for (var project : projects.findAll()) {
+            boolean owned = ownerId == null || ownerId.equals(project.ownerId());
             for (Experiment experiment : experiments.findByProjectId(project.id())) {
                 known.put(experiment.id(), experiment);
+                if (owned) {
+                    ownedExperiments.add(experiment.id());
+                }
             }
         }
         Set<UUID> protectedSnapshots = new HashSet<>();
@@ -175,6 +200,7 @@ public class RuntimeRetentionService {
             if (experiment.continuedFromExperimentId() != null
                     && experiment.baseSnapshotId() != null
                     && experiment.workspacePath() != null
+                    && hasNoSymbolicComponents(experiment.workspacePath())
                     && Files.isDirectory(experiment.workspacePath(), LinkOption.NOFOLLOW_LINKS)) {
                 forkReadySources.add(experiment.continuedFromExperimentId());
             }
@@ -196,7 +222,8 @@ public class RuntimeRetentionService {
             }
         }
         return new RetentionContext(known, protectedSnapshots, activeExperiments,
-                recoveryExperiments, forkReadySources, protectedCandidates);
+                recoveryExperiments, forkReadySources, protectedCandidates,
+                ownerId, ownedExperiments);
     }
 
     private void cleanupVerificationWorkspaces(RetentionContext context,
@@ -205,6 +232,9 @@ public class RuntimeRetentionService {
         Path root = managedRoot("verification-workspaces");
         for (Path experimentRoot : children(root)) {
             UUID experimentId = parseUuid(experimentRoot.getFileName());
+            if (context.scoped() && (experimentId == null || !context.ownedExperiments().contains(experimentId))) {
+                continue;
+            }
             if (experimentId != null && context.activeExperiments().contains(experimentId)) continue;
             for (Path attempt : children(experimentRoot)) {
                 if (!isOld(attempt, now, verificationRetention)) continue;
@@ -220,6 +250,9 @@ public class RuntimeRetentionService {
         Path root = managedRoot("promotion-candidates");
         for (Path experimentRoot : children(root)) {
             UUID experimentId = parseUuid(experimentRoot.getFileName());
+            if (context.scoped() && (experimentId == null || !context.ownedExperiments().contains(experimentId))) {
+                continue;
+            }
             if (experimentId != null && context.recoveryExperiments().contains(experimentId)) continue;
             for (Path candidate : children(experimentRoot)) {
                 if (isProtected(candidate, context.protectedCandidates())) continue;
@@ -236,6 +269,9 @@ public class RuntimeRetentionService {
         Path root = managedRoot("experiments");
         for (Path workspace : children(root)) {
             UUID experimentId = parseUuid(workspace.getFileName());
+            if (context.scoped() && (experimentId == null || !context.ownedExperiments().contains(experimentId))) {
+                continue;
+            }
             Experiment experiment = experimentId == null ? null : context.known().get(experimentId);
             if (experiment != null) {
                 // A sealed result is the durable source for diff, promotion and
@@ -261,8 +297,8 @@ public class RuntimeRetentionService {
     }
 
     private void cleanupSnapshots(RetentionContext context,
-                                  Instant now,
-                                  CleanupCounter counter) {
+                                   Instant now,
+                                   CleanupCounter counter) {
         Path root = managedRoot("snapshots");
         for (Path snapshot : children(root)) {
             UUID snapshotId = parseUuid(snapshot.getFileName());
@@ -277,7 +313,12 @@ public class RuntimeRetentionService {
     }
 
     private List<Path> children(Path root) {
-        if (!Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)) return List.of();
+        // Never traverse a managed root (or one of its ancestors) through a
+        // symbolic link.  The cleaner runs asynchronously, so checking only
+        // the immediate child is not enough if an attacker swaps a parent
+        // directory between passes.
+        if (!hasNoSymbolicComponents(root)
+                || !Files.isDirectory(root, LinkOption.NOFOLLOW_LINKS)) return List.of();
         try (var stream = Files.list(root)) {
             return stream.filter(path -> !Files.isSymbolicLink(path)).toList();
         } catch (IOException error) {
@@ -306,6 +347,8 @@ public class RuntimeRetentionService {
         Path normalized = normalize(path);
         Path root = normalize(managedRoot);
         if (normalized.equals(root) || !normalized.startsWith(root)
+                || !hasNoSymbolicComponents(root)
+                || !hasNoSymbolicComponents(path)
                 || Files.isSymbolicLink(path)) return false;
         try {
             deleteTree(path);
@@ -323,6 +366,9 @@ public class RuntimeRetentionService {
     }
 
     private void deleteTree(Path root) throws IOException {
+        if (Files.isSymbolicLink(root) || !hasNoSymbolicComponents(root)) {
+            throw new IOException("Refusing to delete a symbolic-link runtime path");
+        }
         Files.walkFileTree(root, new SimpleFileVisitor<>() {
             @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
@@ -352,6 +398,19 @@ public class RuntimeRetentionService {
         return path.toAbsolutePath().normalize();
     }
 
+    private boolean hasNoSymbolicComponents(Path path) {
+        if (path == null) return false;
+        Path current = path.toAbsolutePath().normalize();
+        while (current != null) {
+            if (Files.exists(current, LinkOption.NOFOLLOW_LINKS)
+                    && Files.isSymbolicLink(current)) {
+                return false;
+            }
+            current = current.getParent();
+        }
+        return true;
+    }
+
     private static Duration hours(long value) {
         return Duration.ofHours(Math.max(0, value));
     }
@@ -363,9 +422,14 @@ public class RuntimeRetentionService {
     private record RetentionContext(Map<UUID, Experiment> known,
                                     Set<UUID> protectedSnapshots,
                                     Set<UUID> activeExperiments,
-                                    Set<UUID> recoveryExperiments,
-                                    Set<UUID> forkReadySources,
-                                    Set<Path> protectedCandidates) {
+                                     Set<UUID> recoveryExperiments,
+                                     Set<UUID> forkReadySources,
+                                     Set<Path> protectedCandidates,
+                                     UUID ownerId,
+                                     Set<UUID> ownedExperiments) {
+        private boolean scoped() {
+            return ownerId != null;
+        }
     }
 
     public record CleanupReport(int verificationWorkspaces,

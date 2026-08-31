@@ -10,6 +10,9 @@ import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.LinkOption;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.attribute.PosixFilePermission;
 import java.security.SecureRandom;
 import java.util.Base64;
@@ -20,6 +23,14 @@ import java.util.EnumSet;
 public final class SecretCipher {
     private static final int KEY_BYTES = 32;
     private static final int NONCE_BYTES = 12;
+    private static final int TAG_BYTES = 16;
+    // User model keys are bounded to printable ASCII in ModelApiKeyPolicy.
+    // Keep a small allowance for the nonce, authentication tag and Base64
+    // expansion so a tampered database cannot make decrypt allocate an
+    // unbounded byte array before the domain boundary rejects it.
+    private static final int MAX_PLAINTEXT_BYTES = 4_096;
+    private static final int MAX_PACKED_BYTES = NONCE_BYTES + TAG_BYTES + MAX_PLAINTEXT_BYTES;
+    private static final int MAX_CIPHERTEXT_CHARS = ((MAX_PACKED_BYTES + 2) / 3) * 4;
     private final SecretKey key;
     private final SecureRandom random = new SecureRandom();
 
@@ -28,26 +39,60 @@ public final class SecretCipher {
         try {
             java.util.Objects.requireNonNull(instanceLock, "instanceLock");
             Path root = Path.of(dataRoot).toAbsolutePath().normalize();
+            if (Files.isSymbolicLink(root)) {
+                throw new IllegalStateException("Offcanon data directory must not be a symbolic link");
+            }
             Files.createDirectories(root);
+            if (Files.isSymbolicLink(root)) {
+                throw new IllegalStateException("Offcanon data directory must not be a symbolic link");
+            }
             Path keyPath = root.resolve("secret.key");
             byte[] raw;
-            if (Files.exists(keyPath)) {
+            if (Files.exists(keyPath, LinkOption.NOFOLLOW_LINKS)) {
+                if (Files.isSymbolicLink(keyPath) || !Files.isRegularFile(keyPath, LinkOption.NOFOLLOW_LINKS)) {
+                    throw new IllegalStateException("Offcanon secret key must be a regular file");
+                }
+                try {
+                    if (Files.size(keyPath) != KEY_BYTES) {
+                        throw new IllegalStateException("Invalid Offcanon secret key");
+                    }
+                } catch (java.io.IOException error) {
+                    throw new IllegalStateException("Unable to inspect Offcanon secret key", error);
+                }
                 raw = Files.readAllBytes(keyPath);
                 if (raw.length != KEY_BYTES) throw new IllegalStateException("Invalid Offcanon secret key");
+                tightenPermissions(keyPath);
             } else {
                 raw = new byte[KEY_BYTES];
                 random.nextBytes(raw);
-                Files.write(keyPath, raw);
                 try {
-                    Files.setPosixFilePermissions(keyPath, EnumSet.of(PosixFilePermission.OWNER_READ,
-                            PosixFilePermission.OWNER_WRITE));
-                } catch (UnsupportedOperationException ignored) {
-                    // Windows ACLs are inherited from the application data directory.
+                    Files.write(keyPath, raw, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+                } catch (FileAlreadyExistsException race) {
+                    // Another thread/process may have created the key between
+                    // the existence check and CREATE_NEW. Re-open it through
+                    // the same symlink/size checks instead of overwriting it.
+                    if (Files.isSymbolicLink(keyPath)
+                            || !Files.isRegularFile(keyPath, LinkOption.NOFOLLOW_LINKS)
+                            || Files.size(keyPath) != KEY_BYTES) {
+                        throw new IllegalStateException("Invalid Offcanon secret key", race);
+                    }
+                    raw = Files.readAllBytes(keyPath);
+                    if (raw.length != KEY_BYTES) throw new IllegalStateException("Invalid Offcanon secret key");
                 }
+                tightenPermissions(keyPath);
             }
             key = new SecretKeySpec(raw, "AES");
         } catch (Exception error) {
             throw new IllegalStateException("Unable to initialise Offcanon secret storage", error);
+        }
+    }
+
+    private void tightenPermissions(Path keyPath) {
+        try {
+            Files.setPosixFilePermissions(keyPath, EnumSet.of(PosixFilePermission.OWNER_READ,
+                    PosixFilePermission.OWNER_WRITE));
+        } catch (UnsupportedOperationException | java.io.IOException | SecurityException ignored) {
+            // Windows ACLs are inherited from the application data directory.
         }
     }
 
@@ -71,8 +116,13 @@ public final class SecretCipher {
     public String decrypt(String ciphertext) {
         if (ciphertext == null || ciphertext.isBlank()) return "";
         try {
+            if (ciphertext.length() > MAX_CIPHERTEXT_CHARS) {
+                throw new IllegalArgumentException("Encrypted credential is too large");
+            }
             byte[] packed = Base64.getDecoder().decode(ciphertext);
-            if (packed.length <= NONCE_BYTES) throw new IllegalArgumentException("Invalid encrypted credential");
+            if (packed.length <= NONCE_BYTES + TAG_BYTES || packed.length > MAX_PACKED_BYTES) {
+                throw new IllegalArgumentException("Invalid encrypted credential");
+            }
             byte[] nonce = java.util.Arrays.copyOfRange(packed, 0, NONCE_BYTES);
             byte[] encrypted = java.util.Arrays.copyOfRange(packed, NONCE_BYTES, packed.length);
             Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");

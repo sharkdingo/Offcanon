@@ -6,6 +6,9 @@ spring:
     locations: classpath:db/migration
 server:
   port: 8080
+  # Offcanon is a local desktop service. Keep the HTTP surface off the LAN by
+  # default; deployments that intentionally expose it must opt in explicitly.
+  address: 127.0.0.1
   shutdown: graceful
 offcanon:
   data-root: ${user.home}/.offcanon

@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 
-const props = defineProps<{ labelledBy: string; describedBy?: string }>()
+const props = withDefaults(defineProps<{ labelledBy: string; describedBy?: string; closeDisabled?: boolean }>(), {
+  closeDisabled: false,
+})
 const emit = defineEmits<{ close: [] }>()
 const dialog = ref<HTMLDialogElement | null>(null)
 const returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
@@ -11,11 +13,28 @@ let focusRestored = false
 function restoreFocus() {
   if (focusRestored) return
   focusRestored = true
-  window.setTimeout(() => returnFocus?.focus(), 0)
+  window.setTimeout(() => {
+    if (returnFocus
+      && document.contains(returnFocus)
+      && !returnFocus.hasAttribute('disabled')
+      && returnFocus.offsetParent !== null
+      && !returnFocus.closest('[inert], [aria-hidden="true"]')) {
+      returnFocus.focus()
+      return
+    }
+    // Actions such as clearing a credential can remove or disable the
+    // original trigger. Keep keyboard focus in the visible application.
+    const fallback = Array.from(document.querySelectorAll<HTMLElement>(
+      'button, a[href], input, textarea, select, summary, [contenteditable="true"], [tabindex]:not([tabindex="-1"])',
+    )).find((item) => !item.hasAttribute('disabled')
+      && item.offsetParent !== null
+      && !item.closest('[inert], [aria-hidden="true"]'))
+    fallback?.focus()
+  }, 0)
 }
 
 function close() {
-  if (!dialog.value?.open) return
+  if (props.closeDisabled || !dialog.value?.open) return
   closing = true
   dialog.value.close()
 }
@@ -36,12 +55,13 @@ function handleBackdrop(event: MouseEvent) {
 
 function trapFocus(event: KeyboardEvent) {
   if (event.key !== 'Tab' || !dialog.value) return
-  const focusable = Array.from(dialog.value.querySelectorAll<HTMLElement>('button, a[href], input, textarea, select, [tabindex]:not([tabindex="-1"])'))
+  const focusable = Array.from(dialog.value.querySelectorAll<HTMLElement>('button, a[href], input, textarea, select, summary, [contenteditable="true"], [tabindex]:not([tabindex="-1"])'))
     .filter((item) => !item.hasAttribute('disabled') && item.offsetParent !== null)
   if (!focusable.length) return
   const first = focusable[0]
   const last = focusable[focusable.length - 1]
-  if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
+  if (!dialog.value.contains(document.activeElement)) { event.preventDefault(); first.focus() }
+  else if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
   else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
 }
 
@@ -66,6 +86,7 @@ defineExpose({ close })
   <dialog
     ref="dialog"
     class="dialog"
+    aria-modal="true"
     :aria-labelledby="props.labelledBy"
     :aria-describedby="props.describedBy"
     @cancel.prevent="close"

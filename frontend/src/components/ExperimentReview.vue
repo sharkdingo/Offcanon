@@ -85,10 +85,10 @@ const integrityFailureText = computed(() => [
 const isIntegrityFailure = (item: Evidence) => item.kind !== 'AGENT_COMMAND'
   && !item.trusted
   && /(MUTATED_SOURCE|SOURCE_INTEGRITY|CANDIDATE_MUTATED|MUTATED)/.test(integrityFailureText.value)
-const trustedEvidence = computed(() => experimentVerificationEvidence.value.filter((item) => item.trusted))
-const failedVerificationEvidence = computed(() => experimentVerificationEvidence.value.filter((item) => !item.trusted && !isIntegrityFailure(item)))
-const trustedPromotionEvidence = computed(() => promotionVerificationEvidence.value.filter((item) => item.trusted))
-const failedPromotionEvidence = computed(() => promotionVerificationEvidence.value.filter((item) => !item.trusted && !isIntegrityFailure(item)))
+const trustedEvidence = computed(() => experimentVerificationEvidence.value.filter((item) => evidenceAccepted(item)))
+const failedVerificationEvidence = computed(() => experimentVerificationEvidence.value.filter((item) => !evidenceAccepted(item) && !isIntegrityFailure(item)))
+const trustedPromotionEvidence = computed(() => promotionVerificationEvidence.value.filter((item) => evidenceAccepted(item)))
+const failedPromotionEvidence = computed(() => promotionVerificationEvidence.value.filter((item) => !evidenceAccepted(item) && !isIntegrityFailure(item)))
 const invalidatedEvidence = computed(() => props.evidence.filter(isIntegrityFailure))
 const observations = computed(() => props.evidence.filter((item) => item.kind === 'AGENT_COMMAND'))
 const resolvedRunConfiguration = computed(() => {
@@ -149,7 +149,7 @@ const failurePresentation = computed<FailurePresentation | null>(() => {
       ),
     }
   }
-  if (code === 'MODEL_ENDPOINT_INVALID' || code === 'MODEL_REQUEST_FAILED') {
+  if (code === 'MODEL_ENDPOINT_INVALID' || code === 'MODEL_API_KEY_INVALID' || code === 'MODEL_REQUEST_INVALID' || code === 'MODEL_REQUEST_FAILED') {
     return {
       title: text('模型连接设置不可用', 'Model connection settings are not usable'),
       detail: text(
@@ -210,6 +210,8 @@ const failureRetryable = computed(() => {
 const failureNeedsSettings = computed(() => [
   'MODEL_NOT_CONFIGURED',
   'MODEL_ENDPOINT_INVALID',
+  'MODEL_API_KEY_INVALID',
+  'MODEL_REQUEST_INVALID',
   'MODEL_REQUEST_FAILED',
 ].includes(failureCode(props.experiment?.failureReason?.trim() ?? '')))
 
@@ -322,6 +324,10 @@ function evidencePassed(item: Evidence) {
   return item.exitCode === 0 && !item.timedOut && !item.cancelled
 }
 
+function evidenceAccepted(item: Evidence) {
+  return item.trusted && evidencePassed(item)
+}
+
 function evidenceFailureText(item: Evidence) {
   if (item.cancelled) return text('已取消', 'cancelled')
   if (item.timedOut) return text('超时', 'timed out')
@@ -406,7 +412,7 @@ function activateWithKeyboard(event: KeyboardEvent, index: number) {
         </div>
         <div class="decision-actions">
           <button v-if="experiment.status === 'READY_TO_RUN'" class="button primary" :disabled="actionBusy" @click="emit('start')"><LoaderCircle :class="{ spin: actionBusy }" :size="16" /> {{ text('启动代理', 'Start agent') }}</button>
-           <button v-if="experiment.status === 'VERIFIED'" class="button" :class="canonicalChanged ? 'warning' : promotionPreview?.promotable ? 'success' : 'secondary'" :disabled="actionBusy || recoveryRequired || !!promotionPreviewError || !!promotionRecoveryError || (!promotionPreview?.promotable && !promotionPreview?.conflict)" @click="emit('promote')">
+            <button v-if="experiment.status === 'VERIFIED'" class="button" :class="canonicalChanged ? 'warning' : promotionPreview?.promotable ? 'success' : 'secondary'" :disabled="actionBusy || recoveryRequired || !!evidenceError || !!diffError || !!promotionPreviewError || !!promotionRecoveryError || (!promotionPreview?.promotable && !promotionPreview?.conflict)" @click="emit('promote')">
             <AlertTriangle v-if="canonicalChanged" :size="16" />
             <GitCommitHorizontal v-else :size="16" />
             {{ canonicalChanged ? text('处理主线变化', 'Resolve canonical change') : text('审阅并应用', 'Review and apply') }}
