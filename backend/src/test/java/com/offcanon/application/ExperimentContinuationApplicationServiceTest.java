@@ -27,11 +27,111 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ExperimentContinuationApplicationServiceTest {
     @TempDir
     Path temp;
+
+    @Test
+    void sealedResultCanContinueWithoutAcceptanceCommands() throws Exception {
+        Fixture fixture = fixture("waiting");
+        Experiment source = fixture.create("implement parser");
+        Snapshot result = sealWaiting(fixture, source, "candidate awaiting verification\n");
+
+        Experiment successor = fixture.service.continueExperiment(fixture.owner, source.id(), "Keep going.");
+
+        assertEquals(source.id(), successor.continuedFromExperimentId());
+        assertEquals(ExperimentStatus.READY_TO_RUN, successor.status());
+        assertEquals("candidate awaiting verification\n",
+                Files.readString(successor.workspacePath().resolve("app.txt")));
+        assertEquals("canonical\n", Files.readString(fixture.canonical.resolve("app.txt")));
+        Experiment storedSource = fixture.experiments.findById(source.id()).orElseThrow();
+        assertEquals(ExperimentStatus.AGENT_COMPLETED, storedSource.status());
+        assertEquals(result.id(), storedSource.resultSnapshotId());
+        assertFalse(fixture.experiments.hasRunningExperiment(source.sessionId(), successor.id()));
+    }
+
+    @Test
+    void sealedResultContinuationUsesSnapshotAfterSourceWorkspaceContentIsRemoved() throws Exception {
+        Fixture fixture = fixture("waiting-retained");
+        Experiment source = fixture.create("implement parser");
+        sealWaiting(fixture, source, "durable sealed candidate\n");
+        Files.delete(source.workspacePath().resolve("app.txt"));
+
+        Experiment successor = fixture.service.continueExperiment(fixture.owner, source.id(), "Keep going.");
+
+        assertEquals("durable sealed candidate\n",
+                Files.readString(successor.workspacePath().resolve("app.txt")));
+        assertEquals("canonical\n", Files.readString(fixture.canonical.resolve("app.txt")));
+    }
+
+    @Test
+    void sealedWaitingResultCannotBypassConfiguredAcceptanceCommands() throws Exception {
+        Fixture fixture = fixture("waiting-with-policy", List.of("test"));
+        Experiment source = fixture.create("implement parser");
+        sealWaiting(fixture, source, "candidate awaiting verification\n");
+
+        com.offcanon.shared.domain.DomainException error = assertThrows(
+                com.offcanon.shared.domain.DomainException.class,
+                () -> fixture.service.continueExperiment(fixture.owner, source.id(), "Keep going."));
+
+        assertEquals("EXPERIMENT_NOT_CONTINUABLE", error.code());
+        assertEquals("canonical\n", Files.readString(fixture.canonical.resolve("app.txt")));
+    }
+
+    @Test
+    void unsealedAgentCompletedResultCannotContinue() throws Exception {
+        Fixture fixture = fixture("unsealed");
+        Experiment source = fixture.create("implement parser");
+        start(fixture, source);
+        source.markAgentCompleted("finished editing");
+        fixture.experiments.save(source);
+
+        com.offcanon.shared.domain.DomainException error = assertThrows(
+                com.offcanon.shared.domain.DomainException.class,
+                () -> fixture.service.continueExperiment(fixture.owner, source.id(), "Keep going."));
+
+        assertEquals("EXPERIMENT_NOT_CONTINUABLE", error.code());
+    }
+
+    @Test
+    void sealedResultCannotContinueUntilTheOriginalRunReleasesItsLease() throws Exception {
+        Fixture fixture = fixture("waiting-with-lease");
+        Experiment source = fixture.create("implement parser");
+        sealWaiting(fixture, source, "candidate awaiting verification\n");
+        var heldLease = fixture.leases.tryAcquire(source.sessionId(), source.id()).orElseThrow();
+        try {
+            com.offcanon.shared.domain.DomainException error = assertThrows(
+                    com.offcanon.shared.domain.DomainException.class,
+                    () -> fixture.service.continueExperiment(fixture.owner, source.id(), "Keep going."));
+
+            assertEquals("SESSION_ALREADY_RUNNING", error.code());
+        } finally {
+            heldLease.release();
+        }
+    }
+
+    @Test
+    void anotherPreparedExperimentBlocksContinuationInTheSameSession() throws Exception {
+        Fixture fixture = fixture("waiting-with-queued-successor");
+        Experiment source = fixture.create("implement parser");
+        sealWaiting(fixture, source, "candidate awaiting verification\n");
+        Experiment queued = Experiment.continueFrom(fixture.project.id(), source.sessionId(), source.id(),
+                "already queued", Instant.now());
+        fixture.experiments.save(queued);
+        queued.beginSnapshot();
+        fixture.experiments.save(queued);
+        queued.attachBase(source.baseSnapshotId(), source.workspacePath());
+        fixture.experiments.save(queued);
+
+        com.offcanon.shared.domain.DomainException error = assertThrows(
+                com.offcanon.shared.domain.DomainException.class,
+                () -> fixture.service.continueExperiment(fixture.owner, source.id(), "Keep going."));
+
+        assertEquals("SESSION_ALREADY_RUNNING", error.code());
+    }
 
     @Test
     void providerFailureCarriesPartialWorkWhenCanonicalStillMatches() throws Exception {
@@ -113,6 +213,13 @@ class ExperimentContinuationApplicationServiceTest {
     }
 
     private Snapshot seal(Fixture fixture, Experiment experiment, String content) throws Exception {
+        Snapshot result = sealWaiting(fixture, experiment, content);
+        experiment.beginVerification();
+        fixture.experiments.save(experiment);
+        return result;
+    }
+
+    private Snapshot sealWaiting(Fixture fixture, Experiment experiment, String content) throws Exception {
         start(fixture, experiment);
         Files.writeString(experiment.workspacePath().resolve("app.txt"), content);
         experiment.markAgentCompleted("implemented the requested change");
@@ -121,8 +228,6 @@ class ExperimentContinuationApplicationServiceTest {
         Snapshot result = fixture.snapshotPort.captureWorkspace(fixture.project, experiment.workspacePath(), base.fingerprint());
         fixture.snapshots.save(result);
         experiment.sealResult(result.id());
-        fixture.experiments.save(experiment);
-        experiment.beginVerification();
         fixture.experiments.save(experiment);
         return result;
     }
@@ -133,6 +238,10 @@ class ExperimentContinuationApplicationServiceTest {
     }
 
     private Fixture fixture(String name) throws Exception {
+        return fixture(name, List.of());
+    }
+
+    private Fixture fixture(String name, List<String> verificationCommands) throws Exception {
         Path canonical = Files.createDirectories(temp.resolve(name).resolve("canonical"));
         ProcessRunner runner = new ProcessRunner();
         git(runner, canonical, "-c", "init.defaultBranch=main", "init", "-q");
@@ -143,18 +252,19 @@ class ExperimentContinuationApplicationServiceTest {
         Path runtime = temp.resolve(name).resolve("runtime");
         UUID owner = UUID.randomUUID();
         InMemoryProjectRepository projects = new InMemoryProjectRepository();
-        Project project = projects.save(Project.create(owner, name, canonical, List.of(), Instant.now()));
+        Project project = projects.save(Project.create(owner, name, canonical, verificationCommands, Instant.now()));
         InMemorySessionRepository sessions = new InMemorySessionRepository();
         InMemoryExperimentRepository experiments = new InMemoryExperimentRepository();
         InMemorySnapshotRepository snapshots = new InMemorySnapshotRepository();
         GitSnapshotAdapter snapshotPort = new GitSnapshotAdapter(runner, runtime.toString());
         LocalWorkspaceAdapter workspaces = new LocalWorkspaceAdapter(runtime.toString(), runner);
         AtomicLong seconds = new AtomicLong();
+        InMemorySessionRunLease leases = new InMemorySessionRunLease();
         ExperimentApplicationService service = new ExperimentApplicationService(projects, sessions, experiments,
                 snapshots, snapshotPort, workspaces,
                 () -> Instant.parse("2026-08-28T00:00:00Z").plusSeconds(seconds.getAndIncrement()),
-                new InMemorySessionRunLease(), new com.offcanon.infrastructure.memory.InMemoryPromotionLock());
-        return new Fixture(owner, canonical, project, experiments, snapshots, snapshotPort, runner, service);
+                leases, new com.offcanon.infrastructure.memory.InMemoryPromotionLock());
+        return new Fixture(owner, canonical, project, experiments, snapshots, snapshotPort, leases, runner, service);
     }
 
     private ProcessRunner.ProcessResult git(ProcessRunner runner, Path cwd, String... arguments) {
@@ -171,6 +281,7 @@ class ExperimentContinuationApplicationServiceTest {
                            InMemoryExperimentRepository experiments,
                            InMemorySnapshotRepository snapshots,
                            GitSnapshotAdapter snapshotPort,
+                           InMemorySessionRunLease leases,
                            ProcessRunner runner,
                            ExperimentApplicationService service) {
         private Experiment create(String task) {

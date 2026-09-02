@@ -11,6 +11,7 @@ import com.offcanon.port.SnapshotRepository;
 import com.offcanon.port.WorkspacePort;
 import com.offcanon.port.VerificationPort;
 import com.offcanon.port.PromotionJournalPort;
+import com.offcanon.port.SessionRunLeasePort;
 import com.offcanon.experiment.domain.ExperimentStatus;
 import com.offcanon.project.domain.Project;
 import com.offcanon.shared.domain.DomainException;
@@ -37,6 +38,8 @@ public class PromotionApplicationService {
     private final VerificationPort verification;
     private final PromotionJournalPort journals;
     private final PromotionStateCoordinator states;
+    /** Prevent a successor from starting while an older result is promoted. */
+    private final SessionRunLeasePort sessionRunLease;
     private final String ownerId = UUID.randomUUID().toString();
 
     @Autowired
@@ -50,7 +53,8 @@ public class PromotionApplicationService {
                                        EventSink events,
                                        VerificationPort verification,
                                        PromotionJournalPort journals,
-                                       PromotionStateCoordinator states) {
+                                       PromotionStateCoordinator states,
+                                       SessionRunLeasePort sessionRunLease) {
         this.experiments = experiments;
         this.projects = projects;
         this.snapshots = snapshots;
@@ -62,6 +66,23 @@ public class PromotionApplicationService {
         this.verification = verification;
         this.journals = journals;
         this.states = states;
+        this.sessionRunLease = sessionRunLease;
+    }
+
+    /** Compatibility constructor retaining the pre-lease dependency shape. */
+    public PromotionApplicationService(ExperimentRepository experiments,
+                                       ProjectRepository projects,
+                                       SnapshotRepository snapshots,
+                                       SnapshotPort snapshotPort,
+                                       WorkspacePort workspaces,
+                                       PromotionPort promotionPort,
+                                       PromotionLockPort promotionLock,
+                                       EventSink events,
+                                       VerificationPort verification,
+                                       PromotionJournalPort journals,
+                                       PromotionStateCoordinator states) {
+        this(experiments, projects, snapshots, snapshotPort, workspaces, promotionPort,
+                promotionLock, events, verification, journals, states, null);
     }
 
     public PromotionApplicationService(ExperimentRepository experiments,
@@ -76,18 +97,35 @@ public class PromotionApplicationService {
                                        PromotionJournalPort journals) {
         this(experiments, projects, snapshots, snapshotPort, workspaces, promotionPort, promotionLock,
                 events, verification, journals, new PromotionStateCoordinator(experiments, journals,
-                        (org.springframework.transaction.PlatformTransactionManager) null));
+                        (org.springframework.transaction.PlatformTransactionManager) null), null);
     }
 
+    /**
+     * Publish one terminal activity record for every promotion attempt. The
+     * detailed phase events remain useful for progress, while this boundary
+     * gives the client an unambiguous end even when a preparation branch
+     * returns early or a durable journal has already reached a terminal phase.
+     */
     public PromotionOutcome promote(UUID experimentId) {
+        try {
+            PromotionOutcome outcome = promoteInternal(experimentId);
+            publishPromotionFinished(experimentId, outcome);
+            return outcome;
+        } catch (RuntimeException error) {
+            publishPromotionFailure(experimentId, error);
+            throw error;
+        }
+    }
+
+    private PromotionOutcome promoteInternal(UUID experimentId) {
         Experiment experiment = experiments.findById(experimentId)
                 .orElseThrow(() -> new NotFoundException("Experiment not found: " + experimentId));
         Project project = projects.findById(experiment.projectId())
                 .orElseThrow(() -> new NotFoundException("Project not found: " + experiment.projectId()));
-        if (experiment.status() == com.offcanon.experiment.domain.ExperimentStatus.PROMOTED) {
+        if (experiment.status() == ExperimentStatus.PROMOTED) {
             return PromotionOutcome.blocked("ALREADY_PROMOTED", "Experiment has already been promoted");
         }
-        if (experiment.status() != com.offcanon.experiment.domain.ExperimentStatus.VERIFIED) {
+        if (experiment.status() != ExperimentStatus.VERIFIED) {
             return PromotionOutcome.blocked("NOT_VERIFIED", "Only a verified experiment can be promoted");
         }
         if (experiment.baseSnapshotId() == null) {
@@ -96,13 +134,33 @@ public class PromotionApplicationService {
         if (experiment.resultSnapshotId() == null) {
             return PromotionOutcome.blocked("RESULT_SNAPSHOT_MISSING", "Verified experiment has no immutable result snapshot");
         }
+        SessionRunLeasePort.Lease sessionLease = acquirePromotionLease(experiment, project);
+        if (sessionLease == null) {
+            publishSessionBlocked(experimentId);
+            return PromotionOutcome.blocked("SESSION_ALREADY_RUNNING",
+                    "A later experiment in this session is still active");
+        }
+        try {
+            sessionLease.assertHeld();
+            return promoteWithLease(experimentId, experiment, project, sessionLease);
+        } finally {
+            releaseSessionLeaseBestEffort(sessionLease);
+        }
+    }
+
+    private PromotionOutcome promoteWithLease(UUID experimentId,
+                                              Experiment experiment,
+                                              Project project,
+                                              SessionRunLeasePort.Lease sessionLease) {
         Snapshot base = snapshots.findById(experiment.baseSnapshotId())
                 .orElseThrow(() -> new NotFoundException("Snapshot not found: " + experiment.baseSnapshotId()));
         Snapshot resultSnapshot = snapshots.findById(experiment.resultSnapshotId())
                 .orElseThrow(() -> new NotFoundException("Snapshot not found: " + experiment.resultSnapshotId()));
 
         try {
+            sessionLease.assertHeld();
             String preparedAgainst = snapshotPort.currentFingerprint(project);
+            sessionLease.assertHeld();
             if (!base.fingerprint().equals(preparedAgainst)) {
                 experiment.markStale("Canonical changed after this experiment started");
                 experiments.save(experiment);
@@ -155,6 +213,7 @@ public class PromotionApplicationService {
             try {
                 return promotionLock.withProjectLock(project.id(), () -> {
                 promotionLock.assertHeld(project.id());
+                sessionLease.assertHeld();
                 // Re-read the lifecycle marker after acquiring the project
                 // lock. A concurrent stale confirmation or promotion may have
                 // advanced the detached object used during preparation; never
@@ -169,6 +228,18 @@ public class PromotionApplicationService {
                     return PromotionOutcome.blocked("CONCURRENT_STATE_CHANGE",
                             "Experiment is now " + lockedExperiment.status().name());
                 }
+                // A successor may have been persisted after preparation but
+                // before this final critical section. The session lease held
+                // by this promotion normally prevents that race; retain the
+                // durable-state check for crash/recovery rows as well.
+                if (experiments.hasRunningExperiment(lockedExperiment.sessionId(), lockedExperiment.id())) {
+                    markJournalAborted(preparedJournal,
+                            "A later experiment in this session is still active");
+                    discardCandidateBestEffort(candidate);
+                    return PromotionOutcome.blocked("SESSION_ALREADY_RUNNING",
+                            "A later experiment in this session is still active");
+                }
+                sessionLease.assertHeld();
                 String current = snapshotPort.currentFingerprint(project);
                 if (!preparedAgainst.equals(current)) {
                     states.stalePrepared(experiment, preparedJournal,
@@ -211,6 +282,7 @@ public class PromotionApplicationService {
                 boolean canonicalUpdated = false;
                 try {
                     promotionLock.assertHeld(project.id());
+                    sessionLease.assertHeld();
                     // Pass the lifecycle object reloaded after the durable
                     // transition, rather than the detached VERIFIED object
                     // captured before lock acquisition. Adapters may use the
@@ -221,18 +293,21 @@ public class PromotionApplicationService {
                         throw new DomainException("PROMOTION_APPLY_FAILED", "Promotion adapter did not apply the candidate");
                     }
                     promotionLock.assertHeld(project.id());
+                    sessionLease.assertHeld();
                     String finalFingerprint = snapshotPort.currentFingerprint(project);
                     if (!candidateFingerprint.equals(finalFingerprint)) {
                         throw new DomainException("MANUAL_RECOVERY_REQUIRED",
                                 "Canonical changed during final apply; inspect it before another promotion");
                     }
                     promotionLock.assertHeld(project.id());
+                    sessionLease.assertHeld();
                     states.commit(experiment, applyingJournal, finalFingerprint, Instant.now());
                     // Verify ownership once more after the paired durable
                     // commit. If the lease expires in this tiny window, the
                     // terminal journal still wins and the caller must not
                     // downgrade the experiment to recovery.
                     promotionLock.assertHeld(project.id());
+                    sessionLease.assertHeld();
                     publishBestEffort(experimentId, "PROMOTED", java.util.Map.of(
                             "changedFiles", result.changedFiles(), "fingerprint", finalFingerprint));
                     return PromotionOutcome.promoted(result.changedFiles(), finalFingerprint);
@@ -336,6 +411,84 @@ public class PromotionApplicationService {
             // Lifecycle state and canonical contents remain authoritative when telemetry is unavailable.
         }
     }
+
+    private void publishPromotionFinished(UUID experimentId, PromotionOutcome outcome) {
+        if (outcome == null) return;
+        java.util.Map<String, Object> payload = new java.util.LinkedHashMap<>();
+        payload.put("promoted", outcome.promoted());
+        payload.put("status", outcome.status() == null ? "PROMOTION_FINISHED" : outcome.status());
+        payload.put("detail", boundedDetail(outcome.detail()));
+        payload.put("changedFiles", outcome.changedFiles() == null ? java.util.List.of() : outcome.changedFiles());
+        if (outcome.fingerprint() != null) payload.put("fingerprint", outcome.fingerprint());
+        publishBestEffort(experimentId, "PROMOTION_FINISHED", java.util.Map.copyOf(payload));
+    }
+
+    private void publishPromotionFailure(UUID experimentId, RuntimeException error) {
+        String status = "PROMOTION_FAILED";
+        try {
+            Experiment current = experiments.findById(experimentId).orElse(null);
+            if (current != null) status = current.status().name();
+        } catch (RuntimeException ignored) {
+            // Keep the generic terminal status when the lifecycle row cannot
+            // be read while handling the original promotion failure.
+        }
+        publishBestEffort(experimentId, "PROMOTION_FINISHED", java.util.Map.of(
+                "promoted", false,
+                "status", status,
+                "detail", boundedDetail(error == null ? null : error.getMessage()),
+                "changedFiles", java.util.List.of()));
+    }
+
+    private String boundedDetail(String value) {
+        if (value == null || value.isBlank()) return "";
+        String normalized = value.trim();
+        return normalized.length() > 2_000 ? normalized.substring(0, 2_000) + "..." : normalized;
+    }
+
+    /**
+     * Acquire the session execution capability while holding the project lock.
+     * The acquisition is deliberately non-blocking: waiting for a lease while
+     * another operation holds the project lock would create a lock-order cycle.
+     */
+    private SessionRunLeasePort.Lease acquirePromotionLease(Experiment experiment, Project project) {
+        return promotionLock.withProjectLock(project.id(), () -> {
+            promotionLock.assertHeld(project.id());
+            if (experiments.hasRunningExperiment(experiment.sessionId(), experiment.id())) return null;
+            if (sessionRunLease == null) return NOOP_SESSION_LEASE;
+            return sessionRunLease.tryAcquire(experiment.sessionId(), experiment.id()).orElse(null);
+        });
+    }
+
+    private void releaseSessionLeaseBestEffort(SessionRunLeasePort.Lease lease) {
+        if (lease == null || lease == NOOP_SESSION_LEASE) return;
+        try {
+            lease.release();
+        } catch (RuntimeException ignored) {
+            // A remote lease will expire; never mask the promotion outcome.
+        }
+    }
+
+    private void publishSessionBlocked(UUID experimentId) {
+        publishBestEffort(experimentId, "PROMOTION_BLOCKED", java.util.Map.of(
+                "status", "SESSION_ALREADY_RUNNING",
+                "detail", "A later experiment in this session is still active"));
+    }
+
+    private static final SessionRunLeasePort.Lease NOOP_SESSION_LEASE = new SessionRunLeasePort.Lease() {
+        private static final UUID ZERO = new UUID(0L, 0L);
+
+        @Override
+        public UUID sessionId() { return ZERO; }
+
+        @Override
+        public UUID experimentId() { return ZERO; }
+
+        @Override
+        public void assertHeld() { }
+
+        @Override
+        public void release() { }
+    };
 
     private void markJournalRecoveryRequired(com.offcanon.promotion.domain.PromotionJournal journal, String reason) {
         try {

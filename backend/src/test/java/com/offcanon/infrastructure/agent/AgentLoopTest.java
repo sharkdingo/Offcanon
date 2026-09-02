@@ -42,6 +42,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -85,16 +86,33 @@ class AgentLoopTest {
         responses.add(new ModelResponse("", List.of(new ToolCall("1", "write_file", Map.of("path", "hello.txt", "content", "hello"))), "tool_calls"));
         responses.add(new ModelResponse("", List.of(new ToolCall("2", "shell", Map.of("command", "type hello.txt"))), "tool_calls"));
         responses.add(new ModelResponse("Updated and verified.", List.of(), "stop"));
+        InMemoryEventSink events = new InMemoryEventSink();
 
         Experiment experiment = Experiment.create(UUID.randomUUID(), UUID.randomUUID(), "write hello.txt and verify it", Instant.now());
         experiment.beginSnapshot();
         experiment.attachBase(UUID.randomUUID(), temp);
-        AgentRunResult result = new AgentLoop(new QueueModel(responses), registry, 5).run(experiment, new NoCancellation());
+        AgentRunResult result = new AgentLoop(new QueueModel(responses), registry, 5, events, 80_000)
+                .run(experiment, new NoCancellation());
 
         assertEquals("Updated and verified.", result.summary());
         assertEquals(3, result.steps());
         assertEquals("hello", Files.readString(temp.resolve("hello.txt")));
         assertTrue(result.context().stream().anyMatch(message -> message.role().name().equals("TOOL") && message.content().contains("exit=0")));
+        var toolCalls = events.after(experiment.id(), 0).stream()
+                .filter(event -> event.type().equals("TOOL_CALL"))
+                .toList();
+        assertEquals(2, toolCalls.size());
+        assertEquals("hello.txt", toolCalls.get(0).payload().get("path"));
+        assertEquals(5, toolCalls.get(0).payload().get("contentChars"));
+        assertFalse(toolCalls.get(0).payload().containsKey("content"));
+        assertEquals("type hello.txt", toolCalls.get(1).payload().get("command"));
+        var toolResults = events.after(experiment.id(), 0).stream()
+                .filter(event -> event.type().equals("TOOL_RESULT"))
+                .toList();
+        assertEquals(2, toolResults.size());
+        assertEquals(List.of("1", "2"), toolResults.stream()
+                .map(event -> event.payload().get("toolCallId").toString()).toList());
+        assertTrue(toolResults.stream().allMatch(event -> Boolean.TRUE.equals(event.payload().get("success"))));
     }
 
     @Test
@@ -481,20 +499,62 @@ class AgentLoopTest {
     }
 
     @Test
+    void closesToolCallWithFailureEventWhenDispatchAborts() {
+        InMemoryEventSink events = new InMemoryEventSink();
+        ToolRegistry interruptedRegistry = new ToolRegistry() {
+            @Override
+            public List<ToolDefinition> definitions() {
+                return List.of(new ToolDefinition("shell", "Run a project command", Map.of("type", "object")));
+            }
+
+            @Override
+            public ToolResult dispatch(Experiment experiment, ToolCall call) {
+                throw new DomainException("TOOL_EXECUTION_INDETERMINATE", "execution outcome is unknown");
+            }
+        };
+        ModelPort model = request -> new ModelResponse("", List.of(
+                new ToolCall("call-1", "shell", Map.of("command", "build"))), "tool_calls");
+        Experiment experiment = experiment(temp);
+
+        DomainException error = assertThrows(DomainException.class, () -> new AgentLoop(
+                model, interruptedRegistry, 2, events, 20_000, 1, Duration.ofSeconds(5))
+                .run(experiment, new NoCancellation()));
+
+        assertEquals("TOOL_EXECUTION_INDETERMINATE", error.code());
+        var toolEvents = events.after(experiment.id(), 0);
+        var calls = toolEvents.stream().filter(event -> event.type().equals("TOOL_CALL")).toList();
+        var results = toolEvents.stream().filter(event -> event.type().equals("TOOL_RESULT")).toList();
+        assertEquals(1, calls.size());
+        assertEquals(1, results.size());
+        assertTrue(calls.getFirst().sequence() < results.getFirst().sequence());
+        assertEquals("call-1", results.getFirst().payload().get("toolCallId"));
+        assertEquals(false, results.getFirst().payload().get("success"));
+        assertEquals("TOOL_EXECUTION_INDETERMINATE", results.getFirst().payload().get("errorCode"));
+        assertEquals(true, results.getFirst().payload().get("interrupted"));
+    }
+
+    @Test
     void overallDeadlineInterruptsAnInFlightTool() throws Exception {
         CountDownLatch interrupted = new CountDownLatch(1);
         Tool blocking = blockingTool("blocking", interrupted);
         ModelPort model = request -> new ModelResponse("", List.of(
                 new ToolCall("slow", "blocking", Map.of())), "tool_calls");
         long started = System.nanoTime();
+        Experiment experiment = experiment(temp);
+        InMemoryEventSink events = new InMemoryEventSink();
 
         DomainException error = assertThrows(DomainException.class, () -> new AgentLoop(model,
-                new ToolRegistryImpl(List.of(blocking)), 2, new InMemoryEventSink(), 20_000, 1,
-                Duration.ofMillis(100)).run(experiment(temp), new NoCancellation()));
+                new ToolRegistryImpl(List.of(blocking)), 2, events, 20_000, 1,
+                Duration.ofMillis(100)).run(experiment, new NoCancellation()));
 
         assertEquals("AGENT_TIMEOUT", error.code());
         assertTrue(interrupted.await(2, TimeUnit.SECONDS), "tool worker was not interrupted at the run deadline");
         assertTrue(Duration.ofNanos(System.nanoTime() - started).compareTo(Duration.ofSeconds(2)) < 0);
+        var timeoutResult = events.after(experiment.id(), 0).stream()
+                .filter(event -> event.type().equals("TOOL_RESULT")).toList();
+        assertEquals(1, timeoutResult.size());
+        assertEquals("AGENT_TIMEOUT", timeoutResult.getFirst().payload().get("errorCode"));
+        assertEquals(true, timeoutResult.getFirst().payload().get("interrupted"));
     }
 
     @Test
@@ -530,13 +590,20 @@ class AgentLoopTest {
         });
         ModelPort model = request -> new ModelResponse("", List.of(
                 new ToolCall("cancel", "blocking", Map.of())), "tool_calls");
+        Experiment experiment = experiment(temp);
+        InMemoryEventSink events = new InMemoryEventSink();
 
         DomainException error = assertThrows(DomainException.class, () -> new AgentLoop(model,
-                new ToolRegistryImpl(List.of(blocking)), 2, new InMemoryEventSink(), 20_000, 1,
-                Duration.ofSeconds(5)).run(experiment(temp), cancelled::get));
+                new ToolRegistryImpl(List.of(blocking)), 2, events, 20_000, 1,
+                Duration.ofSeconds(5)).run(experiment, cancelled::get));
 
         assertEquals("AGENT_CANCELLED", error.code());
         assertTrue(interrupted.await(2, TimeUnit.SECONDS), "tool worker was not interrupted on cancellation");
+        var cancellationResult = events.after(experiment.id(), 0).stream()
+                .filter(event -> event.type().equals("TOOL_RESULT")).toList();
+        assertEquals(1, cancellationResult.size());
+        assertEquals("AGENT_CANCELLED", cancellationResult.getFirst().payload().get("errorCode"));
+        assertEquals(true, cancellationResult.getFirst().payload().get("interrupted"));
     }
 
     @Test

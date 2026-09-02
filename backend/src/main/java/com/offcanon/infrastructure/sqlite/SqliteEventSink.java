@@ -6,6 +6,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.offcanon.agent.domain.RunEvent;
 import com.offcanon.port.EventSink;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -18,14 +20,29 @@ import java.util.UUID;
 
 @Component
 
+/**
+ * Durable activity telemetry with a bounded per-experiment history. Lifecycle
+ * and evidence tables remain authoritative; trimming this stream only affects
+ * older activity rows and deliberately leaves sequence numbers
+ * monotonic so SSE clients can detect a retention gap.
+ */
 public class SqliteEventSink implements EventSink {
     private static final int MAX_FETCH_EVENTS = 500;
     private final JdbcTemplate jdbc;
     private final ObjectMapper mapper;
+    private final int retentionPerExperiment;
 
     public SqliteEventSink(JdbcTemplate jdbc, ObjectMapper mapper) {
+        this(jdbc, mapper, 2_000);
+    }
+
+    @Autowired
+    public SqliteEventSink(JdbcTemplate jdbc,
+                           ObjectMapper mapper,
+                           @Value("${offcanon.events.retention-per-experiment:2000}") int retentionPerExperiment) {
         this.jdbc = jdbc;
         this.mapper = mapper;
+        this.retentionPerExperiment = Math.max(100, retentionPerExperiment);
     }
 
     @Override
@@ -38,6 +55,8 @@ public class SqliteEventSink implements EventSink {
         RunEvent event = new RunEvent(UUID.randomUUID(), experimentId, sequence, type, timestamp, payload);
         jdbc.update("INSERT INTO run_events (event_id,experiment_id,sequence,type,event_timestamp,payload) VALUES (?,?,?,?,?,?)",
                 event.eventId().toString(), experimentId.toString(), sequence, type, SqliteValues.epochMicros(timestamp), json(payload));
+        jdbc.update("DELETE FROM run_events WHERE experiment_id=? AND sequence <= (SELECT MAX(sequence) - ? FROM run_events WHERE experiment_id=?)",
+                experimentId.toString(), retentionPerExperiment, experimentId.toString());
         return event;
     }
 
@@ -45,6 +64,14 @@ public class SqliteEventSink implements EventSink {
     public List<RunEvent> after(UUID experimentId, long sequence) {
         return jdbc.query("SELECT * FROM run_events WHERE experiment_id=? AND sequence>? ORDER BY sequence LIMIT ?",
                 this::map, experimentId.toString(), sequence, MAX_FETCH_EVENTS);
+    }
+
+    @Override
+    public long latestSequence(UUID experimentId) {
+        Long latest = jdbc.queryForObject(
+                "SELECT COALESCE(MAX(sequence), 0) FROM run_events WHERE experiment_id=?",
+                Long.class, experimentId.toString());
+        return latest == null ? 0 : latest;
     }
 
     private RunEvent map(ResultSet rs, int row) throws SQLException {

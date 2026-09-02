@@ -12,6 +12,7 @@ import com.offcanon.promotion.application.PromotionPreviewApplicationService;
 import com.offcanon.promotion.application.PromotionRecoveryService;
 import com.offcanon.promotion.application.PromotionStaleApplicationService;
 import com.offcanon.verification.domain.Evidence;
+import com.offcanon.workspace.domain.Snapshot;
 import com.offcanon.identity.web.IdentityContext;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
@@ -95,6 +96,13 @@ public class ExperimentController {
         return toResponse(agentService.cancel(experimentId));
     }
 
+    /** Re-run trusted verification for a sealed result after project settings change. */
+    @PostMapping("/{experimentId}/verify")
+    public ExperimentResponse verify(@PathVariable UUID experimentId, HttpServletRequest request) {
+        experimentService.get(experimentId, owner(request));
+        return toResponse(agentService.reverify(experimentId));
+    }
+
     @PostMapping("/{experimentId}/continue")
     public ExperimentResponse continueExperiment(@PathVariable UUID experimentId,
                                                  @Valid @RequestBody(required = false) ContinueExperimentRequest continuation,
@@ -113,7 +121,14 @@ public class ExperimentController {
     @GetMapping("/{experimentId}/diff")
     public List<DiffEntryResponse> diff(@PathVariable UUID experimentId, HttpServletRequest request) {
         Experiment experiment = experimentService.get(experimentId, owner(request));
-        if (experiment.baseSnapshotId() == null || experiment.workspacePath() == null) return List.of();
+        if (experiment.baseSnapshotId() == null) return List.of();
+        if (experiment.resultSnapshotId() == null && experiment.workspacePath() == null) {
+            if (evictedTerminalWorkspace(experiment.status())) {
+                throw new com.offcanon.shared.domain.DomainException("DIFF_UNAVAILABLE",
+                        "The experiment workspace is unavailable and no result snapshot was sealed");
+            }
+            return List.of();
+        }
         if (experiment.resultSnapshotId() == null
                 && !java.nio.file.Files.isDirectory(experiment.workspacePath(), NOFOLLOW_LINKS)
                 && evictedTerminalWorkspace(experiment.status())) {
@@ -123,17 +138,29 @@ public class ExperimentController {
             throw new com.offcanon.shared.domain.DomainException("DIFF_UNAVAILABLE",
                     "The experiment workspace was evicted before a result snapshot was sealed");
         }
-        var snapshot = snapshotRepository.findById(experiment.baseSnapshotId())
+        Snapshot snapshot = snapshotRepository.findById(experiment.baseSnapshotId())
                 .orElseThrow(() -> new com.offcanon.shared.web.NotFoundException("Snapshot not found: " + experiment.baseSnapshotId()));
-        java.nio.file.Path comparedWorkspace = experiment.resultSnapshotId() == null
-                ? experiment.workspacePath()
-                : snapshotRepository.findById(experiment.resultSnapshotId())
-                .orElseThrow(() -> new com.offcanon.shared.web.NotFoundException("Snapshot not found: " + experiment.resultSnapshotId()))
-                .materializedPath();
+        assertSnapshotBelongsToExperiment(snapshot, experiment);
+        java.nio.file.Path comparedWorkspace;
+        if (experiment.resultSnapshotId() == null) {
+            comparedWorkspace = experiment.workspacePath();
+        } else {
+            Snapshot result = snapshotRepository.findById(experiment.resultSnapshotId())
+                    .orElseThrow(() -> new com.offcanon.shared.web.NotFoundException("Snapshot not found: " + experiment.resultSnapshotId()));
+            assertSnapshotBelongsToExperiment(result, experiment);
+            comparedWorkspace = result.materializedPath();
+        }
         return diffPort.compare(snapshot, comparedWorkspace).stream()
                 .map(item -> new DiffEntryResponse(item.path(), item.change().name(), item.beforeBytes(), item.afterBytes(),
                         item.binary(), item.additions(), item.deletions(), item.patch()))
                 .toList();
+    }
+
+    private void assertSnapshotBelongsToExperiment(Snapshot snapshot, Experiment experiment) {
+        if (!experiment.projectId().equals(snapshot.projectId())) {
+            throw new com.offcanon.shared.domain.DomainException("DIFF_SNAPSHOT_PROJECT_MISMATCH",
+                    "A diff snapshot belongs to a different project");
+        }
     }
 
     private boolean evictedTerminalWorkspace(ExperimentStatus status) {

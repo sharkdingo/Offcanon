@@ -104,6 +104,24 @@ class TaskMemoryApplicationServiceTest {
     }
 
     @Test
+    void policyInvalidationKeepsVerifiedFactsHistoricalUntilReverification() {
+        Evidence proof = trustedEvidence();
+        evidence.save(proof);
+        var verified = service.recordVerifiedSystem(session.id(), experiment.id(), result.id(),
+                new MemoryPatch(TaskMemoryKind.VERIFIED_FACT, "All trusted tests pass",
+                        List.of(proof.id()), List.of()));
+
+        experiment.invalidateVerificationForPolicyChange();
+        experiments.save(experiment);
+
+        TaskMemoryProjection projection = service.project(session.id(), result.id());
+        assertEquals(List.of(verified), projection.stale().stream()
+                .map(TaskMemoryProjection.ProjectedMemory::revision).toList());
+        assertEquals(List.of(), projection.current().stream()
+                .map(TaskMemoryProjection.ProjectedMemory::revision).toList());
+    }
+
+    @Test
     void verifiedSystemMemoryRejectsTrustedButFailedEvidence() {
         Evidence failed = new Evidence(UUID.randomUUID(), experiment.id(), result.id(), "VERIFICATION",
                 "mvn test", ".", 1, "", "failed", NOW, NOW.plusSeconds(1), Duration.ofSeconds(1),

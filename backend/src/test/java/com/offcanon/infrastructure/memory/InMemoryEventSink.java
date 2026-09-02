@@ -49,6 +49,15 @@ public class InMemoryEventSink implements EventSink {
         }
     }
 
+    @Override
+    public long latestSequence(UUID experimentId) {
+        EventBuffer buffer = buffers.get(experimentId);
+        if (buffer == null) return 0;
+        synchronized (buffer) {
+            return buffer.lastSequence;
+        }
+    }
+
     private static final class EventBuffer {
         private final ArrayDeque<RunEvent> events = new ArrayDeque<>();
         private long lastSequence;

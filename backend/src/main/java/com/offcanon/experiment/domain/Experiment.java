@@ -16,6 +16,7 @@ public final class Experiment {
      */
     private static final int MAX_AGENT_SUMMARY_CHARS = 12_000;
     private static final String SUMMARY_TRUNCATION_MARKER = "\n...[summary truncated]...";
+    public static final String VERIFICATION_POLICY_CHANGED_PREFIX = "VERIFICATION_POLICY_CHANGED:";
     private final UUID id;
     private final UUID projectId;
     private final UUID sessionId;
@@ -163,23 +164,89 @@ public final class Experiment {
         if (resultSnapshotId == null) {
             throw new DomainException("RESULT_SNAPSHOT_MISSING", "Seal the experiment result before verification");
         }
-        transition(ExperimentStatus.AGENT_COMPLETED, ExperimentStatus.VERIFYING);
+        if (status != ExperimentStatus.AGENT_COMPLETED
+                && status != ExperimentStatus.REJECTED
+                && !(status == ExperimentStatus.STALE && verificationPolicyChanged())) {
+            throw new DomainException("INVALID_EXPERIMENT_TRANSITION",
+                    "Expected AGENT_COMPLETED or REJECTED but was " + status);
+        }
+        // A verification attempt authorizes the result only after its own
+        // commands finish. Do not carry an older pass/failure into the new
+        // VERIFYING state or into an interruption recovery response.
+        verificationResult = null;
+        failureReason = null;
+        status = ExperimentStatus.VERIFYING;
+        version++;
+    }
+
+    /**
+     * Returns an interrupted verification to its durable pre-verification
+     * boundary. The sealed result remains immutable and can be checked again
+     * without rerunning the agent.
+     */
+    public void recoverInterruptedVerification(String reason) {
+        requireStatus(ExperimentStatus.VERIFYING);
+        if (resultSnapshotId == null) {
+            throw new DomainException("RESULT_SNAPSHOT_MISSING",
+                    "An interrupted verification requires a sealed result");
+        }
+        failureReason = Objects.requireNonNull(reason, "reason");
+        status = ExperimentStatus.AGENT_COMPLETED;
+        version++;
+    }
+
+    /**
+     * Preserve a sealed result when a post-agent bookkeeping step fails. The
+     * result is still valid input for an explicit verification retry; marking
+     * the row FAILED here would strand the immutable snapshot behind a state
+     * from which re-verification is not allowed.
+     */
+    public void retainVerificationWaiting(String reason) {
+        requireStatus(ExperimentStatus.AGENT_COMPLETED);
+        if (resultSnapshotId == null) {
+            throw new DomainException("RESULT_SNAPSHOT_MISSING",
+                    "A waiting verification requires a sealed result");
+        }
+        failureReason = Objects.requireNonNull(reason, "reason");
+        version++;
     }
 
     public void markVerified(VerificationResult result) {
         requireStatus(ExperimentStatus.VERIFYING);
         verificationResult = Objects.requireNonNull(result, "result");
         status = result.passed() ? ExperimentStatus.VERIFIED : ExperimentStatus.REJECTED;
-        if (!result.passed()) {
-            failureReason = result.failureReason();
+        failureReason = result.passed() ? null : result.failureReason();
+        version++;
+    }
+
+    /**
+     * A project acceptance-policy change invalidates the authorization carried
+     * by a previously passing result. The immutable result snapshot and its
+     * evidence remain available; only the lifecycle returns to the sealed
+     * waiting boundary so it can be checked against the new policy.
+     */
+    public void invalidateVerificationForPolicyChange() {
+        requireStatus(ExperimentStatus.VERIFIED);
+        if (resultSnapshotId == null) {
+            throw new DomainException("RESULT_SNAPSHOT_MISSING",
+                    "A verified experiment must retain its immutable result");
         }
+        verificationResult = null;
+        failureReason = VERIFICATION_POLICY_CHANGED_PREFIX
+                + " acceptance commands changed; run verification again";
+        status = ExperimentStatus.AGENT_COMPLETED;
         version++;
     }
 
     public void rejectVerifiedPromotion(VerificationResult result) {
         requireStatus(ExperimentStatus.VERIFIED);
-        verificationResult = Objects.requireNonNull(result, "result");
-        failureReason = result.failureReason();
+        VerificationResult checked = Objects.requireNonNull(result, "result");
+        if (checked.passed()) {
+            throw new DomainException("INVALID_PROMOTION_REJECTION",
+                    "Passing verification cannot reject promotion");
+        }
+        verificationResult = checked;
+        failureReason = checked.failureReason();
         status = ExperimentStatus.REJECTED;
         version++;
     }
@@ -318,6 +385,10 @@ public final class Experiment {
                 && status != ExperimentStatus.VERIFYING) {
             throw new DomainException("INVALID_CANCEL", "Terminal experiment cannot be cancelled");
         }
+        if (status == ExperimentStatus.AGENT_COMPLETED && resultSnapshotId != null) {
+            throw new DomainException("RESULT_ALREADY_SEALED",
+                    "A sealed result must be verified or continued; it cannot be cancelled");
+        }
         status = ExperimentStatus.CANCELLED;
         version++;
     }
@@ -364,5 +435,8 @@ public final class Experiment {
     public String agentSummary() { return agentSummary; }
     public VerificationResult verificationResult() { return verificationResult; }
     public String failureReason() { return failureReason; }
+    public boolean verificationPolicyChanged() {
+        return failureReason != null && failureReason.startsWith(VERIFICATION_POLICY_CHANGED_PREFIX);
+    }
     public long version() { return version; }
 }

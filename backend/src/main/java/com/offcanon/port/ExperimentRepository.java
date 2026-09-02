@@ -29,6 +29,25 @@ public interface ExperimentRepository {
     }
 
     /**
+     * Returns whether a project has lifecycle work that must block changing
+     * its verification policy. A sealed AGENT_COMPLETED result with a
+     * re-runnable result is intentionally excluded: the user can configure or
+     * correct commands before asking for verification. VERIFIED results are
+     * also excluded because the project service invalidates them under the
+     * project lock before saving a changed policy.
+     */
+    default boolean hasBlockingExperimentForProject(UUID projectId) {
+        if (projectId == null) return false;
+        return findByProjectId(projectId).stream().anyMatch(experiment -> switch (experiment.status()) {
+            case CREATED, SNAPSHOTTING, READY_TO_RUN, RUNNING,
+                    VERIFYING, PREPARING_PROMOTION,
+                    PROMOTING, RECOVERY_REQUIRED -> true;
+            case AGENT_COMPLETED -> experiment.resultSnapshotId() == null;
+            default -> false;
+        });
+    }
+
+    /**
      * Same-session guard for a newly persisted READY_TO_RUN row. The row being
      * started must be excluded, otherwise the lifecycle would reject its own
      * transition after creation.
@@ -38,12 +57,13 @@ public interface ExperimentRepository {
                 .filter(experiment -> excludingExperimentId == null
                         || !experiment.id().equals(excludingExperimentId))
                 .anyMatch(experiment -> switch (experiment.status()) {
-                    // A READY_TO_RUN row is a queued, not yet claimed run. It
-                    // must not prevent the first worker from claiming the
-                    // session; once that worker is RUNNING, later starts are
-                    // blocked. Creation/continuation use the broader guard.
-                    case RUNNING, AGENT_COMPLETED, VERIFYING,
-                            PREPARING_PROMOTION, PROMOTING, RECOVERY_REQUIRED -> true;
+                    // The caller's own preparation/queue row is filtered out
+                    // above. Any other row in those states still owns the
+                    // session and must block a second lifecycle.
+                    case CREATED, SNAPSHOTTING, READY_TO_RUN, RUNNING,
+                            VERIFYING, PREPARING_PROMOTION,
+                            PROMOTING, RECOVERY_REQUIRED -> true;
+                    case AGENT_COMPLETED -> experiment.resultSnapshotId() == null;
                     default -> false;
                 });
     }

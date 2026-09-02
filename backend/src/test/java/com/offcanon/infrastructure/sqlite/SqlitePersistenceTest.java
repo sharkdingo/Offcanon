@@ -110,6 +110,60 @@ class SqlitePersistenceTest {
     }
 
     @Test
+    void boundsPersistedEventsPerExperimentWithoutResettingSequence() throws Exception {
+        try (ApplicationInstanceLock lock = new ApplicationInstanceLock(dataRoot.toString());
+             HikariDataSource dataSource = (HikariDataSource) new SqlitePersistenceConfiguration()
+                     .dataSource(dataRoot.toString(), lock)) {
+            JdbcTemplate jdbc = new SqlitePersistenceConfiguration().jdbcTemplate(dataSource);
+            Flyway.configure().dataSource(dataSource).locations("classpath:db/migration").load().migrate();
+            UUID experiment = seedExperiment(jdbc);
+            // Use the minimum supported retention in order to exercise the
+            // trim boundary without making this persistence test slow.
+            SqliteEventSink sink = new SqliteEventSink(jdbc, new ObjectMapper(), 100);
+
+            for (int index = 1; index <= 105; index++) {
+                sink.publish(experiment, "TEST", Map.of("n", index));
+            }
+
+            assertEquals(100L, jdbc.queryForObject(
+                    "SELECT COUNT(*) FROM run_events WHERE experiment_id=?", Long.class, experiment.toString()));
+            assertEquals(java.util.stream.LongStream.rangeClosed(6, 105).boxed().toList(),
+                    sink.after(experiment, 0).stream().map(RunEvent::sequence).toList());
+            assertEquals(105L, sink.latestSequence(experiment));
+
+            RunEvent next = sink.publish(experiment, "TEST", Map.of("n", 106));
+            assertEquals(106L, next.sequence());
+            assertEquals(100L, jdbc.queryForObject(
+                    "SELECT COUNT(*) FROM run_events WHERE experiment_id=?", Long.class, experiment.toString()));
+        }
+    }
+
+    @Test
+    void eventReadsArePagedAtFiveHundredRows() throws Exception {
+        try (ApplicationInstanceLock lock = new ApplicationInstanceLock(dataRoot.toString());
+             HikariDataSource dataSource = (HikariDataSource) new SqlitePersistenceConfiguration()
+                     .dataSource(dataRoot.toString(), lock)) {
+            JdbcTemplate jdbc = new SqlitePersistenceConfiguration().jdbcTemplate(dataSource);
+            Flyway.configure().dataSource(dataSource).locations("classpath:db/migration").load().migrate();
+            UUID experiment = seedExperiment(jdbc);
+            SqliteEventSink sink = new SqliteEventSink(jdbc, new ObjectMapper(), 1_000);
+
+            for (int index = 1; index <= 600; index++) {
+                sink.publish(experiment, "TEST", Map.of("n", index));
+            }
+
+            List<RunEvent> firstPage = sink.after(experiment, 0);
+            List<RunEvent> secondPage = sink.after(experiment, firstPage.getLast().sequence());
+            assertEquals(500, firstPage.size());
+            assertEquals(1L, firstPage.getFirst().sequence());
+            assertEquals(500L, firstPage.getLast().sequence());
+            assertEquals(100, secondPage.size());
+            assertEquals(501L, secondPage.getFirst().sequence());
+            assertEquals(600L, secondPage.getLast().sequence());
+        }
+    }
+
+    @Test
     void accountSettingsAndEncryptedCredentialSurviveRestart() {
         UUID userId = UUID.randomUUID();
         String plaintextKey = "restart-secret-key";

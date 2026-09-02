@@ -16,10 +16,12 @@ import com.offcanon.port.AgentLoopPort;
 import com.offcanon.port.CancellationPort;
 import com.offcanon.port.SnapshotPort;
 import com.offcanon.port.ToolRegistry;
+import com.offcanon.port.UserSettingsRepository;
 import com.offcanon.port.VerificationPort;
 import com.offcanon.port.WorkspacePort;
 import com.offcanon.project.domain.Project;
 import com.offcanon.session.domain.Session;
+import com.offcanon.shared.domain.DomainException;
 import com.offcanon.verification.domain.VerificationPurpose;
 import com.offcanon.verification.domain.VerificationResult;
 import com.offcanon.workspace.domain.Snapshot;
@@ -35,9 +37,12 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class AgentSettingsIntegrationTest {
@@ -120,5 +125,79 @@ class AgentSettingsIntegrationTest {
         assertEquals("ACCOUNT_SETTINGS", configEvent.payload().get("modelEndpointSource"));
         assertEquals("ACCOUNT_SETTINGS", configEvent.payload().get("modelNameSource"));
         assertEquals(true, configEvent.payload().get("effective"));
+    }
+
+    @Test
+    void rejectsMissingModelConfigurationBeforeAdvancingThePreparedExperiment() {
+        Instant now = Instant.parse("2026-08-28T00:00:00Z");
+        UUID owner = UUID.randomUUID();
+        InMemoryProjectRepository projects = new InMemoryProjectRepository();
+        Project project = projects.save(Project.create(owner, "demo", temp, List.of(), now));
+        InMemoryExperimentRepository experiments = new InMemoryExperimentRepository();
+        Experiment experiment = Experiment.create(project.id(), UUID.randomUUID(), "update service", now);
+        experiments.save(experiment);
+        experiment.beginSnapshot();
+        experiments.save(experiment);
+        experiment.attachBase(UUID.randomUUID(), temp);
+        experiments.save(experiment);
+        InMemoryUserSettingsRepository settings = new InMemoryUserSettingsRepository();
+        settings.save(UserSettings.defaults(owner, now));
+        ExecutorService executor = mock(ExecutorService.class);
+
+        AgentApplicationService service = new AgentApplicationService(experiments, projects,
+                new InMemorySnapshotRepository(), mock(SnapshotPort.class), mock(AgentLoopPort.class),
+                mock(VerificationPort.class), executor, new InMemoryEventSink(),
+                new InMemorySessionRunLease(), mock(WorkspacePort.class), settings, null, null,
+                20, 600, 80_000);
+
+        DomainException error = assertThrows(DomainException.class, () -> service.start(experiment.id()));
+
+        assertEquals("MODEL_NOT_CONFIGURED", error.code());
+        assertEquals(ExperimentStatus.READY_TO_RUN,
+                experiments.findById(experiment.id()).orElseThrow().status());
+        verify(executor, never()).execute(any());
+    }
+
+    @Test
+    void rejectsInvalidModelEndpointBeforeAdvancingThePreparedExperiment() {
+        Instant now = Instant.parse("2026-08-28T00:00:00Z");
+        UUID owner = UUID.randomUUID();
+        InMemoryProjectRepository projects = new InMemoryProjectRepository();
+        Project project = projects.save(Project.create(owner, "demo", temp, List.of(), now));
+        InMemoryExperimentRepository experiments = new InMemoryExperimentRepository();
+        Experiment experiment = Experiment.create(project.id(), UUID.randomUUID(), "update service", now);
+        experiments.save(experiment);
+        experiment.beginSnapshot();
+        experiments.save(experiment);
+        experiment.attachBase(UUID.randomUUID(), temp);
+        experiments.save(experiment);
+
+        // A repository can contain legacy or externally migrated settings that
+        // predate the current UserSettings invariant. The run boundary must
+        // still apply the shared endpoint policy before changing experiment
+        // state, so model adapters never receive an ambiguous destination.
+        UserSettings configured = mock(UserSettings.class);
+        when(configured.agentMaxSteps()).thenReturn(20);
+        when(configured.agentRunTimeoutSeconds()).thenReturn(600L);
+        when(configured.contextLimitChars()).thenReturn(80_000);
+        when(configured.modelEndpoint()).thenReturn("ftp://models.example/v1");
+        when(configured.modelName()).thenReturn("runtime-model");
+        when(configured.modelApiKey()).thenReturn("runtime-key");
+        UserSettingsRepository settings = mock(UserSettingsRepository.class);
+        when(settings.findByUserId(owner)).thenReturn(java.util.Optional.of(configured));
+        ExecutorService executor = mock(ExecutorService.class);
+
+        AgentApplicationService service = new AgentApplicationService(experiments, projects,
+                new InMemorySnapshotRepository(), mock(SnapshotPort.class), mock(AgentLoopPort.class),
+                mock(VerificationPort.class), executor, new InMemoryEventSink(),
+                new InMemorySessionRunLease(), mock(WorkspacePort.class), settings, null, null,
+                20, 600, 80_000);
+
+        DomainException error = assertThrows(DomainException.class, () -> service.start(experiment.id()));
+
+        assertEquals("MODEL_ENDPOINT_INVALID", error.code());
+        assertEquals(ExperimentStatus.READY_TO_RUN,
+                experiments.findById(experiment.id()).orElseThrow().status());
+        verify(executor, never()).execute(any());
     }
 }

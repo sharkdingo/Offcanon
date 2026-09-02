@@ -9,11 +9,13 @@ import com.offcanon.port.PromotionLockPort;
 import com.offcanon.port.PromotionJournalPort;
 import com.offcanon.port.SnapshotPort;
 import com.offcanon.port.SnapshotRepository;
+import com.offcanon.port.SessionRunLeasePort;
 import com.offcanon.project.domain.Project;
 import com.offcanon.shared.domain.DomainException;
 import com.offcanon.shared.web.NotFoundException;
 import com.offcanon.workspace.domain.Snapshot;
 import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Autowired;
 
 import java.util.Map;
 import java.util.Objects;
@@ -28,14 +30,17 @@ public class PromotionStaleApplicationService {
     private final EventSink events;
     private final PromotionLockPort promotionLock;
     private final PromotionJournalPort promotionJournals;
+    private final SessionRunLeasePort sessionRunLease;
 
+    @Autowired
     public PromotionStaleApplicationService(ExperimentRepository experiments,
                                              ProjectRepository projects,
                                              SnapshotRepository snapshots,
                                              SnapshotPort snapshotPort,
                                              EventSink events,
                                              PromotionLockPort promotionLock,
-                                             PromotionJournalPort promotionJournals) {
+                                             PromotionJournalPort promotionJournals,
+                                             SessionRunLeasePort sessionRunLease) {
         this.experiments = experiments;
         this.projects = projects;
         this.snapshots = snapshots;
@@ -43,6 +48,19 @@ public class PromotionStaleApplicationService {
         this.events = events;
         this.promotionLock = Objects.requireNonNull(promotionLock, "promotionLock");
         this.promotionJournals = promotionJournals;
+        this.sessionRunLease = sessionRunLease;
+    }
+
+    /** Compatibility constructor for focused tests that do not model session leases. */
+    public PromotionStaleApplicationService(ExperimentRepository experiments,
+                                             ProjectRepository projects,
+                                             SnapshotRepository snapshots,
+                                             SnapshotPort snapshotPort,
+                                             EventSink events,
+                                             PromotionLockPort promotionLock,
+                                             PromotionJournalPort promotionJournals) {
+        this(experiments, projects, snapshots, snapshotPort, events, promotionLock,
+                promotionJournals, null);
     }
 
     public StaleConfirmation confirm(UUID experimentId) {
@@ -75,29 +93,53 @@ public class PromotionStaleApplicationService {
                         "Verified experiment has no base snapshot", null);
             }
 
-            Snapshot base = snapshots.findById(experiment.baseSnapshotId())
-                    .orElseThrow(() -> new NotFoundException("Snapshot not found: " + experiment.baseSnapshotId()));
-            promotionLock.assertHeld(project.id());
-            String currentFingerprint = snapshotPort.currentFingerprint(project);
-            promotionLock.assertHeld(project.id());
-            if (base.fingerprint().equals(currentFingerprint)) {
-                return StaleConfirmation.unchanged("CANONICAL_MATCHES_BASE",
-                        "Canonical matches the experiment base; experiment remains verified", currentFingerprint);
+            if (experiments.hasRunningExperiment(experiment.sessionId(), experiment.id())) {
+                publishSessionBlocked(experimentId);
+                return StaleConfirmation.unchanged("SESSION_ALREADY_RUNNING",
+                        "A later experiment in this session is still active", null);
             }
-
+            SessionRunLeasePort.Lease sessionLease = acquireSessionLease(experiment);
+            if (sessionLease == null) {
+                publishSessionBlocked(experimentId);
+                return StaleConfirmation.unchanged("SESSION_ALREADY_RUNNING",
+                        "A later experiment in this session is still active", null);
+            }
             try {
+                sessionLease.assertHeld();
+                if (experiments.hasRunningExperiment(experiment.sessionId(), experiment.id())) {
+                    publishSessionBlocked(experimentId);
+                    return StaleConfirmation.unchanged("SESSION_ALREADY_RUNNING",
+                            "A later experiment in this session is still active", null);
+                }
+
+                Snapshot base = snapshots.findById(experiment.baseSnapshotId())
+                        .orElseThrow(() -> new NotFoundException("Snapshot not found: " + experiment.baseSnapshotId()));
                 promotionLock.assertHeld(project.id());
-                experiment.markStale("Canonical changed after this experiment started");
+                String currentFingerprint = snapshotPort.currentFingerprint(project);
                 promotionLock.assertHeld(project.id());
-                experiments.save(experiment);
-            } catch (DomainException error) {
-                if (!"EXPERIMENT_VERSION_CONFLICT".equals(error.code())) throw error;
-                Experiment current = experiments.findById(experimentId).orElse(experiment);
-                return StaleConfirmation.unchanged("CONCURRENT_STATE_CHANGE",
-                        "Experiment is now " + current.status().name(), currentFingerprint);
+                if (base.fingerprint().equals(currentFingerprint)) {
+                    return StaleConfirmation.unchanged("CANONICAL_MATCHES_BASE",
+                            "Canonical matches the experiment base; experiment remains verified", currentFingerprint);
+                }
+
+                try {
+                    promotionLock.assertHeld(project.id());
+                    sessionLease.assertHeld();
+                    experiment.markStale("Canonical changed after this experiment started");
+                    promotionLock.assertHeld(project.id());
+                    sessionLease.assertHeld();
+                    experiments.save(experiment);
+                } catch (DomainException error) {
+                    if (!"EXPERIMENT_VERSION_CONFLICT".equals(error.code())) throw error;
+                    Experiment current = experiments.findById(experimentId).orElse(experiment);
+                    return StaleConfirmation.unchanged("CONCURRENT_STATE_CHANGE",
+                            "Experiment is now " + current.status().name(), currentFingerprint);
+                }
+                publishBestEffort(experimentId, currentFingerprint);
+                return StaleConfirmation.marked(currentFingerprint);
+            } finally {
+                releaseSessionLeaseBestEffort(sessionLease);
             }
-            publishBestEffort(experimentId, currentFingerprint);
-            return StaleConfirmation.marked(currentFingerprint);
         });
     }
 
@@ -109,6 +151,39 @@ public class PromotionStaleApplicationService {
             // Experiment state remains authoritative when telemetry is unavailable.
         }
     }
+
+    private SessionRunLeasePort.Lease acquireSessionLease(Experiment experiment) {
+        if (sessionRunLease == null) return NOOP_SESSION_LEASE;
+        return sessionRunLease.tryAcquire(experiment.sessionId(), experiment.id()).orElse(null);
+    }
+
+    private void releaseSessionLeaseBestEffort(SessionRunLeasePort.Lease lease) {
+        if (lease == null || lease == NOOP_SESSION_LEASE) return;
+        try {
+            lease.release();
+        } catch (RuntimeException ignored) {
+            // A remote lease will expire; preserve the stale-confirmation result.
+        }
+    }
+
+    private void publishSessionBlocked(UUID experimentId) {
+        try {
+            events.publish(experimentId, "PROMOTION_BLOCKED", Map.of(
+                    "status", "SESSION_ALREADY_RUNNING",
+                    "detail", "A later experiment in this session is still active"));
+        } catch (RuntimeException ignored) {
+            // Lifecycle state remains authoritative when telemetry is unavailable.
+        }
+    }
+
+    private static final SessionRunLeasePort.Lease NOOP_SESSION_LEASE = new SessionRunLeasePort.Lease() {
+        private static final UUID ZERO = new UUID(0L, 0L);
+
+        @Override public UUID sessionId() { return ZERO; }
+        @Override public UUID experimentId() { return ZERO; }
+        @Override public void assertHeld() { }
+        @Override public void release() { }
+    };
 
     public record StaleConfirmation(boolean markedStale,
                                     String status,

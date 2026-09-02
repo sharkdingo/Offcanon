@@ -140,7 +140,6 @@ class AgentCancellationRaceTest {
         UUID projectId = UUID.randomUUID();
         UUID sessionId = UUID.randomUUID();
         Experiment first = readyExperiment(experiments, projectId, sessionId);
-        Experiment second = readyExperiment(experiments, projectId, sessionId);
         CountDownLatch keepFirstRunning = new CountDownLatch(1);
         AgentLoopPort loop = (current, cancellation, context, settings) -> {
             awaitIgnoringInterrupts(keepFirstRunning);
@@ -167,6 +166,7 @@ class AgentCancellationRaceTest {
 
         try {
             service.start(first.id());
+            Experiment second = readyExperiment(experiments, projectId, sessionId);
             DomainException error = assertThrows(DomainException.class, () -> service.start(second.id()));
 
             assertEquals("SESSION_ALREADY_RUNNING", error.code());

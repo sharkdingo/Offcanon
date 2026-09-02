@@ -63,6 +63,44 @@ class InMemoryExperimentRepositoryTest {
     }
 
     @Test
+    void sealedAgentCompletedSourceDoesNotBlockItsSuccessorStart() {
+        InMemoryExperimentRepository repository = new InMemoryExperimentRepository();
+        UUID sessionId = UUID.randomUUID();
+        Experiment sealed = Experiment.restore(UUID.randomUUID(), UUID.randomUUID(), sessionId,
+                "task", Instant.now(), ExperimentStatus.AGENT_COMPLETED, UUID.randomUUID(), UUID.randomUUID(),
+                Path.of("C:/offcanon/workspace"), null, null, null, 0);
+        repository.save(sealed);
+
+        assertTrue(repository.hasRunningExperiment(sessionId));
+        assertFalse(repository.hasRunningExperiment(sessionId, UUID.randomUUID()));
+    }
+
+    @Test
+    void unsealedAgentCompletedSourceStillBlocksItsSuccessorStart() {
+        InMemoryExperimentRepository repository = new InMemoryExperimentRepository();
+        UUID sessionId = UUID.randomUUID();
+        Experiment unsealed = Experiment.restore(UUID.randomUUID(), UUID.randomUUID(), sessionId,
+                "task", Instant.now(), ExperimentStatus.AGENT_COMPLETED, UUID.randomUUID(), null,
+                Path.of("C:/offcanon/workspace"), null, null, null, 0);
+        repository.save(unsealed);
+
+        assertTrue(repository.hasRunningExperiment(sessionId, UUID.randomUUID()));
+    }
+
+    @Test
+    void anotherReadyExperimentBlocksStartWhenTheCurrentRowIsExcluded() {
+        InMemoryExperimentRepository repository = new InMemoryExperimentRepository();
+        UUID sessionId = UUID.randomUUID();
+        Experiment queued = Experiment.restore(UUID.randomUUID(), UUID.randomUUID(), sessionId,
+                "queued task", Instant.now(), ExperimentStatus.READY_TO_RUN, UUID.randomUUID(), null,
+                Path.of("C:/offcanon/queued-workspace"), null, null, null, 0);
+        repository.save(queued);
+
+        assertTrue(repository.hasRunningExperiment(sessionId, UUID.randomUUID()));
+        assertFalse(repository.hasRunningExperiment(sessionId, queued.id()));
+    }
+
+    @Test
     void terminalStatesDoNotBlockAnotherExperiment() {
         InMemoryExperimentRepository repository = new InMemoryExperimentRepository();
         UUID sessionId = UUID.randomUUID();

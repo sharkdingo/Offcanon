@@ -8,6 +8,26 @@ export type Project = {
   createdAt: string
 }
 
+export const EXPERIMENT_STATUSES = [
+  'CREATED',
+  'SNAPSHOTTING',
+  'READY_TO_RUN',
+  'RUNNING',
+  'AGENT_COMPLETED',
+  'VERIFYING',
+  'VERIFIED',
+  'REJECTED',
+  'STALE',
+  'PREPARING_PROMOTION',
+  'PROMOTING',
+  'PROMOTED',
+  'RECOVERY_REQUIRED',
+  'FAILED',
+  'CANCELLED',
+] as const
+
+export type ExperimentStatus = typeof EXPERIMENT_STATUSES[number]
+
 export type ProjectRegistration = Project & {
   reopened: boolean
 }
@@ -39,7 +59,7 @@ export type Experiment = {
   sessionId: string
   continuedFromExperimentId: string | null
   task: string
-  status: string
+  status: ExperimentStatus
   baseSnapshotId: string | null
   resultSnapshotId: string | null
   workspacePath: string | null
@@ -270,9 +290,12 @@ export const api = {
   },
   createProject: (body: { name: string; canonicalPath: string; verificationCommands: string[] }) =>
     request<ProjectRegistration>('/api/projects', { method: 'POST', body: JSON.stringify(body) }),
+  createLocalProject: (body: { name: string; canonicalPath: string; verificationCommands: string[] }) =>
+    request<ProjectRegistration>('/api/projects/new', { method: 'POST', body: JSON.stringify(body) }),
   updateProject: (projectId: string, body: { name: string; canonicalPath: string; verificationCommands: string[] }) =>
     request<Project>(`/api/projects/${projectId}`, { method: 'PUT', body: JSON.stringify(body) }),
   experiments: (projectId: string) => request<Experiment[]>(`/api/projects/${projectId}/experiments`),
+  experiment: (experimentId: string) => request<Experiment>(`/api/experiments/${experimentId}`),
   sessions: (projectId: string) => request<Session[]>(`/api/projects/${projectId}/sessions`),
   createSession: (projectId: string, title: string) =>
     request<Session>(`/api/projects/${projectId}/sessions`, { method: 'POST', body: JSON.stringify({ title }) }),
@@ -287,6 +310,8 @@ export const api = {
     request<Experiment>(`/api/experiments/${experimentId}/start`, { method: 'POST' }),
   cancelExperiment: (experimentId: string) =>
     request<Experiment>(`/api/experiments/${experimentId}/cancel`, { method: 'POST' }),
+  verifyExperiment: (experimentId: string) =>
+    request<Experiment>(`/api/experiments/${experimentId}/verify`, { method: 'POST' }),
   promoteExperiment: (experimentId: string) =>
     request<PromotionOutcome>(`/api/experiments/${experimentId}/promote`, { method: 'POST' }),
   confirmExperimentStale: (experimentId: string) =>

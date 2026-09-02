@@ -34,3 +34,4 @@ offcanon:
   events:
     poll-interval-ms: 500
     heartbeat-interval-ms: 15000
+    retention-per-experiment: 2000

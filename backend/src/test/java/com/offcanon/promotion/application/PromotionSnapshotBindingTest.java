@@ -161,6 +161,23 @@ class PromotionSnapshotBindingTest {
     }
 
     @Test
+    void refusesToPromoteAnOlderResultWhileItsSessionHasAQueuedSuccessor() throws Exception {
+        Fixture fixture = fixture(List.of("java -version"));
+        Experiment older = fixture.verifiedExperiment();
+        Experiment successor = Experiment.continueFrom(older.projectId(), older.sessionId(), older.id(),
+                "continue the task", Instant.now());
+        fixture.experiments.save(successor);
+
+        PromotionApplicationService.PromotionOutcome outcome = fixture.promotions.promote(older.id());
+
+        assertFalse(outcome.promoted(), outcome.toString());
+        assertEquals("SESSION_ALREADY_RUNNING", outcome.status());
+        assertEquals(ExperimentStatus.VERIFIED,
+                fixture.experiments.findById(older.id()).orElseThrow().status());
+        assertEquals("base\n", normalized(fixture.canonical.resolve("service.txt")));
+    }
+
+    @Test
     void simultaneousPromotionRequestsEnterTheFinalCriticalSectionOnlyOnceAtATime() throws Exception {
         BarrierPromotionLock lock = new BarrierPromotionLock();
         Fixture fixture = fixture(List.of("java -version"), new LocalPromotionAdapter(lock), lock);

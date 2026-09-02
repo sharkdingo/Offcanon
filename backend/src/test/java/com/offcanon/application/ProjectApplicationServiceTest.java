@@ -4,10 +4,14 @@ import com.offcanon.infrastructure.git.GitSnapshotAdapter;
 import com.offcanon.infrastructure.memory.InMemoryProjectRepository;
 import com.offcanon.infrastructure.memory.InMemoryExperimentRepository;
 import com.offcanon.infrastructure.memory.InMemoryPromotionLock;
+import com.offcanon.infrastructure.memory.InMemoryPromotionJournal;
 import com.offcanon.experiment.domain.Experiment;
+import com.offcanon.experiment.domain.ExperimentStatus;
+import com.offcanon.promotion.domain.PromotionJournal;
 import com.offcanon.infrastructure.process.ProcessRunner;
 import com.offcanon.project.domain.Project;
 import com.offcanon.shared.domain.DomainException;
+import com.offcanon.verification.domain.VerificationResult;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -81,6 +85,18 @@ class ProjectApplicationServiceTest {
     }
 
     @Test
+    void permitsRegisteringAndUpdatingAProjectWithoutVerificationCommands() {
+        Project registered = service.register(fixtureOwner, "without-policy", repository.toString(), List.of());
+
+        assertEquals(List.of(), registered.verificationCommands());
+        Project updated = service.update(fixtureOwner, registered.id(), "without-policy-renamed",
+                repository.toString(), List.of());
+
+        assertEquals(List.of(), updated.verificationCommands());
+        assertEquals("without-policy-renamed", updated.name());
+    }
+
+    @Test
     void updatesMetadataWithoutChangingCanonicalIdentity() {
         Project registered = register("first", repository);
 
@@ -121,6 +137,95 @@ class ProjectApplicationServiceTest {
         ProjectApplicationService guarded = new ProjectApplicationService(projects,
                 new GitSnapshotAdapter(new ProcessRunner(), temp.resolve("offcanon-data-guarded").toString()),
                 experiments, new InMemoryPromotionLock());
+
+        DomainException error = assertThrows(DomainException.class, () -> guarded.update(
+                fixtureOwner, registered.id(), "renamed", repository.toString(), List.of("gradle test")));
+
+        assertEquals("VERIFICATION_POLICY_LOCKED", error.code());
+        assertEquals(List.of("mvn test"), projects.findById(registered.id()).orElseThrow().verificationCommands());
+    }
+
+    @Test
+    void allowsAddingAFirstVerificationPolicyToASealedResultWaitingForVerification() {
+        Project registered = service.register(fixtureOwner, "without-policy", repository.toString(), List.of());
+        InMemoryExperimentRepository experiments = new InMemoryExperimentRepository();
+        Experiment waiting = Experiment.create(registered.id(), UUID.randomUUID(), "waiting", java.time.Instant.now());
+        experiments.save(waiting);
+        waiting.beginSnapshot();
+        experiments.save(waiting);
+        waiting.attachBase(UUID.randomUUID(), repository);
+        experiments.save(waiting);
+        waiting.start();
+        experiments.save(waiting);
+        waiting.markAgentCompleted("done");
+        experiments.save(waiting);
+        waiting.sealResult(UUID.randomUUID());
+        experiments.save(waiting);
+        ProjectApplicationService guarded = new ProjectApplicationService(projects,
+                new GitSnapshotAdapter(new ProcessRunner(), temp.resolve("offcanon-data-waiting").toString()),
+                experiments, new InMemoryPromotionLock());
+
+        Project updated = guarded.update(fixtureOwner, registered.id(), "configured",
+                repository.toString(), List.of("mvn test"));
+
+        assertEquals(List.of("mvn test"), updated.verificationCommands());
+
+        Project changed = guarded.update(fixtureOwner, registered.id(), "configured",
+                repository.toString(), List.of("gradle test"));
+        assertEquals(List.of("gradle test"), changed.verificationCommands());
+
+        Project cleared = guarded.update(fixtureOwner, registered.id(), "configured",
+                repository.toString(), List.of());
+        assertEquals(List.of(), cleared.verificationCommands());
+    }
+
+    @Test
+    void changingPolicyInvalidatesVerifiedResultsAndKeepsThemReverifiable() {
+        Project registered = register("first", repository);
+        InMemoryExperimentRepository experiments = new InMemoryExperimentRepository();
+        Experiment verified = Experiment.create(registered.id(), UUID.randomUUID(), "verified", java.time.Instant.now());
+        experiments.save(verified);
+        verified.beginSnapshot();
+        experiments.save(verified);
+        verified.attachBase(UUID.randomUUID(), repository);
+        experiments.save(verified);
+        verified.start();
+        experiments.save(verified);
+        verified.markAgentCompleted("done");
+        experiments.save(verified);
+        UUID resultSnapshotId = UUID.randomUUID();
+        verified.sealResult(resultSnapshotId);
+        experiments.save(verified);
+        verified.beginVerification();
+        experiments.save(verified);
+        verified.markVerified(VerificationResult.passed(List.of()));
+        experiments.save(verified);
+
+        ProjectApplicationService guarded = new ProjectApplicationService(projects,
+                new GitSnapshotAdapter(new ProcessRunner(), temp.resolve("offcanon-data-verified").toString()),
+                experiments, new InMemoryPromotionLock());
+
+        Project updated = guarded.update(fixtureOwner, registered.id(), "first",
+                repository.toString(), List.of("gradle test"));
+
+        assertEquals(List.of("gradle test"), updated.verificationCommands());
+        Experiment invalidated = experiments.findById(verified.id()).orElseThrow();
+        assertEquals(ExperimentStatus.AGENT_COMPLETED, invalidated.status());
+        assertEquals(resultSnapshotId, invalidated.resultSnapshotId());
+        assertTrue(invalidated.failureReason().startsWith("VERIFICATION_POLICY_CHANGED:"));
+        assertTrue(invalidated.verificationResult() == null);
+    }
+
+    @Test
+    void blocksPolicyChangeWhilePromotionJournalIsUnresolved() {
+        Project registered = register("first", repository);
+        InMemoryPromotionJournal journals = new InMemoryPromotionJournal();
+        journals.create(PromotionJournal.create(UUID.randomUUID(), registered.id(),
+                "base-fingerprint", "candidate-fingerprint", repository.resolve(".candidate"),
+                "test-owner", java.time.Instant.now(), java.time.Instant.now().plusSeconds(600)));
+        ProjectApplicationService guarded = new ProjectApplicationService(projects,
+                new GitSnapshotAdapter(new ProcessRunner(), temp.resolve("offcanon-data-journal").toString()),
+                new InMemoryExperimentRepository(), new InMemoryPromotionLock(), journals);
 
         DomainException error = assertThrows(DomainException.class, () -> guarded.update(
                 fixtureOwner, registered.id(), "renamed", repository.toString(), List.of("gradle test")));

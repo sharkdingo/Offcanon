@@ -161,13 +161,13 @@ public class ExperimentApplicationService {
         if (!session.projectId().equals(project.id())) {
             throw new DomainException("SESSION_PROJECT_MISMATCH", "Session belongs to a different project");
         }
-        requireContinuable(source);
+        requireContinuable(source, project);
 
         ReentrantLock lock = sessionLocks.computeIfAbsent(session.id(), ignored -> new ReentrantLock());
         lock.lock();
         try {
             assertPromotionLockHeld(project.id());
-            if (experimentRepository.hasRunningExperiment(session.id())) {
+            if (experimentRepository.hasRunningExperiment(session.id(), source.id())) {
                 throw new DomainException("SESSION_ALREADY_RUNNING", "A session can run only one experiment at a time");
             }
             String nextTask = task == null || task.isBlank()
@@ -273,17 +273,29 @@ public class ExperimentApplicationService {
         return sessionRepository.save(Session.create(project.id(), sessionTitle, clock.now()));
     }
 
-    private void requireContinuable(Experiment source) {
+    private void requireContinuable(Experiment source, Project project) {
         switch (source.status()) {
             case VERIFIED, REJECTED, STALE, PROMOTED, FAILED, CANCELLED -> {
                 return;
             }
+            case AGENT_COMPLETED -> {
+                if (source.resultSnapshotId() != null
+                        && (project.verificationCommands().isEmpty()
+                        || source.verificationPolicyChanged())) {
+                    return;
+                }
+            }
             default -> throw new DomainException("EXPERIMENT_NOT_CONTINUABLE",
                     "Experiment cannot be continued from " + source.status());
         }
+        throw new DomainException("EXPERIMENT_NOT_CONTINUABLE",
+                "A sealed result can be continued before verification only when no acceptance commands are configured");
     }
 
     private ContinuationSeed continuationSeed(Project project, Experiment source, Snapshot currentBase) {
+        if (source.status() == ExperimentStatus.AGENT_COMPLETED) {
+            return sealedWaitingResultSeed(project, source, currentBase);
+        }
         if (source.baseSnapshotId() == null) return ContinuationSeed.none();
         Snapshot sourceBase = snapshotRepository.findById(source.baseSnapshotId()).orElse(null);
         if (sourceBase == null || !sourceBase.fingerprint().equals(currentBase.fingerprint())) {
@@ -315,6 +327,42 @@ public class ExperimentApplicationService {
             }
             throw error;
         }
+    }
+
+    private ContinuationSeed sealedWaitingResultSeed(Project project,
+                                                     Experiment source,
+                                                     Snapshot currentBase) {
+        if (source.baseSnapshotId() == null) {
+            throw new DomainException("BASE_SNAPSHOT_MISSING",
+                    "The sealed result has no base snapshot");
+        }
+        if (source.resultSnapshotId() == null) {
+            throw new DomainException("RESULT_SNAPSHOT_MISSING",
+                    "The experiment result has not been sealed");
+        }
+        Snapshot sourceBase = snapshotRepository.findById(source.baseSnapshotId())
+                .orElseThrow(() -> new DomainException("BASE_SNAPSHOT_MISSING",
+                        "The sealed result base snapshot is unavailable"));
+        if (!sourceBase.projectId().equals(project.id())) {
+            throw new DomainException("CONTINUATION_PROJECT_MISMATCH",
+                    "The sealed result base belongs to a different project");
+        }
+        if (!sourceBase.fingerprint().equals(currentBase.fingerprint())) {
+            throw new DomainException("PROJECT_CHANGED",
+                    "The project changed after this result was sealed; start a new task from the current project");
+        }
+        Snapshot result = snapshotRepository.findById(source.resultSnapshotId())
+                .orElseThrow(() -> new DomainException("RESULT_SNAPSHOT_MISSING",
+                        "The sealed result snapshot is unavailable"));
+        if (!result.projectId().equals(project.id())) {
+            throw new DomainException("CONTINUATION_PROJECT_MISMATCH",
+                    "The sealed result belongs to a different project");
+        }
+        if (!Files.isDirectory(result.materializedPath())) {
+            throw new DomainException("WORKSPACE_SOURCE_MISSING",
+                    "The sealed result materialization is unavailable");
+        }
+        return new ContinuationSeed(result, false);
     }
 
     private java.nio.file.Path materializeContinuation(Snapshot base, ContinuationSeed seed, UUID experimentId) {

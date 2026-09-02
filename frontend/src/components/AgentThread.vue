@@ -19,8 +19,10 @@ import {
 } from 'lucide-vue-next'
 import { api, type Experiment, type ModelConfigurationStatus, type Project, type PromotionPreview, type RunEvent, type Session } from '../api'
 import { useLocale } from '../i18n'
-import { formatDate, formatError, statusLabel, statusTone } from '../ui'
+import { experimentBlocksSession, experimentDisplayTone, formatDate, formatError, sealedResultWaiting, statusLabel, verificationPolicyChanged } from '../ui'
+import { runEventLabel } from '../runEvents'
 import MarkdownContent from './MarkdownContent.vue'
+import RunActivityTimeline from './RunActivityTimeline.vue'
 
 const props = defineProps<{
   project: Project | null
@@ -28,6 +30,9 @@ const props = defineProps<{
   experiments: Experiment[]
   selectedExperimentId: string | null
   activity: RunEvent[]
+  activityExperimentId: string | null
+  activityTruncated?: boolean
+  eventWarning?: string | null
   streamState: 'idle' | 'connecting' | 'live' | 'reconnecting' | 'offline'
   actionBusy: boolean
   detailLoading: boolean
@@ -45,12 +50,17 @@ const emit = defineEmits<{
   reconnect: []
   start: [experimentId: string]
   cancel: [experimentId: string]
+  verify: [experimentId: string]
+  editProject: []
   openNavigation: []
+  modelReadiness: [ready: boolean]
 }>()
 
 const { text } = useLocale()
 const draft = ref('')
 const composer = ref<HTMLTextAreaElement | null>(null)
+const turnList = ref<HTMLElement | null>(null)
+const followLiveActivity = ref(true)
 const submittedForProject = ref<string | null>(null)
 const modelStatus = ref<ModelConfigurationStatus | null>(null)
 const modelStatusLoading = ref(false)
@@ -98,7 +108,12 @@ const workingStatuses = new Set([
 // The backend accepts cancellation before the worker is scheduled as well as
 // while it is running. Keep the conversation controls in sync with that API.
 const cancellableStatuses = new Set(['READY_TO_RUN', 'RUNNING', 'AGENT_COMPLETED', 'VERIFYING'])
-const composerAvailable = computed(() => !latest.value || continuableStatuses.has(latest.value.status))
+const sealedResultCanContinue = computed(() => !!latest.value
+  && awaitsVerification(latest.value)
+  && (props.project?.verificationCommands.length === 0 || verificationPolicyChanged(latest.value)))
+const composerAvailable = computed(() => !latest.value
+  || continuableStatuses.has(latest.value.status)
+  || sealedResultCanContinue.value)
 const modelReady = computed(() => !modelStatusLoading.value
   && !modelStatusError.value
   && Boolean(modelStatus.value?.apiKeyConfigured
@@ -117,15 +132,15 @@ const modelGateCopy = computed(() => {
     title: text('无法确认模型配置', 'Unable to check model configuration'),
     detail: text('无法确认服务端运行条件。请重新检查；如果持续失败，请联系运行 Offcanon 的管理员。', 'The server run requirements could not be confirmed. Check again; if it persists, contact the Offcanon administrator.'),
   }
-  if (!status?.apiKeyConfigured) return {
-    title: text('开始前需要配置模型 API Key', 'A model API key is required before starting'),
-    detail: text('请在设置中保存当前账户的 API Key。', 'Save an API key for this account in Settings.'),
+  const missing: string[] = []
+  if (!status?.apiKeyConfigured) missing.push(text('API Key', 'API key'))
+  if (!status?.endpointConfigured) missing.push(text('Endpoint', 'endpoint'))
+  if (!status?.modelConfigured) missing.push(text('模型名', 'model name'))
+  if (missing.length) return {
+    title: text(`开始前还缺少：${missing.join('、')}`, `Missing before starting: ${missing.join(', ')}`),
+    detail: text('请在设置中补齐当前账户的模型服务配置。', 'Complete the model service settings for this account.'),
   }
-  if (!status.endpointConfigured || !status.modelConfigured) return {
-    title: text('请选择模型服务和模型', 'Choose a model service and model'),
-    detail: text('在设置中保存 Endpoint 和模型名后即可发送任务。', 'Save an endpoint and model name in Settings before sending a task.'),
-  }
-  if (!status.endpointValid) return {
+  if (!status?.endpointValid) return {
     title: text('模型地址无效', 'The model endpoint is invalid'),
     detail: text('请输入不带凭据、查询参数或片段的 HTTP(S) 地址。', 'Enter an HTTP(S) URL without credentials, query parameters, or fragments.'),
   }
@@ -136,6 +151,14 @@ const placeholder = computed(() => {
   if (!latest.value) return text('告诉 Agent 你想完成什么', 'Tell the agent what you want to build')
   if (latest.value.status === 'READY_TO_RUN') return text('先启动当前任务', 'Start the current task first')
   if (latest.value.status === 'RECOVERY_REQUIRED') return text('先恢复项目状态', 'Reconcile the project state first')
+  if (awaitsVerification(latest.value)) {
+    if (verificationPolicyChanged(latest.value)) {
+      return text('验收命令已变化；可重新验收，也可以继续提出下一步', 'Acceptance commands changed; verify again or ask for the next step')
+    }
+    return props.project?.verificationCommands.length
+      ? text('结果已封存，请先运行验收', 'The result is sealed; run verification first')
+      : text('继续提出下一步；验收命令可以稍后设置', 'Ask for the next step; acceptance commands can be set later')
+  }
   if (latest.value.status === 'AGENT_COMPLETED') return text('正在锁定结果并准备可信验证', 'Sealing the result and preparing trusted verification')
   if (['PREPARING_PROMOTION', 'PROMOTING'].includes(latest.value.status)) {
     return text('正在应用到项目，请稍候', 'Applying the result to the project; please wait')
@@ -171,49 +194,14 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 
-function eventLabel(event: RunEvent) {
-  const labels: Record<string, [string, string]> = {
-    MODEL_REQUEST: ['正在思考下一步', 'Planning the next step'],
-    MODEL_RESPONSE: ['已决定下一步', 'Next step chosen'],
-    TOOL_CALL: ['正在调用工具', 'Calling a tool'],
-    TOOL_RESULT: ['已完成一次操作', 'Completed an operation'],
-    CONTEXT_SNAPSHOT: ['正在整理上下文', 'Preparing context'],
-    CONTEXT_COMPACTED: ['正在压缩上下文', 'Compacting context'],
-    MODEL_RETRY: ['模型暂时不可用，稍后重试', 'Model unavailable; retrying shortly'],
-    SESSION_CONTEXT_IMPORTED: ['已承接上一轮任务上下文', 'Previous task context carried forward'],
-    TASK_MEMORY_AGENT_PROPOSAL_RECORDED: ['已保存一条待确认记忆', 'Saved a memory proposal'],
-    TASK_MEMORY_VERIFIED_FACT_RECORDED: ['已记录可信验证事实', 'Recorded a verified fact'],
-    TASK_MEMORY_UNAVAILABLE: ['记忆暂时不可用，继续使用当前代码', 'Memory unavailable; continuing with current code'],
-    TASK_MEMORY_RECORD_FAILED: ['记忆未保存，运行结果不受影响', 'Memory was not saved; run result is unaffected'],
-    VERIFICATION_STARTED: ['正在运行验证', 'Running verification'],
-    VERIFICATION_FINISHED: ['验证已完成', 'Verification finished'],
-    RESULT_SNAPSHOT_SEALED: ['已锁定实验结果', 'Result sealed in the experiment'],
-    EXPERIMENT_STARTED: ['已启动隔离实验', 'Isolated experiment started'],
-    AGENT_COMPLETED: ['代理已完成，正在保存结果', 'Agent finished; saving the result'],
-    EXPERIMENT_RECOVERED: ['已恢复中断的实验', 'Interrupted experiment recovered'],
-    PROMOTION_PREPARING: ['正在准备应用', 'Preparing to apply the result'],
-    PROMOTION_VERIFICATION_STARTED: ['正在检查应用候选', 'Checking the application candidate'],
-    PROMOTION_BLOCKED: ['应用被阻止', 'Application blocked'],
-    PROMOTION_RECOVERY_REQUIRED: ['需要恢复应用状态', 'Application recovery required'],
-    PROMOTION_RECOVERY_DEFERRED: ['应用恢复已延期', 'Application recovery deferred'],
-    PROMOTION_RECOVERED: ['应用状态已恢复', 'Application state recovered'],
-    PROMOTION_MANUALLY_RECONCILED: ['应用状态已手动确认', 'Application state reconciled'],
-    PROMOTING: ['正在应用到主线', 'Applying to canonical'],
-    PROMOTED: ['已应用到主线', 'Applied to canonical'],
-    EXPERIMENT_FAILED: ['实验运行失败', 'Experiment run failed'],
-    EXPERIMENT_CANCELLED: ['实验已取消', 'Experiment cancelled'],
-  }
-  const pair = labels[event.type] ?? [statusLabel(event.type), statusLabel(event.type)]
-  return text(pair[0], pair[1])
-}
-
 function recentEvents(experimentId: string) {
-  return props.activity.filter((event) => event.experimentId === experimentId).slice(-3)
+  if (props.activityExperimentId !== experimentId) return []
+  return props.activity.slice(-3)
 }
 
 function workingCopy(experiment: Experiment) {
   const latestEvent = recentEvents(experiment.id).at(-1)
-  if (latestEvent) return eventLabel(latestEvent)
+  if (latestEvent) return runEventLabel(latestEvent, text)
   if (experiment.status === 'CREATED' || experiment.status === 'SNAPSHOTTING') {
     return text('正在准备隔离工作区', 'Preparing the isolated workspace')
   }
@@ -223,10 +211,23 @@ function workingCopy(experiment: Experiment) {
 function statusHeadline(experiment: Experiment) {
   if (experiment.status === 'PROMOTED') return text('已应用到项目', 'Applied to project')
   if (experiment.status === 'VERIFIED') return text('结果已经准备好审阅', 'The result is ready to review')
-  if (experiment.status === 'STALE') return text('项目已更新，结果需要在最新主线上继续', 'The project changed; continue on the latest state')
+  if (experiment.status === 'STALE') return experiment.failureReason?.includes('VERIFICATION_POLICY_CHANGED')
+    ? text('验收命令已修改，结果已过期', 'Acceptance commands changed; result is stale')
+    : text('项目已更新，结果需要在最新主线上继续', 'The project changed; continue on the latest state')
   if (experiment.status === 'FAILED') return text('这次运行没有完成', 'This run did not finish')
-  if (experiment.status === 'REJECTED') return text('验证没有通过，可以继续修复', 'Verification failed; continue fixing')
+  if (experiment.status === 'REJECTED') return text('验收没有通过，可以继续修复', 'Checks failed; continue fixing')
   if (experiment.status === 'CANCELLED') return text('运行已停止', 'Run stopped')
+  if (awaitsVerification(experiment)) {
+    if (verificationPolicyChanged(experiment)) {
+      return text('验收策略已变化，需重新验收', 'Acceptance policy changed; ready to reverify')
+    }
+    if (experiment.failureReason?.trim()) {
+      return text('验收已中断，可重新运行', 'Verification interrupted; ready to retry')
+    }
+    return props.project?.verificationCommands.length
+      ? text('等待运行验收', 'Ready for verification')
+      : text('已封存，可继续', 'Sealed; ready to continue')
+  }
   if (experiment.status === 'CREATED' || experiment.status === 'SNAPSHOTTING') return text('正在准备隔离工作区', 'Preparing the isolated workspace')
   if (experiment.status === 'RUNNING') return text('Agent 正在处理这项任务', 'The agent is working on this task')
   if (experiment.status === 'AGENT_COMPLETED') return text('代理已完成，正在保存结果', 'Agent finished; saving the result')
@@ -241,18 +242,39 @@ function statusHeadline(experiment: Experiment) {
 function statusDetail(experiment: Experiment) {
   if (experiment.status === 'PROMOTED') return text('主线已经更新。你可以继续提出下一步。', 'Canonical is updated. You can ask for the next step.')
   if (experiment.status === 'VERIFIED') return text('变更仍在隔离实验中，确认后才会进入项目。', 'Changes are still isolated in the experiment until you confirm.')
-  if (experiment.status === 'STALE') return text('主线没有被覆盖；继续会重新面对当前代码。', 'Canonical was not overwritten; continuing will re-check the current code.')
+  if (experiment.status === 'STALE') return experiment.failureReason?.includes('VERIFICATION_POLICY_CHANGED')
+    ? text('验收命令已经变化；这个结果不会按旧命令应用。继续任务后会按新命令重新验收。', 'The acceptance commands changed; this result will not be applied under the old policy. Continue the task to verify under the new commands.')
+    : text('主线没有被覆盖；继续会重新面对当前代码。', 'Canonical was not overwritten; continuing will re-check the current code.')
   if (experiment.status === 'FAILED') return text('主线未变化时，已有意图和有效草稿会在继续时保留。', 'If canonical is unchanged, the intent and any valid draft will be carried into the next run.')
-  if (experiment.status === 'REJECTED') return text('继续时 Agent 会根据最新验证结果修复。', 'The next run will use the verification result to guide a fix.')
+  if (experiment.status === 'REJECTED') return text('继续时 Agent 会根据最新验收结果修复。', 'The next run will use the acceptance result to guide a fix.')
   if (experiment.status === 'CANCELLED') return text('可以在主线未变化时承接当前实验继续。', 'You can continue from this experiment when canonical is unchanged.')
+  if (awaitsVerification(experiment)) {
+    if (verificationPolicyChanged(experiment)) {
+      return text('项目验收命令已更新；这个封存结果仍然保留，请按新命令重新验收。', 'The project acceptance commands changed; this sealed result is retained and ready to verify under the new policy.')
+    }
+    if (experiment.failureReason?.trim()) {
+      return text('上次验收没有完成；可以重新运行验收或继续任务。', 'The previous verification did not finish; retry verification or continue the task.')
+    }
+    return props.project?.verificationCommands.length
+      ? text('结果已锁定，运行验收后才能进入可应用状态。', 'The result is sealed; run acceptance checks before it can be applied.')
+      : text('结果已锁定并保留；你可以继续迭代，也可以稍后在项目设置中补充命令再验收。', 'The result is sealed and retained; continue iterating, or add commands in project settings and verify it later.')
+  }
   if (experiment.status === 'CREATED' || experiment.status === 'SNAPSHOTTING') return text('正在创建隔离工作区。', 'The isolated workspace is being created.')
   if (experiment.status === 'AGENT_COMPLETED') return text('正在锁定结果并开始可信验证。', 'The result is being sealed before trusted verification starts.')
-  if (experiment.status === 'VERIFYING') return text('验证完成后，结果才可以进入审阅。', 'The result will be ready for review after verification completes.')
+  if (experiment.status === 'VERIFYING') return text('验收通过后，结果才可以应用。', 'The result can be applied after verification passes.')
   if (experiment.status === 'PREPARING_PROMOTION') return text('正在准备受保护的主线更新。', 'Preparing a guarded update to canonical.')
   if (experiment.status === 'PROMOTING') return text('正在完成主线更新，请稍候。', 'Finishing the canonical update; please wait.')
   if (experiment.status === 'RECOVERY_REQUIRED') return text('上一次应用没有完成，请先恢复项目状态。', 'The previous application did not finish; reconcile the project state first.')
   if (experiment.status === 'READY_TO_RUN') return text('Agent 会在独立实验空间中工作。', 'The agent will work in an isolated experiment.')
   return text('主线在运行期间保持不变。', 'Canonical stays unchanged while the run advances.')
+}
+
+function awaitsVerification(experiment: Experiment) {
+  return sealedResultWaiting(experiment)
+}
+
+function displayTone(experiment: Experiment) {
+  return experimentDisplayTone(experiment)
 }
 
 function failureText(experiment: Experiment) {
@@ -266,6 +288,7 @@ function failureText(experiment: Experiment) {
   if (reason.includes('AGENT_TIMEOUT')) return text('运行超时，可以再次运行或缩小任务范围', 'The run timed out; retry or narrow the task')
   if (reason.includes('MAX_STEPS_EXCEEDED')) return text('运行达到步数上限，可以再次运行或缩小任务范围', 'The run reached its step limit; retry or narrow the task')
   if (reason.includes('TOOL_CALL_LIMIT_EXCEEDED')) return text('工具调用达到上限，可以再次运行或缩小任务范围', 'The tool-call limit was reached; retry or narrow the task')
+  if (reason.includes('VERIFICATION_POLICY_CHANGED')) return text('项目验收命令已修改，这个结果已标记为过期；请继续任务并按新命令重新验收', 'The project acceptance commands changed, so this result is stale; continue the task and verify under the new commands')
   if (reason.includes('VERIFICATION')) return text('验证发现需要处理的问题', 'Verification found an issue to address')
   if (reason.includes('STALE')) return text('这个实验基于旧的项目状态', 'This experiment is based on an older project state')
   return statusHeadline(experiment)
@@ -277,6 +300,21 @@ function failureCode(experiment: Experiment) {
 
 function canRetry(experiment: Experiment) {
   return ['MODEL_TRANSIENT_FAILURE', 'AGENT_TIMEOUT', 'MAX_STEPS_EXCEEDED', 'TOOL_CALL_LIMIT_EXCEEDED'].includes(failureCode(experiment))
+}
+
+function canReverify(experiment: Experiment) {
+  return (experiment.status === 'REJECTED' || awaitsVerification(experiment))
+    && !!experiment.resultSnapshotId
+}
+
+function blockedByOtherLifecycle(experiment: Experiment) {
+  return props.experiments.some((candidate) => candidate.id !== experiment.id
+    && candidate.sessionId === experiment.sessionId
+    && experimentBlocksSession(candidate))
+}
+
+function activityRunning(experiment: Experiment) {
+  return workingStatuses.has(experiment.status) && !awaitsVerification(experiment)
 }
 
 function needsModelSettings(experiment: Experiment) {
@@ -312,6 +350,19 @@ async function focusComposer() {
   composer.value?.focus()
 }
 
+function updateFollowState() {
+  const list = turnList.value
+  if (!list) return
+  followLiveActivity.value = list.scrollHeight - list.scrollTop - list.clientHeight < 140
+}
+
+async function scrollToLatest(force = false) {
+  if (!force && !followLiveActivity.value) return
+  await nextTick()
+  const list = turnList.value
+  if (list) list.scrollTop = list.scrollHeight
+}
+
 watch(() => latest.value?.id, (next, previous) => {
   if (!next || next === previous) return
   if (submittedForProject.value === props.project?.id) {
@@ -320,6 +371,8 @@ watch(() => latest.value?.id, (next, previous) => {
     submittedForProject.value = null
     if (composer.value) composer.value.style.height = '48px'
   }
+  followLiveActivity.value = true
+  void scrollToLatest(true)
 })
 
 watch(() => props.project?.id, (next, previous) => {
@@ -329,6 +382,8 @@ watch(() => props.project?.id, (next, previous) => {
 }, { immediate: true })
 
 watch(draft, (value) => saveDraft(props.project?.id, value))
+watch(modelReady, (ready) => emit('modelReadiness', ready), { immediate: true })
+watch(() => props.activity.at(-1)?.sequence, () => void scrollToLatest())
 
 defineExpose({ focusComposer })
 </script>
@@ -342,9 +397,10 @@ defineExpose({ focusComposer })
         <h1>{{ session?.title || (project ? text('新任务', 'New task') : text('打开一个项目', 'Open a project')) }}</h1>
         <p v-if="project" class="thread-path" :title="project.canonicalPath">{{ project.canonicalPath }}</p>
       </div>
-      <div v-if="session" class="thread-actions">
-        <span class="thread-guard"><ShieldCheck :size="14" />{{ text('实验隔离', 'Experiment isolated') }}</span>
-        <button class="button secondary compact" :aria-label="text('新任务', 'New task')" :title="text('新任务', 'New task')" @click="emit('newTask')"><Wrench :size="14" />{{ text('新任务', 'New task') }}</button>
+      <div v-if="project" class="thread-actions">
+        <span v-if="session" class="thread-guard"><ShieldCheck :size="14" />{{ text('实验隔离', 'Experiment isolated') }}</span>
+        <button class="button secondary compact project-settings-button" :disabled="actionBusy" :aria-label="text('项目设置', 'Project settings')" :title="text('项目设置', 'Project settings')" @click="emit('editProject')"><Settings2 :size="14" />{{ text('项目设置', 'Project settings') }}</button>
+        <button v-if="session" class="button secondary compact new-task-button" :disabled="actionBusy" :aria-label="text('新任务', 'New task')" :title="text('新任务', 'New task')" @click="emit('newTask')"><Wrench :size="14" />{{ text('新任务', 'New task') }}</button>
       </div>
     </header>
 
@@ -356,18 +412,21 @@ defineExpose({ focusComposer })
     <div v-else-if="project && streamState === 'reconnecting'" class="thread-stream-notice reconnecting" role="status">
       <LoaderCircle class="spin" :size="14" /><span>{{ text('实时活动连接正在恢复。', 'Live activity connection is recovering.') }}</span>
     </div>
+    <div v-if="project && eventWarning" class="thread-stream-notice" role="status">
+      <AlertTriangle :size="14" /><span>{{ eventWarning }}</span>
+    </div>
 
     <section v-if="!project" class="thread-welcome">
       <div class="welcome-mark"><FlaskConical :size="24" /></div>
       <h2>{{ text('把下一件编程工作交给 Agent', 'Give the next coding task to the agent') }}</h2>
     </section>
 
-    <section v-else-if="experiments.length" class="turn-list" aria-live="polite">
+    <section v-else-if="experiments.length" ref="turnList" class="turn-list" @scroll.passive="updateFollowState">
       <article
         v-for="experiment in experiments"
         :key="experiment.id"
         class="conversation-turn"
-        :class="{ selected: experiment.id === selectedExperimentId, [`tone-${statusTone(experiment.status)}`]: true }"
+        :class="{ selected: experiment.id === selectedExperimentId, [`tone-${displayTone(experiment)}`]: true }"
         @click="selectTurn($event, experiment.id)"
       >
         <div class="turn-user">
@@ -381,7 +440,7 @@ defineExpose({ focusComposer })
           <div class="agent-body">
             <div class="agent-meta">
               <strong>Offcanon</strong>
-              <span class="turn-state" :class="statusTone(experiment.status)">{{ statusHeadline(experiment) }}</span>
+              <span class="turn-state" :class="displayTone(experiment)">{{ statusHeadline(experiment) }}</span>
               <button
                 type="button"
                 class="turn-select-button"
@@ -395,12 +454,22 @@ defineExpose({ focusComposer })
                 <CircleDot v-else :size="15" />
               </button>
             </div>
-            <MarkdownContent v-if="experiment.agentSummary && !workingStatuses.has(experiment.status)" class="agent-summary" :source="experiment.agentSummary" />
+            <MarkdownContent v-if="experiment.agentSummary && (!workingStatuses.has(experiment.status) || awaitsVerification(experiment))" class="agent-summary" :source="experiment.agentSummary" />
+            <p v-else-if="awaitsVerification(experiment)" class="agent-summary muted-copy">{{ statusDetail(experiment) }}</p>
             <p v-else-if="['FAILED', 'REJECTED', 'STALE', 'CANCELLED'].includes(experiment.status)" class="agent-summary failure-copy">{{ failureText(experiment) }}</p>
             <div v-else-if="workingStatuses.has(experiment.status)" class="working-row">
               <LoaderCircle class="spin" :size="16" /><span>{{ workingCopy(experiment) }}</span><small>{{ streamCopy() }}</small>
             </div>
             <p v-else class="agent-summary muted-copy">{{ statusDetail(experiment) }}</p>
+
+            <RunActivityTimeline
+              v-if="experiment.id === activityExperimentId && (activity.length || activityRunning(experiment))"
+              :events="activity"
+              :stream-state="streamState"
+              :running="activityRunning(experiment)"
+              :truncated="activityTruncated"
+              :list-id="`run-activity-main-${experiment.id}`"
+            />
 
             <div v-if="experiment.status === 'VERIFIED'" class="turn-decision">
               <div><CheckCircle2 :size="16" /><span>{{ text('已通过可信检查', 'Trusted checks passed') }}</span></div>
@@ -411,18 +480,27 @@ defineExpose({ focusComposer })
               <button class="button primary compact" :disabled="actionBusy || !modelReady" @click.stop="emit('start', experiment.id)"><Play :size="14" />{{ text('开始', 'Start') }}</button>
               <button class="button danger-ghost compact" :disabled="actionBusy" @click.stop="emit('cancel', experiment.id)"><Pause :size="14" />{{ text('取消', 'Cancel') }}</button>
             </div>
+            <div v-else-if="awaitsVerification(experiment)" class="turn-decision deferred-verification-actions">
+              <div><AlertTriangle :size="16" /><span>{{ verificationPolicyChanged(experiment) ? text('验收命令已变化；这个封存结果仍然保留，需要按新命令重新验收。', 'Acceptance commands changed; this sealed result is retained and needs verification under the new policy.') : project?.verificationCommands.length ? text('结果已锁定，尚未运行验收。', 'The result is sealed and has not been verified yet.') : text('结果已锁定并保留；可继续迭代，验收命令稍后再设置。', 'The result is sealed and retained; you can continue and set acceptance commands later.') }}</span></div>
+              <button v-if="project?.verificationCommands.length" class="button success compact" :disabled="actionBusy || blockedByOtherLifecycle(experiment)" :title="blockedByOtherLifecycle(experiment) ? text('同一任务已有后续操作正在进行', 'Another operation is active in this task') : undefined" @click.stop="emit('verify', experiment.id)"><ShieldCheck :size="14" />{{ text('运行验收', 'Run verification') }}</button>
+              <button class="button secondary compact" :disabled="actionBusy || blockedByOtherLifecycle(experiment)" :title="blockedByOtherLifecycle(experiment) ? text('同一任务已有后续操作正在进行', 'Another operation is active in this task') : undefined" @click.stop="emit('editProject')"><Settings2 :size="14" />{{ project?.verificationCommands.length ? text('编辑项目设置', 'Edit project settings') : text('设置验收命令', 'Set acceptance commands') }}</button>
+              <small v-if="blockedByOtherLifecycle(experiment)" class="turn-action-note">{{ text('同一任务已有后续操作正在进行。', 'Another operation is active in this task.') }}</small>
+            </div>
             <div v-else-if="['FAILED', 'REJECTED', 'STALE', 'CANCELLED', 'RECOVERY_REQUIRED'].includes(experiment.status)" class="turn-recovery">
               <AlertTriangle :size="15" />
               <span>{{ failureText(experiment) }}</span>
               <button v-if="needsModelSettings(experiment)" class="button secondary compact" :disabled="actionBusy" @click.stop="emit('openSettings')">{{ text('去设置', 'Open Settings') }}</button>
-              <button v-else-if="canRetry(experiment)" class="button secondary compact" :disabled="actionBusy" @click.stop="emit('retry', experiment.id)">{{ text('再次运行', 'Retry') }}</button>
+              <button v-else-if="canRetry(experiment)" class="button secondary compact" :disabled="actionBusy || blockedByOtherLifecycle(experiment)" :title="blockedByOtherLifecycle(experiment) ? text('同一任务已有后续操作正在进行', 'A later operation is already active in this task') : undefined" @click.stop="emit('retry', experiment.id)">{{ text('再次运行', 'Retry') }}</button>
+              <button v-if="canReverify(experiment) && project?.verificationCommands.length" class="button success compact" :disabled="actionBusy || blockedByOtherLifecycle(experiment)" :title="blockedByOtherLifecycle(experiment) ? text('同一任务已有后续操作正在进行', 'A later operation is already active in this task') : undefined" @click.stop="emit('verify', experiment.id)"><ShieldCheck :size="14" />{{ text('重新验收', 'Verify again') }}</button>
+              <button v-if="canReverify(experiment) && !project?.verificationCommands.length" class="button secondary compact" :disabled="actionBusy || blockedByOtherLifecycle(experiment)" @click.stop="emit('editProject')"><Settings2 :size="14" />{{ text('设置验收命令', 'Set acceptance commands') }}</button>
               <button class="button secondary compact" :disabled="actionBusy" @click.stop="emit('review', experiment.id)">{{ text('查看原因', 'See why') }}</button>
+              <small v-if="blockedByOtherLifecycle(experiment)" class="turn-action-note">{{ text('同一任务已有后续操作正在进行。', 'A later operation is already active in this task.') }}</small>
             </div>
             <div v-else-if="workingStatuses.has(experiment.status)" class="turn-actions">
               <button v-if="cancellableStatuses.has(experiment.status)" class="button danger-ghost compact" :disabled="actionBusy" @click.stop="emit('cancel', experiment.id)"><Pause :size="14" />{{ text('停止', 'Stop') }}</button>
               <span v-else class="muted-copy">{{ statusDetail(experiment) }}</span>
             </div>
-            <div v-if="experiment.status === 'VERIFIED' && promotionPreview && experiment.id === selectedExperimentId && !promotionPreview.promotable" class="turn-note"><ShieldCheck :size="14" />{{ text('结果可查看；应用条件会在审阅面板中说明。', 'The result is available; application conditions are shown in review.') }}</div>
+            <div v-if="experiment.status === 'VERIFIED' && promotionPreview && experiment.id === selectedExperimentId && !promotionPreview.promotable" class="turn-note"><ShieldCheck :size="14" /><span>{{ text('结果可查看；应用条件会在审阅面板中说明。', 'The result is available; application conditions are shown in review.') }}</span></div>
           </div>
         </div>
       </article>
@@ -438,6 +516,12 @@ defineExpose({ focusComposer })
       <div><strong>{{ modelGateCopy.title }}</strong><span>{{ modelGateCopy.detail }}</span></div>
       <button class="button secondary compact" @click="emit('openSettings')"><Settings2 :size="14" />{{ text('打开设置', 'Open Settings') }}</button>
       <button class="icon-button small" :aria-label="text('重新检查模型配置', 'Refresh model configuration')" :title="text('重新检查', 'Refresh check')" @click="refreshModelStatus"><RefreshCw :size="14" /></button>
+    </div>
+
+    <div v-if="project && project.verificationCommands.length === 0" class="project-policy-gate" role="status">
+      <AlertTriangle :size="16" />
+      <div><strong>{{ text('尚未配置验收命令', 'No acceptance commands configured') }}</strong><span>{{ text('可以继续创建和迭代代码；配置验收命令后，实验结果才能通过验收并应用。', 'You can keep creating and iterating; configure acceptance commands before a result can pass verification and be applied.') }}</span></div>
+      <button class="button secondary compact" :disabled="actionBusy" @click="emit('editProject')"><Settings2 :size="14" />{{ text('项目设置', 'Project settings') }}</button>
     </div>
 
     <footer class="composer-wrap">

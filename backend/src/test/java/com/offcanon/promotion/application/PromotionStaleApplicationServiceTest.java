@@ -83,6 +83,22 @@ class PromotionStaleApplicationServiceTest {
                 journals.findUnresolvedByProject(fixture.experiment.projectId()).getFirst().phase());
     }
 
+    @Test
+    void refusesToMarkAnOlderResultStaleWhileItsSessionHasAQueuedSuccessor() throws Exception {
+        Fixture fixture = fixture("changed-canonical");
+        Experiment successor = Experiment.continueFrom(fixture.experiment.projectId(),
+                fixture.experiment.sessionId(), fixture.experiment.id(), "continue the task", Instant.now());
+        fixture.experiments.save(successor);
+
+        PromotionStaleApplicationService.StaleConfirmation outcome = fixture.service.confirm(fixture.experiment.id());
+
+        assertFalse(outcome.markedStale());
+        assertEquals("SESSION_ALREADY_RUNNING", outcome.status());
+        assertEquals(ExperimentStatus.VERIFIED,
+                fixture.experiments.findById(fixture.experiment.id()).orElseThrow().status());
+        assertEquals("external work\n", Files.readString(fixture.canonicalFile));
+    }
+
     private Fixture fixture(String currentFingerprint) throws Exception {
         Path canonical = temp.resolve(UUID.randomUUID().toString());
         Files.createDirectories(canonical);

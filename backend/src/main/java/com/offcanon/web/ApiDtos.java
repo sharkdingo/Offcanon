@@ -1,6 +1,7 @@
 package com.offcanon.web;
 
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
 
 import java.time.Instant;
@@ -14,9 +15,8 @@ public final class ApiDtos {
     public record CreateProjectRequest(
             @NotBlank @Size(max = 200) String name,
             @NotBlank @Size(max = 4_096) String canonicalPath,
-            // The application service validates the non-empty policy for a
-            // genuinely new project. A repeated open may intentionally omit
-            // commands because the existing project's policy is retained.
+            // Commands are optional at registration time. A missing policy
+            // leaves sealed experiment results waiting for later verification.
             @Size(max = 20) List<@NotBlank @Size(max = 1_000) String> verificationCommands) {
         public CreateProjectRequest {
             verificationCommands = verificationCommands == null ? List.of() : List.copyOf(verificationCommands);
@@ -26,9 +26,11 @@ public final class ApiDtos {
     public record UpdateProjectRequest(
             @NotBlank @Size(max = 200) String name,
             @NotBlank @Size(max = 4_096) String canonicalPath,
-            @Size(min = 1, max = 20) List<@NotBlank @Size(max = 1_000) String> verificationCommands) {
+            // PUT replaces the complete editable representation. Requiring an
+            // explicit list distinguishes intentional clearing from omission.
+            @NotNull @Size(max = 20) List<@NotBlank @Size(max = 1_000) String> verificationCommands) {
         public UpdateProjectRequest {
-            verificationCommands = verificationCommands == null ? List.of() : List.copyOf(verificationCommands);
+            if (verificationCommands != null) verificationCommands = List.copyOf(verificationCommands);
         }
     }
 

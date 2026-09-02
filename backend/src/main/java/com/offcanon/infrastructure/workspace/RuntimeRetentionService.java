@@ -195,7 +195,13 @@ public class RuntimeRetentionService {
         for (Experiment experiment : known.values()) {
             if (experiment.baseSnapshotId() != null) protectedSnapshots.add(experiment.baseSnapshotId());
             if (experiment.resultSnapshotId() != null) protectedSnapshots.add(experiment.resultSnapshotId());
-            if (ACTIVE_EXPERIMENTS.contains(experiment.status())) activeExperiments.add(experiment.id());
+            // Once the result snapshot is sealed, AGENT_COMPLETED is a
+            // durable waiting-for-verification state rather than an active
+            // worker. The immutable result remains protected below, while
+            // the mutable agent workspace can follow normal retention.
+            if (isActiveLifecycle(experiment)) {
+                activeExperiments.add(experiment.id());
+            }
             if (experiment.status() == ExperimentStatus.RECOVERY_REQUIRED) recoveryExperiments.add(experiment.id());
             if (experiment.continuedFromExperimentId() != null
                     && experiment.baseSnapshotId() != null
@@ -280,7 +286,7 @@ public class RuntimeRetentionService {
                 // Runs without a sealed result may still contain the only useful
                 // partial draft, so retain them until a successor has forked it.
                 boolean terminalResult = experiment.resultSnapshotId() != null
-                        && !ACTIVE_EXPERIMENTS.contains(experiment.status());
+                        && !isActiveLifecycle(experiment);
                 boolean forkedPartial = experiment.resultSnapshotId() == null
                         && FORK_SOURCE_STATUSES.contains(experiment.status())
                         && context.forkReadySources().contains(experiment.id());
@@ -392,6 +398,13 @@ public class RuntimeRetentionService {
         } catch (IllegalArgumentException ignored) {
             return null;
         }
+    }
+
+    private boolean isActiveLifecycle(Experiment experiment) {
+        return experiment != null
+                && ACTIVE_EXPERIMENTS.contains(experiment.status())
+                && !(experiment.status() == ExperimentStatus.AGENT_COMPLETED
+                && experiment.resultSnapshotId() != null);
     }
 
     private Path normalize(Path path) {

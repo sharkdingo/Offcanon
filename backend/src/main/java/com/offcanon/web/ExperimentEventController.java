@@ -31,6 +31,8 @@ import java.util.concurrent.atomic.AtomicReference;
 @RestController
 @RequestMapping("/api/experiments")
 public class ExperimentEventController {
+    /** Keep the initial replay bounded even when a client sends a huge tail. */
+    private static final int MAX_INITIAL_TAIL_EVENTS = 500;
     private static final Logger log = LoggerFactory.getLogger(ExperimentEventController.class);
     private final ExperimentApplicationService experimentService;
     private final EventSink events;
@@ -54,15 +56,30 @@ public class ExperimentEventController {
         this.identity = identity;
     }
 
+    public SseEmitter stream(@PathVariable UUID experimentId,
+                             @RequestParam(defaultValue = "0") long after,
+                             @RequestHeader(value = "Last-Event-ID", required = false) String lastEventId,
+                             HttpServletRequest request) {
+        return stream(experimentId, after, 0, lastEventId, request);
+    }
+
+    /** Opens an event stream, optionally starting from a bounded recent tail. */
     @GetMapping(value = "/{experimentId}/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter stream(@PathVariable UUID experimentId,
                              @RequestParam(defaultValue = "0") long after,
+                             @RequestParam(defaultValue = "0") int tail,
                              @RequestHeader(value = "Last-Event-ID", required = false) String lastEventId,
                              HttpServletRequest request) {
         experimentService.get(experimentId, identity.ownerId(request));
         SseEmitter emitter = new SseEmitter(0L);
         long reconnectCursor = parseCursor(lastEventId);
-        AtomicLong cursor = new AtomicLong(Math.max(0, Math.max(after, reconnectCursor)));
+        long requestedCursor = Math.max(0, Math.max(after, reconnectCursor));
+        int boundedTail = Math.max(0, Math.min(MAX_INITIAL_TAIL_EVENTS, tail));
+        if (requestedCursor == 0 && boundedTail > 0) {
+            long latest = events.latestSequence(experimentId);
+            requestedCursor = Math.max(0, latest - boundedTail);
+        }
+        AtomicLong cursor = new AtomicLong(requestedCursor);
         AtomicLong lastWrite = new AtomicLong(System.nanoTime());
         AtomicBoolean terminal = new AtomicBoolean();
         AtomicReference<ScheduledFuture<?>> pollerRef = new AtomicReference<>();

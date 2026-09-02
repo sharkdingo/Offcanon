@@ -30,6 +30,8 @@ Everything a normal user needs is available in the Settings screen:
 - theme, language, and bounded run defaults;
 - password rotation, non-secret history export, and cleanup of rebuildable runtime files.
 
+Project name (a display label), repository path, and acceptance commands are maintained from the project settings button beside the project name in the workspace; acceptance commands may be added after the first run.
+
 The server validates the Endpoint as an HTTP(S) base URL for OpenAI-compatible Chat Completions and appends `/chat/completions`; it sends the account's key only to that saved Endpoint. Local/private endpoints are supported for local model servers such as Ollama. Keep the service bound to loopback unless you have an explicit network access policy, because an endpoint can intentionally target any address the host can reach. Data-directory and database-engine details are application-owned so a user does not need to install or administer infrastructure.
 
 ## Run Locally
@@ -59,6 +61,6 @@ cd ..\frontend
 npm run build
 ```
 
-The current vertical slice is intentionally explicit: the agent edits an isolated experiment, seals an immutable result, runs trusted verification in a disposable workspace, then re-verifies a promotion candidate before changing canonical. Agent shell output is recorded as observation, never presented as trusted verification. Session continuation uses an append-only typed memory ledger: agent notes remain proposals, while verified facts carry source snapshot and evidence provenance.
+The current vertical slice is intentionally explicit: the agent edits an isolated experiment, seals an immutable result, runs trusted verification in a disposable workspace, then re-verifies a promotion candidate before changing canonical. Acceptance commands are optional when a project is opened or created; a sealed result waits for commands and can be verified later from project settings. Agent shell output is recorded as observation, never presented as trusted verification. Session continuation uses an append-only typed memory ledger: agent notes remain proposals, while verified facts carry source snapshot and evidence provenance.
 
 Offcanon provides application-level isolation, not an operating-system sandbox. Agent commands run with the current user's permissions; use a container or worker sandbox when prompts or repositories are hostile.

@@ -9,8 +9,9 @@ import PromotionDialog from '../components/PromotionDialog.vue'
 import TaskSidebar from '../components/TaskSidebar.vue'
 import ExperimentReview from '../components/ExperimentReview.vue'
 import { useLocale } from '../i18n'
+import { RUN_EVENTS_REQUIRING_REFRESH } from '../runEvents'
 import { useWorkspaceStore } from '../stores/workspace'
-import { formatError } from '../ui'
+import { experimentBlocksSession, formatError } from '../ui'
 
 type StreamState = 'idle' | 'connecting' | 'live' | 'reconnecting' | 'offline'
 
@@ -31,23 +32,50 @@ const reviewReturnFocus = ref<HTMLElement | null>(null)
 const workspaceContent = ref<HTMLElement | null>(null)
 const submitting = ref(false)
 const actionBusy = ref(false)
+const agentModelReady = ref(false)
 const forceNewTask = ref(false)
-const activity = ref<RunEvent[]>([])
-const streamState = ref<StreamState>('idle')
-const eventWarning = ref<string | null>(null)
+const activityByExperiment = ref<Record<string, RunEvent[]>>({})
+const streamStateByExperiment = ref<Record<string, StreamState>>({})
+const eventWarningByExperiment = ref<Record<string, string | null>>({})
+const activityTruncatedByExperiment = ref<Record<string, boolean>>({})
 const initialized = ref(false)
-const seenSequences = new Set<number>()
-let eventSource: EventSource | null = null
-let eventExperimentId: string | null = null
-let refreshTimer: number | null = null
+const eventSources = new Map<string, EventSource>()
+const seenSequences = new Map<string, Set<number>>()
+const refreshTimers = new Map<string, number>()
+let reconciliationTimer: number | null = null
+let reconciliationBusy = false
+const pendingReconciliation = new Set<string>()
 let routeSyncVersion = 0
+let selectionIntent = 0
+const ACTIVITY_WINDOW = 200
+const RECONCILIATION_INTERVAL_MS = 3_000
+const RECONCILIATION_STATUSES = new Set([
+  'CREATED',
+  'SNAPSHOTTING',
+  'RUNNING',
+  'VERIFYING',
+  'PREPARING_PROMOTION',
+  'PROMOTING',
+])
 
 function projectSaveError(cause: unknown) {
   if (cause instanceof ApiError && cause.code === 'PROJECT_ALREADY_REGISTERED') {
     return text('这个 Git 仓库已由其他账户打开。请切换到账户，或选择另一个仓库。', 'This Git repository is already registered by another account. Switch accounts or choose another repository.')
   }
   if (cause instanceof ApiError && cause.code === 'VERIFICATION_POLICY_MISSING') {
-    return text('新项目至少需要一条项目验收命令。', 'A new project needs at least one project acceptance command.')
+    return text('请先在项目设置中配置至少一条验收命令。', 'Configure at least one acceptance command in project settings first.')
+  }
+  if (cause instanceof ApiError && cause.code === 'PROJECT_PARENT_NOT_FOUND') {
+    return text('新项目的父目录必须已经存在。', 'The parent directory for a new project must already exist.')
+  }
+  if (cause instanceof ApiError && cause.code === 'PROJECT_TARGET_NOT_EMPTY') {
+    return text('新项目目录必须为空，请选择一个新目录。', 'The new project directory must be empty. Choose a new directory.')
+  }
+  if (cause instanceof ApiError && cause.code === 'PROJECT_GIT_INIT_FAILED') {
+    return text('无法初始化 Git，请确认本机已安装 Git 且目录可写。', 'Git could not be initialized. Check that Git is installed and the directory is writable.')
+  }
+  if (cause instanceof ApiError && cause.code === 'PROJECT_PARENT_NOT_WRITABLE') {
+    return text('没有权限在此父目录创建项目。', 'You do not have permission to create a project in this parent directory.')
   }
   return formatError(cause, '无法保存项目。', 'Unable to save project')
 }
@@ -61,101 +89,295 @@ const accountInitials = computed(() => auth.session?.displayName
   .slice(0, 2)
   .toUpperCase() ?? 'O')
 
+const activeExperiments = computed(() => store.activeExperiments)
+const latestExperiment = computed(() => activeExperiments.value.at(-1) ?? null)
+const verifiedResultCount = computed(() => store.experiments.filter((experiment) => experiment.status === 'VERIFIED').length)
+const mainActivityExperimentId = computed(() => latestExperiment.value?.id ?? (!showReview.value ? store.selectedExperimentId : null))
+const reviewActivityExperimentId = computed(() => showReview.value ? store.selectedExperimentId : null)
+
+function activityFor(experimentId: string | null) {
+  return experimentId ? activityByExperiment.value[experimentId] ?? [] : []
+}
+
+function streamStateFor(experimentId: string | null): StreamState {
+  return experimentId ? streamStateByExperiment.value[experimentId] ?? 'idle' : 'idle'
+}
+
+function eventWarningFor(experimentId: string | null) {
+  return experimentId ? eventWarningByExperiment.value[experimentId] ?? null : null
+}
+
+function activityTruncatedFor(experimentId: string | null) {
+  return experimentId ? activityTruncatedByExperiment.value[experimentId] ?? false : false
+}
+
+const mainActivity = computed(() => activityFor(mainActivityExperimentId.value))
+const mainStreamState = computed(() => streamStateFor(mainActivityExperimentId.value))
+const reviewActivity = computed(() => activityFor(reviewActivityExperimentId.value))
+const reviewStreamState = computed(() => streamStateFor(reviewActivityExperimentId.value))
+const reviewEventWarning = computed(() => eventWarningFor(reviewActivityExperimentId.value))
+const selectedSessionBusy = computed(() => {
+  const selected = store.selectedExperiment
+  if (!selected) return false
+  return store.experiments.some((candidate) => candidate.id !== selected.id
+    && candidate.sessionId === selected.sessionId
+    && experimentBlocksSession(candidate))
+})
+
 const connectionLabel = computed(() => {
   const labels: Record<StreamState, [string, string]> = {
     idle: ['空闲', 'idle'], connecting: ['连接中', 'connecting'], live: ['实时', 'live'],
     reconnecting: ['重连中', 'reconnecting'], offline: ['离线', 'offline'],
   }
-  const pair = labels[streamState.value]
+  const pair = labels[mainStreamState.value]
   return text(pair[0], pair[1])
 })
-
-const activeExperiments = computed(() => store.activeExperiments)
-const latestExperiment = computed(() => activeExperiments.value.at(-1) ?? null)
-
-const refreshEvents = new Set([
-  'EXPERIMENT_STARTED', 'AGENT_COMPLETED', 'RESULT_SNAPSHOT_SEALED', 'VERIFICATION_STARTED', 'VERIFICATION_FINISHED',
-  'PROMOTION_PREPARING', 'PROMOTION_VERIFICATION_STARTED', 'PROMOTION_BLOCKED', 'EXPERIMENT_FAILED',
-  'PROMOTION_RECOVERY_REQUIRED', 'PROMOTION_RECOVERY_DEFERRED', 'PROMOTION_RECOVERED',
-  'PROMOTION_MANUALLY_RECONCILED', 'PROMOTED', 'EXPERIMENT_RECOVERED', 'EXPERIMENT_CANCELLED',
-])
 
 function validRunEvent(value: unknown): value is RunEvent {
   if (!value || typeof value !== 'object') return false
   const event = value as Partial<RunEvent>
   return typeof event.eventId === 'string'
     && typeof event.experimentId === 'string'
-    && typeof event.sequence === 'number' && Number.isFinite(event.sequence)
+    && typeof event.sequence === 'number' && Number.isInteger(event.sequence) && event.sequence >= 1
     && typeof event.type === 'string' && typeof event.timestamp === 'string'
     && !!event.payload && typeof event.payload === 'object'
 }
 
-function scheduleProjectRefresh(experimentId: string) {
-  if (refreshTimer !== null) window.clearTimeout(refreshTimer)
-  refreshTimer = window.setTimeout(async () => {
-    refreshTimer = null
-    if (store.selectedExperimentId !== experimentId) return
+function scheduleProjectRefresh(experimentId: string, attempt = 0) {
+  const previous = refreshTimers.get(experimentId)
+  if (previous !== undefined) window.clearTimeout(previous)
+  const timer = window.setTimeout(async () => {
+    refreshTimers.delete(experimentId)
+    const source = store.experiments.find((experiment) => experiment.id === experimentId)
+    if (!source || store.selectedProjectId !== source.projectId) {
+      pendingReconciliation.delete(experimentId)
+      return
+    }
+    // A lighter reconciliation may have already converged this event. Do not
+    // let an older backoff callback report a later, spurious failure.
+    if (!pendingReconciliation.has(experimentId)) return
     try {
       await store.reloadSelectedProject()
+      // The project may have changed while the full refresh was in flight.
+      // Never clear a pending refresh for a different project.
+      if (store.selectedProjectId !== source.projectId
+        || !store.experiments.some((experiment) => experiment.id === experimentId)) return
+      pendingReconciliation.delete(experimentId)
+      clearStateRefreshError()
     } catch (cause) {
-      store.error = formatError(cause, '无法刷新任务状态。', 'Unable to refresh task state')
+      if (store.selectedProjectId !== source.projectId
+        || !store.experiments.some((experiment) => experiment.id === experimentId)) {
+        pendingReconciliation.delete(experimentId)
+        return
+      }
+      if (attempt >= 4) store.error = stateRefreshError()
+      // Keep retrying with a capped backoff. The pending set is intentionally
+      // retained until the full project refresh succeeds, because a row-level
+      // GET cannot hydrate sessions, evidence, diffs, or promotion recovery.
+      scheduleProjectRefresh(experimentId, attempt + 1)
     }
-  }, 300)
+  }, attempt === 0 ? 300 : Math.min(30_000, 500 * 2 ** Math.min(attempt - 1, 6)))
+  refreshTimers.set(experimentId, timer)
+}
+
+function updateStreamState(experimentId: string, state: StreamState) {
+  streamStateByExperiment.value = { ...streamStateByExperiment.value, [experimentId]: state }
+}
+
+function updateEventWarning(experimentId: string, warning: string | null) {
+  eventWarningByExperiment.value = { ...eventWarningByExperiment.value, [experimentId]: warning }
+}
+
+function reconciliationIds() {
+  const active = store.experiments
+    .filter((experiment) => RECONCILIATION_STATUSES.has(experiment.status)
+      || (experiment.status === 'AGENT_COMPLETED' && !experiment.resultSnapshotId))
+    .map((experiment) => experiment.id)
+  const known = new Set(store.experiments.map((experiment) => experiment.id))
+  for (const experimentId of pendingReconciliation) {
+    if (!known.has(experimentId)) pendingReconciliation.delete(experimentId)
+  }
+  return [...new Set([...active, ...pendingReconciliation])]
+}
+
+function stateSyncWarning() {
+  return text('任务状态同步暂时失败，将继续重试。', 'Task state sync failed temporarily; it will keep retrying.')
+}
+
+function stateRefreshError() {
+  return text('无法刷新任务状态，将继续保留当前活动并等待重试。', 'Unable to refresh task state; the current activity is retained and will be retried.')
+}
+
+function clearStateRefreshError() {
+  if (store.error === stateRefreshError()) store.error = null
+}
+
+function isStateSyncWarning(value: string | null) {
+  return value === stateSyncWarning()
+}
+
+function clearStateSyncWarnings() {
+  for (const experimentId of Object.keys(eventWarningByExperiment.value)) {
+    if (isStateSyncWarning(eventWarningByExperiment.value[experimentId])) updateEventWarning(experimentId, null)
+  }
+}
+
+function stopStateReconciliation() {
+  if (reconciliationTimer !== null) window.clearInterval(reconciliationTimer)
+  reconciliationTimer = null
+}
+
+async function reconcileActiveState() {
+  if (reconciliationBusy) return
+  const ids = reconciliationIds()
+  if (!ids.length) {
+    clearStateSyncWarnings()
+    clearStateRefreshError()
+    stopStateReconciliation()
+    return
+  }
+  reconciliationBusy = true
+  try {
+    const results = await Promise.allSettled(ids.map((experimentId) => store.refreshExperimentState(experimentId)))
+    results.forEach((result) => {
+      if (result.status === 'fulfilled' && result.value === true) clearStateRefreshError()
+    })
+    // A full refresh can be delayed or lost independently of the lightweight
+    // row request. Make sure each pending ID still has a full-refresh retry.
+    for (const experimentId of ids) {
+      if (pendingReconciliation.has(experimentId) && !refreshTimers.has(experimentId)) {
+        scheduleProjectRefresh(experimentId)
+      }
+    }
+    if (results.some((result) => result.status === 'rejected')) {
+      const warningId = mainActivityExperimentId.value ?? ids[0]
+      updateEventWarning(warningId, stateSyncWarning())
+    } else {
+      for (const experimentId of ids) {
+        if (isStateSyncWarning(eventWarningFor(experimentId))) updateEventWarning(experimentId, null)
+      }
+    }
+  } finally {
+    reconciliationBusy = false
+    syncStateReconciliation()
+  }
+}
+
+function syncStateReconciliation() {
+  if (!reconciliationIds().length) {
+    clearStateSyncWarnings()
+    clearStateRefreshError()
+    stopStateReconciliation()
+    return
+  }
+  if (reconciliationTimer === null) {
+    reconciliationTimer = window.setInterval(() => void reconcileActiveState(), RECONCILIATION_INTERVAL_MS)
+  }
 }
 
 function connectEvents(experimentId: string | null, force = false) {
-  // Route changes can run more than once while the project payload is loading.
-  // Keep a healthy stream alive, but allow a closed stream to be recreated.
-  if (!force && eventSource && eventExperimentId === experimentId && eventSource.readyState !== EventSource.CLOSED) return
-  eventSource?.close()
-  eventSource = null
-  eventExperimentId = experimentId
-  if (refreshTimer !== null) window.clearTimeout(refreshTimer)
-  refreshTimer = null
-  activity.value = []
-  seenSequences.clear()
-  eventWarning.value = null
-  streamState.value = experimentId ? 'connecting' : 'idle'
   if (!experimentId) return
+  const existing = eventSources.get(experimentId)
+  if (!force && existing && existing.readyState !== EventSource.CLOSED) return
+  existing?.close()
+  eventSources.delete(experimentId)
+
+  const retained = activityFor(experimentId)
+  const cursor = retained.at(-1)?.sequence ?? 0
+  const query = cursor > 0 ? `after=${cursor}` : `tail=${ACTIVITY_WINDOW}`
+  updateEventWarning(experimentId, null)
+  updateStreamState(experimentId, 'connecting')
 
   // EventSource does not expose arbitrary headers. Explicit credentials keep
   // the HttpOnly session cookie attached when the frontend is served through a
   // development/reverse-proxy origin.
-  const source = new EventSource(`/api/experiments/${experimentId}/events`, { withCredentials: true })
-  eventSource = source
-  source.onopen = () => { if (eventSource === source) streamState.value = 'live' }
+  const source = new EventSource(`/api/experiments/${experimentId}/events?${query}`, { withCredentials: true })
+  eventSources.set(experimentId, source)
+  source.onopen = () => {
+    if (eventSources.get(experimentId) === source) updateStreamState(experimentId, 'live')
+  }
   source.onerror = () => {
-    if (eventSource !== source) return
-    streamState.value = source.readyState === EventSource.CLOSED ? 'offline' : 'reconnecting'
+    if (eventSources.get(experimentId) !== source) return
+    updateStreamState(experimentId, source.readyState === EventSource.CLOSED ? 'offline' : 'reconnecting')
   }
   source.onmessage = (message) => {
-    if (eventSource !== source) return
+    if (eventSources.get(experimentId) !== source) return
     let parsed: unknown
     try { parsed = JSON.parse(message.data) } catch {
-      eventWarning.value = text('事件内容无法解析。', 'An event payload could not be parsed.')
+      updateEventWarning(experimentId, text('事件内容无法解析。', 'An event payload could not be parsed.'))
       return
     }
     if (!validRunEvent(parsed)) {
-      eventWarning.value = text('已忽略一个格式无效的事件。', 'An event with an invalid shape was ignored.')
+      updateEventWarning(experimentId, text('已忽略一个格式无效的事件。', 'An event with an invalid shape was ignored.'))
       return
     }
     if (parsed.experimentId !== experimentId) {
-      eventWarning.value = text('已忽略了属于其他任务的事件。', 'An event for another task was ignored.')
+      updateEventWarning(experimentId, text('已忽略了属于其他任务的事件。', 'An event for another task was ignored.'))
       return
     }
-    if (seenSequences.has(parsed.sequence)) return
-    seenSequences.add(parsed.sequence)
-    activity.value.push(parsed)
-    if (activity.value.length > 200) {
-      const removed = activity.value.shift()
-      if (removed) seenSequences.delete(removed.sequence)
+    const seen = seenSequences.get(experimentId) ?? new Set<number>()
+    seenSequences.set(experimentId, seen)
+    if (seen.has(parsed.sequence)) return
+    seen.add(parsed.sequence)
+    const current = activityFor(experimentId)
+    // A reconnect can resume after the server has evicted older events.  The
+    // client may still have a non-empty tail in memory, so checking only the
+    // first event is not enough to detect a gap in the retained timeline.
+    const previousSequence = current.at(-1)?.sequence ?? 0
+    if ((current.length === 0 && parsed.sequence > 1)
+      || (previousSequence > 0 && parsed.sequence > previousSequence + 1)) {
+      activityTruncatedByExperiment.value = { ...activityTruncatedByExperiment.value, [experimentId]: true }
     }
-    if (refreshEvents.has(parsed.type)) scheduleProjectRefresh(experimentId)
+    let next = [...current, parsed]
+    if (next.length > ACTIVITY_WINDOW) {
+      next = next.slice(-ACTIVITY_WINDOW)
+      activityTruncatedByExperiment.value = { ...activityTruncatedByExperiment.value, [experimentId]: true }
+    }
+    // Keep duplicate detection bounded with the visible retention window. The
+    // SSE cursor still prevents replaying older events after reconnect; this
+    // set only protects the current in-memory tail from duplicate deliveries.
+    seen.clear()
+    for (const event of next) seen.add(event.sequence)
+    activityByExperiment.value = { ...activityByExperiment.value, [experimentId]: next }
+    if (RUN_EVENTS_REQUIRING_REFRESH.has(parsed.type)) {
+      pendingReconciliation.add(experimentId)
+      scheduleProjectRefresh(experimentId)
+      syncStateReconciliation()
+    }
   }
+}
+
+function disconnectEventStream(experimentId: string) {
+  eventSources.get(experimentId)?.close()
+  eventSources.delete(experimentId)
+  updateStreamState(experimentId, 'idle')
+}
+
+function syncEventStreams() {
+  const desired = new Set<string>()
+  if (mainActivityExperimentId.value) desired.add(mainActivityExperimentId.value)
+  if (reviewActivityExperimentId.value) desired.add(reviewActivityExperimentId.value)
+  for (const experimentId of desired) connectEvents(experimentId)
+  for (const experimentId of [...eventSources.keys()]) {
+    if (!desired.has(experimentId)) disconnectEventStream(experimentId)
+  }
+  syncStateReconciliation()
+}
+
+function disconnectAllEventStreams() {
+  for (const source of eventSources.values()) source.close()
+  eventSources.clear()
+  for (const timer of refreshTimers.values()) window.clearTimeout(timer)
+  refreshTimers.clear()
+  stopStateReconciliation()
+  pendingReconciliation.clear()
 }
 
 async function syncRoute() {
   if (!initialized.value) return
+  // A URL change (including browser back/forward) supersedes any pending
+  // click handler that is still waiting for a store request.
+  selectionIntent++
   const syncId = ++routeSyncVersion
   const desiredProject = projectParam.value
   const desiredExperiment = experimentParam.value
@@ -164,16 +386,16 @@ async function syncRoute() {
     showReview.value = false
     mobileNavOpen.value = true
     forceNewTask.value = false
-    connectEvents(null)
+    syncEventStreams()
     return
   }
   if (store.projects.length === 0 && store.error) {
-    connectEvents(null)
+    syncEventStreams()
     return
   }
   if (!store.projects.some((project) => project.id === desiredProject)) {
     store.error = text('链接中的项目不可用，请从项目列表重新选择。', 'The linked project is unavailable. Choose it again from the project list.')
-    connectEvents(null)
+    syncEventStreams()
     await router.replace({ name: 'home' })
     return
   }
@@ -182,37 +404,39 @@ async function syncRoute() {
     if (syncId !== routeSyncVersion) return
     if (desiredExperiment && store.selectedExperimentId !== desiredExperiment) {
       store.error = text('链接的任务不可用。', 'The linked task is unavailable.')
-      connectEvents(null)
+      syncEventStreams()
       await router.replace({ name: 'project', params: { projectId: desiredProject } })
       return
     }
   } else if (desiredExperiment && store.selectedExperimentId !== desiredExperiment) {
     if (store.experiments.some((experiment) => experiment.id === desiredExperiment)) {
       await store.selectExperiment(desiredExperiment)
+      if (syncId !== routeSyncVersion) return
     } else {
       store.error = text('链接的任务不可用。', 'The linked task is unavailable.')
-      connectEvents(null)
+      syncEventStreams()
       await router.replace({ name: 'project', params: { projectId: desiredProject } })
       return
     }
   }
-  showReview.value = !!desiredExperiment
   if (syncId !== routeSyncVersion) return
-  if (!eventSource || eventExperimentId !== store.selectedExperimentId || eventSource.readyState === EventSource.CLOSED) {
-    connectEvents(store.selectedExperimentId)
-  }
+  showReview.value = !!desiredExperiment
+  syncEventStreams()
 }
 
 async function openProject(projectId: string) {
+  selectionIntent++
   closeMobileNav()
   forceNewTask.value = false
   await router.push({ name: 'project', params: { projectId } })
 }
 
 async function selectSession(sessionId: string) {
+  const intent = ++selectionIntent
   closeMobileNav()
   forceNewTask.value = false
   await store.selectSession(sessionId)
+  if (intent !== selectionIntent) return
   if (!store.selectedProjectId) return
   const latest = store.activeExperiments.at(-1)
   if (latest) await router.push({ name: 'project', params: { projectId: store.selectedProjectId } })
@@ -220,9 +444,11 @@ async function selectSession(sessionId: string) {
 }
 
 async function openReview(experimentId: string) {
+  const intent = ++selectionIntent
   closeMobileNav()
   reviewReturnFocus.value = document.activeElement instanceof HTMLElement ? document.activeElement : null
   await store.selectExperiment(experimentId)
+  if (intent !== selectionIntent) return
   showReview.value = true
   if (store.selectedProjectId) {
     await router.push({ name: 'experiment', params: { projectId: store.selectedProjectId, experimentId } })
@@ -230,7 +456,9 @@ async function openReview(experimentId: string) {
 }
 
 async function selectExperiment(experimentId: string) {
+  const intent = ++selectionIntent
   await store.selectExperiment(experimentId)
+  if (intent !== selectionIntent) return
   if (store.selectedProjectId) {
     // Keep browser history/deep links aligned with selections made in the
     // conversation list, including historical turns.
@@ -239,6 +467,7 @@ async function selectExperiment(experimentId: string) {
 }
 
 async function closeReview() {
+  selectionIntent++
   if (showPromotionDialog.value && actionBusy.value) return
   const returnFocus = reviewReturnFocus.value
   showReview.value = false
@@ -254,21 +483,35 @@ async function continueFromReview() {
   await threadRef.value?.focusComposer()
 }
 
-async function submitProject(value: { name: string; canonicalPath: string; verificationCommands: string[] }) {
+async function submitProject(value: { name: string; canonicalPath: string; verificationCommands: string[]; createNew?: boolean }) {
   submitting.value = true
   store.error = null
   try {
+    const editing = Boolean(editingProject.value)
+    const { createNew, ...projectBody } = value
     const project = editingProject.value
-      ? await store.updateProject(value)
-      : await store.createProject(value)
+      ? await store.updateProject(projectBody)
+      : createNew
+        ? await store.createLocalProject(projectBody)
+        : await store.createProject(projectBody)
     if (!project) return
     const reopened = 'project' in project && project.reopened
     const selected = 'project' in project ? project.project : project
     editingProject.value = null
     showProjectDialog.value = false
     await router.push({ name: 'project', params: { projectId: selected.id } })
+    if (editing && selected.id === store.selectedProjectId) {
+      // Policy changes may return verified results to the sealed waiting state
+      // on the server. Refresh the experiment list so the workspace reflects
+      // that safety transition immediately.
+      try {
+        await store.reloadSelectedProject()
+      } catch (cause) {
+        store.error = formatError(cause, '项目已保存，但任务状态刷新失败。', 'The project was saved, but task status could not be refreshed.')
+      }
+    }
     if (reopened) {
-      store.error = text('已打开这个账户中的现有项目；名称和验收命令沿用原设置，可通过顶部编辑按钮修改。', 'Opened the existing project in this account. Its saved name and acceptance commands were kept; use the edit button in the header to change them.')
+      store.error = text('已打开这个账户中的现有项目；名称和验收命令沿用原设置，可通过顶部的「项目设置」修改。', 'Opened the existing project in this account. Its saved name and acceptance commands were kept; use Project settings in the header to change them.')
     }
   } catch (cause) {
     store.error = projectSaveError(cause)
@@ -341,6 +584,7 @@ async function retryExperiment(experimentId: string) {
 }
 
 function openSettings() {
+  selectionIntent++
   showReview.value = false
   showPromotionDialog.value = false
   const query: Record<string, string> = {}
@@ -349,7 +593,22 @@ function openSettings() {
   void router.push({ name: 'settings', query })
 }
 
+function openProjectSettings() {
+  selectionIntent++
+  showReview.value = false
+  showPromotionDialog.value = false
+  // Editing from the review drawer leaves the experiment deep-link. Replace
+  // it before closing the drawer so cancelling the settings dialog cannot
+  // leave the URL pointing at a review that is no longer visible (and a later
+  // refresh will not reopen that stale drawer).
+  if (store.selectedProjectId && experimentParam.value) {
+    void router.replace({ name: 'project', params: { projectId: store.selectedProjectId } })
+  }
+  editSelectedProject()
+}
+
 async function startNewTask() {
+  selectionIntent++
   forceNewTask.value = true
   mobileNavOpen.value = false
   await store.selectSession(null)
@@ -366,6 +625,10 @@ async function startExperiment(experimentId: string) {
 
 async function cancelExperiment(experimentId: string) {
   await runAction(() => store.cancelExperiment(experimentId))
+}
+
+async function verifyExperiment(experimentId: string) {
+  await runAction(() => store.verifyExperiment(experimentId))
 }
 
 async function reconcileSelected() {
@@ -397,7 +660,7 @@ async function confirmPromotionDecision() {
   // after the confirmation dialog opens, and applying without a complete
   // review would break the user's evidence-first decision model.
   if (!experiment || experiment.status !== 'VERIFIED' || !preview
-    || preview.recoveryRequired || (!preview.promotable && !preview.conflict)
+    || selectedSessionBusy.value || preview.recoveryRequired || (!preview.promotable && !preview.conflict)
     || store.evidenceError || store.diffError || store.promotionPreviewError || store.promotionRecoveryError) {
     showPromotionDialog.value = false
     return
@@ -477,7 +740,11 @@ watch(mobileNavOpen, (open) => {
 })
 
 watch(() => route.fullPath, () => void syncRoute())
-watch(() => store.selectedExperimentId, (next) => connectEvents(next))
+watch([mainActivityExperimentId, reviewActivityExperimentId], () => syncEventStreams())
+watch(() => store.experiments.map((experiment) => `${experiment.id}:${experiment.status}:${experiment.version}`).join('|'), () => {
+  syncEventStreams()
+  syncStateReconciliation()
+})
 watch(() => store.selectedExperimentId, () => {
   // A promotion confirmation belongs to one experiment. Never leave it open
   // while the user navigates to another historical turn.
@@ -499,17 +766,14 @@ onMounted(async () => {
   await syncRoute()
   // The Pinia store survives route changes, while this view's EventSource does
   // not. Reconnect explicitly when returning from Settings or another route.
-  connectEvents(store.selectedExperimentId)
+  syncEventStreams()
   window.addEventListener('keydown', handleGlobalKeydown)
   updateMobileState()
   window.addEventListener('resize', updateMobileState)
 })
 
 onUnmounted(() => {
-  eventSource?.close()
-  eventSource = null
-  eventExperimentId = null
-  if (refreshTimer !== null) window.clearTimeout(refreshTimer)
+  disconnectAllEventStreams()
   window.removeEventListener('keydown', handleGlobalKeydown)
   window.removeEventListener('resize', updateMobileState)
   store.clearSelection()
@@ -523,10 +787,10 @@ onUnmounted(() => {
         <span class="brand-mark">O</span>
         <span><strong>Offcanon</strong><small>{{ text('Coding Agent', 'Coding Agent') }}</small></span>
       </button>
-      <div class="topbar-project" v-if="store.selectedProject"><span class="topbar-project-dot" />{{ store.selectedProject.name }}<button class="icon-button small" :aria-label="text('编辑项目', 'Edit project')" :title="text('编辑项目', 'Edit project')" @click="editSelectedProject"><Edit3 :size="13" /></button></div>
+       <div class="topbar-project" v-if="store.selectedProject"><span class="topbar-project-dot" /><span class="topbar-project-name">{{ store.selectedProject.name }}</span><button class="icon-button small" :disabled="submitting || actionBusy" :aria-label="text('编辑项目设置', 'Edit project settings')" :title="text('编辑项目设置', 'Edit project settings')" @click="editSelectedProject"><Edit3 :size="13" /></button></div>
       <div class="topbar-context">
-        <span v-if="store.selectedExperimentId" class="connection-state" :class="streamState"><span class="stream-dot" :class="streamState" />{{ connectionLabel }}</span>
-        <button v-if="store.selectedProject" class="icon-button small mobile-project-edit" :aria-label="text('编辑项目', 'Edit project')" :title="text('编辑项目', 'Edit project')" @click="editSelectedProject"><Edit3 :size="14" /></button>
+        <span v-if="mainActivityExperimentId" class="connection-state" :class="mainStreamState"><span class="stream-dot" :class="mainStreamState" />{{ connectionLabel }}</span>
+         <button v-if="store.selectedProject" class="icon-button small mobile-project-edit" :disabled="submitting || actionBusy" :aria-label="text('编辑项目设置', 'Edit project settings')" :title="text('编辑项目设置', 'Edit project settings')" @click="editSelectedProject"><Edit3 :size="14" /></button>
         <button class="icon-button" :aria-label="text('刷新', 'Refresh')" :title="text('刷新', 'Refresh')" :disabled="store.loading" @click="refresh"><RefreshCw :class="{ spin: store.loading }" :size="16" /></button>
         <button class="account-button" :aria-label="text('打开设置', 'Open settings')" :title="text('设置', 'Settings')" @click="openSettings"><span>{{ accountInitials }}</span><Settings :size="14" /></button>
       </div>
@@ -580,8 +844,11 @@ onUnmounted(() => {
         :session="store.activeSession"
         :experiments="activeExperiments"
         :selected-experiment-id="store.selectedExperimentId"
-        :activity="activity"
-        :stream-state="streamState"
+         :activity="mainActivity"
+         :activity-experiment-id="mainActivityExperimentId"
+         :activity-truncated="activityTruncatedFor(mainActivityExperimentId)"
+         :event-warning="eventWarningFor(mainActivityExperimentId)"
+         :stream-state="mainStreamState"
         :action-busy="actionBusy || submitting"
         :detail-loading="store.detailLoading"
         :promotion-preview="store.promotionPreview"
@@ -593,9 +860,12 @@ onUnmounted(() => {
         @review="openReview"
         @open-settings="openSettings"
         @retry="retryExperiment"
-        @reconnect="store.selectedExperimentId && connectEvents(store.selectedExperimentId, true)"
+        @reconnect="mainActivityExperimentId && connectEvents(mainActivityExperimentId, true)"
         @start="startExperiment"
         @cancel="cancelExperiment"
+        @verify="verifyExperiment"
+        @edit-project="openProjectSettings"
+        @model-readiness="agentModelReady = $event"
       />
     </div>
 
@@ -615,9 +885,12 @@ onUnmounted(() => {
             :promotion-preview="store.promotionPreview"
             :promotion-outcome="store.promotionOutcome"
             :promotion-reconcile="store.promotionReconcile"
-            :activity="activity"
-            :stream-state="streamState"
-            :event-warning="eventWarning"
+            :activity="reviewActivity"
+            :stream-state="reviewStreamState"
+            :event-warning="reviewEventWarning"
+            :activity-truncated="activityTruncatedFor(reviewActivityExperimentId)"
+            :model-ready="agentModelReady"
+            :session-busy="selectedSessionBusy"
             :action-busy="actionBusy"
             :detail-loading="store.detailLoading"
             :detail-error="store.detailError"
@@ -628,18 +901,20 @@ onUnmounted(() => {
             @back="closeReview"
             @start="store.selectedExperiment && startExperiment(store.selectedExperiment.id)"
             @cancel="store.selectedExperiment && cancelExperiment(store.selectedExperiment.id)"
+            @verify="store.selectedExperiment && verifyExperiment(store.selectedExperiment.id)"
+            @edit-project="openProjectSettings"
             @promote="showPromotionDialog = true"
             @reconcile="reconcileSelected"
             @open-settings="openSettings"
             @retry="store.selectedExperiment && retryExperiment(store.selectedExperiment.id)"
-            @reconnect="store.selectedExperimentId && connectEvents(store.selectedExperimentId, true)"
+            @reconnect="reviewActivityExperimentId && connectEvents(reviewActivityExperimentId, true)"
             @continue-task="continueFromReview"
           />
         </aside>
       </div>
     </Transition>
 
-    <ProjectDialog v-if="showProjectDialog" :project="editingProject" :busy="submitting" :error="store.error" @close="showProjectDialog = false; editingProject = null" @submit="submitProject" />
+    <ProjectDialog v-if="showProjectDialog" :project="editingProject" :verified-result-count="verifiedResultCount" :busy="submitting" :error="store.error" @close="showProjectDialog = false; editingProject = null" @submit="submitProject" />
     <PromotionDialog
       v-if="showPromotionDialog && store.selectedExperiment && store.promotionPreview"
       :experiment="store.selectedExperiment"

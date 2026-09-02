@@ -2,7 +2,7 @@
 import { FolderGit2, MessageSquare, PanelLeftClose, Plus, ChevronRight } from 'lucide-vue-next'
 import type { Experiment, Project, Session } from '../api'
 import { useLocale } from '../i18n'
-import { formatDate, statusLabel, statusTone } from '../ui'
+import { experimentDisplayTone, experimentStatusLabel, formatDate } from '../ui'
 
 const props = defineProps<{
   projects: Project[]
@@ -34,6 +34,11 @@ function taskTitle(session: Session) {
   // appears to be renamed after every follow-up request.
   return session.title || latest?.task || text('未命名任务', 'Untitled task')
 }
+
+function taskStatus(experiment: Experiment) {
+  const project = props.projects.find((item) => item.id === experiment.projectId)
+  return experimentStatusLabel(experiment, Boolean(project?.verificationCommands.length))
+}
 </script>
 
 <template>
@@ -41,7 +46,7 @@ function taskTitle(session: Session) {
     <div class="sidebar-brand-row">
       <div class="sidebar-section-label">{{ text('项目', 'Projects') }}</div>
       <div class="sidebar-heading-actions">
-        <button class="icon-button small" :aria-label="text('打开项目', 'Open project')" :title="text('打开项目', 'Open project')" @click="emit('addProject')"><Plus :size="15" /></button>
+        <button class="icon-button small" :aria-label="text('打开或新建项目', 'Open or create project')" :title="text('打开或新建项目', 'Open or create project')" @click="emit('addProject')"><Plus :size="15" /></button>
         <button v-if="selectedProjectId" class="icon-button small sidebar-close" :aria-label="text('关闭任务导航', 'Close task navigation')" :title="text('关闭', 'Close')" @click="emit('close')"><PanelLeftClose :size="15" /></button>
       </div>
     </div>
@@ -63,7 +68,7 @@ function taskTitle(session: Session) {
       <div v-if="!projects.length && !loading" class="sidebar-empty">
         <FolderGit2 :size="18" />
         <span>{{ text('还没有打开项目', 'No project is open') }}</span>
-        <button class="button secondary compact" @click="emit('addProject')"><Plus :size="14" />{{ text('打开项目', 'Open project') }}</button>
+        <button class="button secondary compact" @click="emit('addProject')"><Plus :size="14" />{{ text('打开或新建项目', 'Open or create project') }}</button>
       </div>
     </nav>
 
@@ -87,7 +92,7 @@ function taskTitle(session: Session) {
           <strong>{{ taskTitle(session) }}</strong>
           <small>{{ formatDate(session.createdAt) }}</small>
         </span>
-        <span v-if="latestFor(session.id)" class="task-status" :class="statusTone(latestFor(session.id)!.status)">{{ statusLabel(latestFor(session.id)!.status) }}</span>
+        <span v-if="latestFor(session.id)" class="task-status" :class="experimentDisplayTone(latestFor(session.id)!)">{{ taskStatus(latestFor(session.id)!) }}</span>
       </button>
       <div v-if="!sessions.length" class="sidebar-empty task-empty">
         <MessageSquare :size="18" />

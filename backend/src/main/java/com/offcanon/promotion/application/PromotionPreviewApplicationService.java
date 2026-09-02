@@ -64,13 +64,15 @@ public class PromotionPreviewApplicationService {
         var unresolvedJournals = promotionJournals.findUnresolvedByProject(project.id());
         var recoveryJournal = unresolvedJournals.isEmpty() ? null : unresolvedJournals.getFirst();
         boolean unresolvedPromotion = recoveryJournal != null;
+        boolean sessionBusy = experiments.hasRunningExperiment(experiment.sessionId(), experiment.id());
         String blockingReason = blockingReason(experiment, baseFingerprint,
-                candidateFingerprint, verificationStatus, inspectionFailure, conflict, unresolvedPromotion);
+                candidateFingerprint, verificationStatus, inspectionFailure, conflict, unresolvedPromotion, sessionBusy);
         boolean promotable = experiment.status() == ExperimentStatus.VERIFIED
                 && trustedVerification
                 && "PASSED".equals(verificationStatus)
                 && !conflict
                 && !unresolvedPromotion
+                && !sessionBusy
                 && baseFingerprint != null
                 && currentFingerprint != null
                 && candidateFingerprint != null;
@@ -88,10 +90,12 @@ public class PromotionPreviewApplicationService {
                                   String verificationStatus,
                                   String inspectionFailure,
                                   boolean conflict,
-                                  boolean unresolvedPromotion) {
+                                  boolean unresolvedPromotion,
+                                  boolean sessionBusy) {
         if (inspectionFailure != null) return inspectionFailure;
         if (baseFingerprint == null) return "Base snapshot is not available";
         if (unresolvedPromotion) return "An earlier promotion requires recovery before this project can be changed";
+        if (sessionBusy) return "A later experiment in this session is still active";
         if (experiment.status() == ExperimentStatus.PROMOTED && !conflict) return "Candidate is already canonical";
         if (conflict) {
             return (experiment.status() == ExperimentStatus.STALE

@@ -2,6 +2,7 @@ package com.offcanon.memory.application;
 
 import com.offcanon.memory.domain.TaskMemoryProjection;
 import com.offcanon.memory.domain.TaskMemoryRevision;
+import com.offcanon.memory.domain.TaskMemoryKind;
 import com.offcanon.memory.domain.TaskMemoryStatus;
 import org.springframework.stereotype.Component;
 
@@ -27,11 +28,27 @@ public class TaskMemoryProjector {
                                         UUID sessionId,
                                         String currentFingerprint,
                                         List<TaskMemoryRevision> ledger) {
+        return project(projectId, sessionId, currentFingerprint, ledger, Set.of());
+    }
+
+    /**
+     * Projects the ledger while allowing the application boundary to mark
+     * trusted facts whose source experiment is no longer an accepted result.
+     * The ledger remains immutable; those facts are simply presented as
+     * historical until their source is verified again.
+     */
+    public TaskMemoryProjection project(UUID projectId,
+                                        UUID sessionId,
+                                        String currentFingerprint,
+                                        List<TaskMemoryRevision> ledger,
+                                        Set<UUID> invalidatedVerifiedExperiments) {
         Objects.requireNonNull(projectId, "projectId");
         Objects.requireNonNull(sessionId, "sessionId");
         Objects.requireNonNull(currentFingerprint, "currentFingerprint");
         Objects.requireNonNull(ledger, "ledger");
+        Objects.requireNonNull(invalidatedVerifiedExperiments, "invalidatedVerifiedExperiments");
         if (currentFingerprint.isBlank()) throw new IllegalArgumentException("Current fingerprint must not be blank");
+        Set<UUID> invalidated = Set.copyOf(invalidatedVerifiedExperiments);
 
         List<TaskMemoryRevision> ordered = ledger.stream().sorted(ORDER).toList();
         validateScope(projectId, sessionId, ordered);
@@ -59,7 +76,9 @@ public class TaskMemoryProjector {
         List<TaskMemoryProjection.ProjectedMemory> proposed = new ArrayList<>();
         List<TaskMemoryProjection.ProjectedMemory> conflicted = new ArrayList<>();
         for (TaskMemoryRevision revision : leaves) {
-            TaskMemoryProjection.Freshness freshness = revision.appliesTo(currentFingerprint)
+            boolean sourceAccepted = revision.kind() != TaskMemoryKind.VERIFIED_FACT
+                    || !invalidated.contains(revision.sourceExperimentId());
+            TaskMemoryProjection.Freshness freshness = sourceAccepted && revision.appliesTo(currentFingerprint)
                     && revision.status() != TaskMemoryStatus.STALE
                     ? TaskMemoryProjection.Freshness.CURRENT
                     : TaskMemoryProjection.Freshness.STALE;

@@ -2,16 +2,23 @@ package com.offcanon.application;
 
 import com.offcanon.port.ProjectRepository;
 import com.offcanon.port.ExperimentRepository;
+import com.offcanon.port.EventSink;
 import com.offcanon.port.PromotionLockPort;
+import com.offcanon.port.PromotionJournalPort;
 import com.offcanon.port.SnapshotPort;
+import com.offcanon.experiment.domain.Experiment;
+import com.offcanon.experiment.domain.ExperimentStatus;
 import com.offcanon.project.domain.Project;
 import com.offcanon.shared.domain.DomainException;
 import com.offcanon.shared.web.NotFoundException;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 @Service
@@ -20,16 +27,61 @@ public class ProjectApplicationService {
     private final SnapshotPort snapshots;
     private final ExperimentRepository experiments;
     private final PromotionLockPort promotionLock;
+    private final PromotionJournalPort promotionJournals;
+    private final EventSink events;
 
+    @Autowired
     public ProjectApplicationService(ProjectRepository projectRepository,
                                      SnapshotPort snapshots,
                                      ExperimentRepository experiments,
-                                     PromotionLockPort promotionLock) {
+                                     PromotionLockPort promotionLock,
+                                     EventSink events,
+                                     PromotionJournalPort promotionJournals) {
         this.projectRepository = projectRepository;
         this.snapshots = snapshots;
         this.experiments = experiments;
         this.promotionLock = promotionLock;
+        this.events = events;
+        this.promotionJournals = promotionJournals;
     }
+
+    /** Compatibility constructor for integrations that already provide events. */
+    public ProjectApplicationService(ProjectRepository projectRepository,
+                                     SnapshotPort snapshots,
+                                     ExperimentRepository experiments,
+                                     PromotionLockPort promotionLock,
+                                     EventSink events) {
+        this(projectRepository, snapshots, experiments, promotionLock, events, null);
+    }
+
+    /** Constructor for focused tests/integrations that model promotion journals. */
+    public ProjectApplicationService(ProjectRepository projectRepository,
+                                     SnapshotPort snapshots,
+                                     ExperimentRepository experiments,
+                                     PromotionLockPort promotionLock,
+                                     PromotionJournalPort promotionJournals) {
+        this(projectRepository, snapshots, experiments, promotionLock, NOOP_EVENTS, promotionJournals);
+    }
+
+    /** Compatibility constructor for focused tests that do not model events. */
+    public ProjectApplicationService(ProjectRepository projectRepository,
+                                     SnapshotPort snapshots,
+                                     ExperimentRepository experiments,
+                                     PromotionLockPort promotionLock) {
+        this(projectRepository, snapshots, experiments, promotionLock, NOOP_EVENTS);
+    }
+
+    private static final EventSink NOOP_EVENTS = new EventSink() {
+        @Override
+        public com.offcanon.agent.domain.RunEvent publish(UUID experimentId, String type, Map<String, Object> payload) {
+            return null;
+        }
+
+        @Override
+        public List<com.offcanon.agent.domain.RunEvent> after(UUID experimentId, long sequence) {
+            return List.of();
+        }
+    };
 
     public Project register(UUID ownerId, String name, String canonicalPath, List<String> verificationCommands) {
         return registerWithOutcome(ownerId, name, canonicalPath, verificationCommands).project();
@@ -83,6 +135,7 @@ public class ProjectApplicationService {
      * Updates display metadata and verification policy for an owned project.
      * The canonical path is intentionally immutable after registration.
      */
+    @Transactional
     public Project update(UUID ownerId,
                           UUID projectId,
                           String name,
@@ -105,13 +158,29 @@ public class ProjectApplicationService {
                     "A registered project's canonical path cannot be changed; open a new project instead");
         }
         List<String> policy = normalizeVerificationCommands(verificationCommands);
-        if (!current.verificationCommands().equals(policy)
-                && experiments.hasActiveExperimentForProject(projectId)) {
+        // A sealed AGENT_COMPLETED result is explicitly a waiting state: the
+        // user must be able to add, correct, or clear commands before asking
+        // for verification. The agent boundary transitions policy-backed runs
+        // to VERIFYING under the same project lock, so every other lifecycle
+        // state remains protected by this blocking query.
+        boolean policyChanged = !current.verificationCommands().equals(policy);
+        boolean policyChangeBlocked = experiments.hasBlockingExperimentForProject(projectId);
+        boolean promotionRecoveryPending = policyChanged
+                && promotionJournals != null
+                && !promotionJournals.findUnresolvedByProject(projectId).isEmpty();
+        if (policyChanged && (policyChangeBlocked || promotionRecoveryPending)) {
             throw new DomainException("VERIFICATION_POLICY_LOCKED",
-                    "Project verification commands cannot change while an experiment or promotion is active");
+                    "Project verification commands cannot change while an experiment or promotion is active or unresolved");
         }
+        // Validate the complete project representation before touching any
+        // pending verification rows. This keeps an invalid display name or a
+        // repository-level validation error from changing lifecycle state.
+        Project candidate = current.updated(name, policy);
+        List<Experiment> invalidated = policyChanged ? invalidateVerifiedResults(projectId) : List.of();
         try {
-            return projectRepository.update(current.updated(name, policy));
+            Project updated = projectRepository.update(candidate);
+            invalidated.forEach(this::publishPolicyInvalidation);
+            return updated;
         } catch (DomainException error) {
             if ("PROJECT_VERSION_CONFLICT".equals(error.code())) {
                 throw error;
@@ -120,13 +189,45 @@ public class ProjectApplicationService {
         }
     }
 
+    /**
+     * A passing result is bound to the policy that produced its evidence. Once
+     * the policy changes, retaining VERIFIED would let an old result be
+     * interpreted under the new commands. Return those pending results to the
+     * sealed waiting boundary while keeping their immutable snapshots and
+     * evidence available for audit; the same immutable result can be
+     * re-verified under the new policy without asking the user to start over.
+     */
+    private List<Experiment> invalidateVerifiedResults(UUID projectId) {
+        List<Experiment> invalidated = new java.util.ArrayList<>();
+        for (Experiment experiment : experiments.findByProjectId(projectId)) {
+            if (experiment.status() != ExperimentStatus.VERIFIED) continue;
+            experiment.invalidateVerificationForPolicyChange();
+            experiments.save(experiment);
+            invalidated.add(experiment);
+        }
+        return List.copyOf(invalidated);
+    }
+
+    private void publishPolicyInvalidation(Experiment experiment) {
+        try {
+            events.publish(experiment.id(), "VERIFICATION_INVALIDATED", Map.of(
+                    "status", experiment.status().name(),
+                    "reason", "VERIFICATION_POLICY_CHANGED",
+                    "resultSnapshotId", experiment.resultSnapshotId().toString()));
+        } catch (RuntimeException ignored) {
+            // Settings and lifecycle state remain authoritative if telemetry is unavailable.
+        }
+    }
+
     private List<String> normalizeVerificationCommands(List<String> verificationCommands) {
         List<String> policy = verificationCommands == null ? List.of() : verificationCommands.stream()
                 .map(command -> command == null ? "" : command.trim())
                 .filter(command -> !command.isBlank()).toList();
-        if (policy.isEmpty()) {
-            throw new DomainException("VERIFICATION_POLICY_MISSING",
-                    "Configure at least one verification command before registering a project");
+        for (String command : policy) {
+            if (command.length() > 1_000) {
+                throw new DomainException("VERIFICATION_COMMAND_TOO_LARGE",
+                        "Each verification command cannot exceed 1000 characters");
+            }
         }
         if (policy.size() > 20) {
             throw new DomainException("VERIFICATION_POLICY_TOO_LARGE",

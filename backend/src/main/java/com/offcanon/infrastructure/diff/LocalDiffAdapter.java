@@ -32,8 +32,29 @@ import java.nio.charset.StandardCharsets;
 public class LocalDiffAdapter implements DiffPort {
     private static final long MAX_FILE_BYTES = 2_000_000;
     private static final int MAX_ENTRIES = 1_000;
+    /**
+     * Bound the discovery walk independently from the response entry limit.
+     * A repository can contain many unchanged files, so using MAX_ENTRIES as
+     * the walk limit would make ordinary large projects impossible to review;
+     * this higher ceiling still prevents an unbounded tree from exhausting
+     * the diff request.
+     */
+    private static final int MAX_WALK_NODES = 100_000;
     private static final int MAX_PATCH_LINES = 2_000;
+    private static final int MAX_PATCH_BYTES = 256 * 1024;
+    private static final int MAX_TOTAL_PATCH_BYTES = 4 * 1024 * 1024;
     private static final int MAX_LCS_LINES = 1_000;
+    private static final String PATCH_TRUNCATED = "... [diff truncated]\n";
+    private static final String PATCH_OMITTED = "... [diff preview omitted: response limit reached]\n";
+    private final int maxWalkNodes;
+
+    public LocalDiffAdapter() {
+        this(MAX_WALK_NODES);
+    }
+
+    LocalDiffAdapter(int maxWalkNodes) {
+        this.maxWalkNodes = Math.max(1, maxWalkNodes);
+    }
 
     @Override
     public List<DiffEntry> compare(Snapshot base, Path workspace) {
@@ -42,6 +63,7 @@ public class LocalDiffAdapter implements DiffPort {
         Set<String> paths = new HashSet<>(before.keySet());
         paths.addAll(after.keySet());
         List<DiffEntry> result = new ArrayList<>();
+        PatchBudget patchBudget = new PatchBudget();
         for (String path : paths.stream().sorted().toList()) {
             FileEntry oldFile = before.get(path);
             FileEntry newFile = after.get(path);
@@ -54,37 +76,43 @@ public class LocalDiffAdapter implements DiffPort {
             long oldSize = oldRead.size();
             long newSize = newRead.size();
             if (oldRead.exceeded() || newRead.exceeded()) {
-                result.add(new DiffEntry(path, change, oldSize, newSize, true,
-                        0, 0, decoratePatch("File differs but exceeds the 2 MB preview limit", oldFile, newFile)));
-                if (result.size() >= MAX_ENTRIES) break;
+                addEntry(result, new DiffEntry(path, change, oldSize, newSize, true,
+                        0, 0, decoratePatch("File differs but exceeds the 2 MB preview limit", oldFile, newFile)), patchBudget);
                 continue;
             }
             if (oldRead.unstable() || newRead.unstable()) {
-                result.add(new DiffEntry(path, change, oldSize, newSize, true,
-                        0, 0, decoratePatch("File changed while being read; preview is unavailable", oldFile, newFile)));
-                if (result.size() >= MAX_ENTRIES) break;
+                addEntry(result, new DiffEntry(path, change, oldSize, newSize, true,
+                        0, 0, decoratePatch("File changed while being read; preview is unavailable", oldFile, newFile)), patchBudget);
                 continue;
             }
             byte[] oldBytes = oldRead.bytes();
             byte[] newBytes = newRead.bytes();
             if (Arrays.equals(oldBytes, newBytes)) {
                 if (!modeChanged) continue;
-                result.add(new DiffEntry(path, DiffEntry.Change.MODIFIED, oldSize, newSize, false,
-                        0, 0, decoratePatch("", oldFile, newFile)));
-                if (result.size() >= MAX_ENTRIES) break;
+                addEntry(result, new DiffEntry(path, DiffEntry.Change.MODIFIED, oldSize, newSize, false,
+                        0, 0, decoratePatch("", oldFile, newFile)), patchBudget);
                 continue;
             }
             boolean binary = !validText(oldBytes) || !validText(newBytes);
             TextDiff textDiff = binary ? new TextDiff(0, 0, "Binary files differ") : textDiff(oldBytes, newBytes, change);
-            result.add(new DiffEntry(path, change, oldSize, newSize, binary,
-                    textDiff.additions(), textDiff.deletions(), decoratePatch(textDiff.patch(), oldFile, newFile)));
-            if (result.size() >= MAX_ENTRIES) break;
+            addEntry(result, new DiffEntry(path, change, oldSize, newSize, binary,
+                    textDiff.additions(), textDiff.deletions(), decoratePatch(textDiff.patch(), oldFile, newFile)), patchBudget);
         }
         return List.copyOf(result);
     }
 
+    private void addEntry(List<DiffEntry> result, DiffEntry entry, PatchBudget patchBudget) {
+        if (result.size() >= MAX_ENTRIES) {
+            throw new DomainException("DIFF_TOO_LARGE",
+                    "Diff contains more than " + MAX_ENTRIES + " changed files");
+        }
+        result.add(new DiffEntry(entry.path(), entry.change(), entry.beforeBytes(), entry.afterBytes(), entry.binary(),
+                entry.additions(), entry.deletions(), patchBudget.take(entry.patch())));
+    }
+
     private Map<String, FileEntry> files(Path root) {
         Map<String, FileEntry> result = new HashMap<>();
+        int[] visitedNodes = {0};
         try {
             // The root itself is a capability boundary.  Files.isDirectory
             // follows links by default; accepting a swapped root symlink would
@@ -96,6 +124,10 @@ public class LocalDiffAdapter implements DiffPort {
             Files.walkFileTree(root, new SimpleFileVisitor<>() {
                 @Override
                 public FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attrs) {
+                    if (++visitedNodes[0] > maxWalkNodes) {
+                        throw new DomainException("DIFF_TOO_LARGE",
+                                "Diff workspace contains too many filesystem entries");
+                    }
                     if (!directory.equals(root) && isProtected(root.relativize(directory).toString())) {
                         return FileVisitResult.SKIP_SUBTREE;
                     }
@@ -107,8 +139,15 @@ public class LocalDiffAdapter implements DiffPort {
 
                 @Override
                 public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                    if (++visitedNodes[0] > maxWalkNodes) {
+                        throw new DomainException("DIFF_TOO_LARGE",
+                                "Diff workspace contains too many filesystem entries");
+                    }
                     String relative = root.relativize(file).toString().replace('\\', '/');
-                    if (isProtected(relative) || Files.isSymbolicLink(file)) return FileVisitResult.CONTINUE;
+                    if (isProtected(relative)) return FileVisitResult.CONTINUE;
+                    if (Files.isSymbolicLink(file)) {
+                        throw new DomainException("DIFF_SYMLINK_BLOCKED", "Symlink in experiment workspace: " + relative);
+                    }
                     result.put(relative, new FileEntry(file, GitFileMode.read(file)));
                     return FileVisitResult.CONTINUE;
                 }
@@ -131,7 +170,7 @@ public class LocalDiffAdapter implements DiffPort {
 
     private String decoratePatch(String contentPatch, FileEntry before, FileEntry after) {
         if (!modeChanged(before, after)) return contentPatch;
-        StringBuilder patch = new StringBuilder();
+        PatchBuilder patch = new PatchBuilder();
         if (before == null) {
             patch.append("new mode ").append(modeText(after.mode())).append('\n');
         } else if (after == null) {
@@ -141,7 +180,7 @@ public class LocalDiffAdapter implements DiffPort {
                     .append("new mode ").append(modeText(after.mode())).append('\n');
         }
         if (contentPatch != null && !contentPatch.isBlank()) patch.append(contentPatch);
-        return patch.toString();
+        return patch.build();
     }
 
     private String modeText(int mode) {
@@ -181,7 +220,14 @@ public class LocalDiffAdapter implements DiffPort {
     private boolean sameContent(Path oldFile, Path newFile) {
         if (oldFile == null || newFile == null) return false;
         try {
-            return Files.size(oldFile) == Files.size(newFile) && Files.mismatch(oldFile, newFile) == -1;
+            BasicFileAttributes oldAttributes = Files.readAttributes(oldFile, BasicFileAttributes.class,
+                    LinkOption.NOFOLLOW_LINKS);
+            BasicFileAttributes newAttributes = Files.readAttributes(newFile, BasicFileAttributes.class,
+                    LinkOption.NOFOLLOW_LINKS);
+            if (oldAttributes.isSymbolicLink() || newAttributes.isSymbolicLink()) {
+                throw new DomainException("DIFF_SYMLINK_BLOCKED", "Symlink appeared while comparing workspace files");
+            }
+            return oldAttributes.size() == newAttributes.size() && Files.mismatch(oldFile, newFile) == -1;
         } catch (IOException error) {
             throw new DomainException("DIFF_READ_FAILED", "Unable to compare workspace files");
         }
@@ -304,30 +350,53 @@ public class LocalDiffAdapter implements DiffPort {
     }
 
     private String patch(ParsedLines oldLines, ParsedLines newLines) {
-        StringBuilder patch = new StringBuilder("--- base\n+++ result\n@@\n");
+        PatchBuilder patch = new PatchBuilder();
+        patch.append("--- base\n+++ result\n@@\n");
         int emitted = 0;
         for (String line : oldLines.preview()) {
             if (emitted >= MAX_PATCH_LINES) break;
-            patch.append('-').append(line).append('\n');
+            if (!appendPatchLine(patch, '-', line)) break;
             emitted++;
         }
         for (String line : newLines.preview()) {
+            if (patch.truncated()) break;
             if (emitted >= MAX_PATCH_LINES) break;
-            patch.append('+').append(line).append('\n');
+            if (!appendPatchLine(patch, '+', line)) break;
             emitted++;
         }
         if ((long) oldLines.count() + newLines.count() > emitted) {
-            patch.append("... [diff truncated]\n");
+            patch.markTruncated();
         }
-        return patch.toString();
+        return patch.build();
     }
 
     private String formatPatch(List<String> lines) {
-        StringBuilder patch = new StringBuilder("--- base\n+++ result\n@@\n");
+        PatchBuilder patch = new PatchBuilder();
+        patch.append("--- base\n+++ result\n@@\n");
         int limit = Math.min(lines.size(), MAX_PATCH_LINES);
-        for (int index = 0; index < limit; index++) patch.append(lines.get(index)).append('\n');
-        if (limit < lines.size()) patch.append("... [diff truncated]\n");
-        return patch.toString();
+        int emitted = 0;
+        for (int index = 0; index < limit; index++) {
+            if (!appendPatchLine(patch, lines.get(index))) break;
+            emitted++;
+        }
+        if (emitted < lines.size()) patch.markTruncated();
+        return patch.build();
+    }
+
+    private boolean appendPatchLine(PatchBuilder patch, char prefix, String line) {
+        patch.append(prefix).append(line).append('\n');
+        return !patch.truncated();
+    }
+
+    private boolean appendPatchLine(PatchBuilder patch, String line) {
+        patch.append(line).append('\n');
+        return !patch.truncated();
+    }
+
+    private static int utf8Length(int codePoint) {
+        if (codePoint <= 0x7f) return 1;
+        if (codePoint <= 0x7ff) return 2;
+        return codePoint <= 0xffff ? 3 : 4;
     }
 
     private record TextDiff(int additions, int deletions, String patch) {
@@ -340,5 +409,87 @@ public class LocalDiffAdapter implements DiffPort {
     }
 
     private record FileEntry(Path path, int mode) {
+    }
+
+    /** Bounds previews while appending so a single unbroken line cannot create a multi-megabyte patch. */
+    private static final class PatchBuilder {
+        private final int maxBytes;
+        private final int contentByteLimit;
+
+        private final StringBuilder value;
+        private int byteCount;
+        private boolean truncated;
+
+        private PatchBuilder() {
+            this(MAX_PATCH_BYTES);
+        }
+
+        private PatchBuilder(int maxBytes) {
+            this.maxBytes = Math.max(0, maxBytes);
+            int markerBytes = PATCH_TRUNCATED.getBytes(StandardCharsets.UTF_8).length;
+            this.contentByteLimit = Math.max(0, this.maxBytes - markerBytes - 1);
+            this.value = new StringBuilder(Math.min(contentByteLimit, 16_384));
+        }
+
+        private PatchBuilder append(char character) {
+            return append(String.valueOf(character));
+        }
+
+        private PatchBuilder append(String text) {
+            if (truncated || text == null || text.isEmpty()) return this;
+            int index = 0;
+            while (index < text.length()) {
+                int codePoint = text.codePointAt(index);
+                int encodedLength = utf8Length(codePoint);
+                if (byteCount + encodedLength > contentByteLimit) {
+                    truncated = true;
+                    break;
+                }
+                value.appendCodePoint(codePoint);
+                byteCount += encodedLength;
+                index += Character.charCount(codePoint);
+            }
+            return this;
+        }
+
+        private boolean truncated() {
+            return truncated;
+        }
+
+        private void markTruncated() {
+            truncated = true;
+        }
+
+        private String build() {
+            if (truncated) {
+                if (maxBytes < PATCH_TRUNCATED.getBytes(StandardCharsets.UTF_8).length + 1) return "";
+                if (!value.isEmpty() && value.charAt(value.length() - 1) != '\n') value.append('\n');
+                value.append(PATCH_TRUNCATED);
+            }
+            return value.toString();
+        }
+    }
+
+    private static final class PatchBudget {
+        private int remainingBytes = MAX_TOTAL_PATCH_BYTES;
+
+        private String take(String patch) {
+            if (patch == null || patch.isEmpty()) return patch;
+            int patchBytes = patch.getBytes(StandardCharsets.UTF_8).length;
+            if (patchBytes <= remainingBytes) {
+                remainingBytes -= patchBytes;
+                return patch;
+            }
+            int markerBytes = PATCH_TRUNCATED.getBytes(StandardCharsets.UTF_8).length;
+            if (remainingBytes < markerBytes + 1) {
+                remainingBytes = 0;
+                return PATCH_OMITTED;
+            }
+            PatchBuilder bounded = new PatchBuilder(Math.min(MAX_PATCH_BYTES, remainingBytes));
+            bounded.append(patch);
+            String result = bounded.build();
+            remainingBytes = Math.max(0, remainingBytes - result.getBytes(StandardCharsets.UTF_8).length);
+            return result;
+        }
     }
 }

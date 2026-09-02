@@ -105,8 +105,17 @@ public class TaskMemoryApplicationService {
             throw new DomainException("TASK_MEMORY_SCOPE_MISMATCH",
                     "Task memory projection Snapshot does not belong to the Session project");
         }
-        return projector.project(session.projectId(), session.id(), snapshot.fingerprint(),
-                memories.findBySessionId(session.id()));
+        List<TaskMemoryRevision> ledger = memories.findBySessionId(session.id());
+        Set<UUID> invalidatedVerifiedExperiments = ledger.stream()
+                .filter(revision -> revision.kind() == TaskMemoryKind.VERIFIED_FACT)
+                .filter(revision -> experiments.findById(revision.sourceExperimentId())
+                        .map(source -> source.status() != ExperimentStatus.VERIFIED
+                                && source.status() != ExperimentStatus.PROMOTED)
+                        .orElse(true))
+                .map(TaskMemoryRevision::sourceExperimentId)
+                .collect(java.util.stream.Collectors.toSet());
+        return projector.project(session.projectId(), session.id(), snapshot.fingerprint(), ledger,
+                invalidatedVerifiedExperiments);
     }
 
     private TaskMemoryRevision append(UUID sessionId,

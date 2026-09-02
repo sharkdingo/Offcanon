@@ -39,6 +39,8 @@ public class AgentRecoveryService {
             ExperimentStatus.SNAPSHOTTING);
     private static final String RESTART_REASON =
             "Agent worker was interrupted by an application restart; continue the experiment to resume from its durable result or draft";
+    private static final String VERIFICATION_RESTART_REASON =
+            "Verification was interrupted by an application restart; run verification again against the sealed result";
 
     private final ProjectRepository projects;
     private final ExperimentRepository experiments;
@@ -112,6 +114,14 @@ public class AgentRecoveryService {
             }
             for (Experiment candidate : knownExperiments) {
                 if (!recoverable.contains(candidate.status())) continue;
+                // AGENT_COMPLETED with a sealed result is an intentional
+                // durable waiting state. There is no lost worker to recover;
+                // verification can be requested explicitly, including after
+                // the project policy is configured.
+                if (candidate.status() == ExperimentStatus.AGENT_COMPLETED
+                        && candidate.resultSnapshotId() != null) {
+                    continue;
+                }
                 SessionRunLeasePort.Lease lease;
                 try {
                     lease = leases.tryAcquire(candidate.sessionId(), candidate.id()).orElse(null);
@@ -130,15 +140,32 @@ public class AgentRecoveryService {
                         continue;
                     }
                     if (current == null || !recoverable.contains(current.status())) continue;
+                    // The candidate snapshot can race with the worker's final
+                    // result sealing. Re-check the durable waiting boundary
+                    // after acquiring the lease as well; a sealed result has
+                    // no lost worker left to recover and must never be turned
+                    // into FAILED by this pass.
+                    if (current.status() == ExperimentStatus.AGENT_COMPLETED
+                            && current.resultSnapshotId() != null) {
+                        continue;
+                    }
                     try {
                         lease.assertHeld();
-                        current.fail(reason);
+                        if (current.status() == ExperimentStatus.VERIFYING
+                                && current.resultSnapshotId() != null) {
+                            // The sealed result survives a verifier process.
+                            // Return it to the explicit waiting state so the
+                            // same immutable snapshot can be checked again.
+                            current.recoverInterruptedVerification(VERIFICATION_RESTART_REASON);
+                        } else {
+                            current.fail(reason);
+                        }
                         lease.assertHeld();
                         experiments.save(current);
                         recovered++;
                         publish(current.id(), "EXPERIMENT_RECOVERED", java.util.Map.of(
                                 "status", current.status().name(),
-                                "reason", reason));
+                                "reason", current.failureReason()));
                     } catch (RuntimeException error) {
                         // A concurrent worker/state transition is authoritative,
                         // but persistence or invariant failures must remain

@@ -102,6 +102,20 @@ class PromotionPreviewApplicationServiceTest {
         assertEquals("Candidate is already canonical", preview.blockingReason());
     }
 
+    @Test
+    void marksAnOlderResultNotPromotableWhileItsSessionHasAQueuedSuccessor() {
+        Fixture fixture = fixture("base", "base", "candidate", ExperimentStatus.VERIFIED,
+                VerificationResult.passed(List.of()), null);
+        Experiment successor = Experiment.continueFrom(fixture.experiment.projectId(),
+                fixture.experiment.sessionId(), fixture.experiment.id(), "continue the task", Instant.now());
+        fixture.experiments.save(successor);
+
+        var preview = fixture.service.preview(fixture.experiment.id());
+
+        assertFalse(preview.promotable());
+        assertEquals("A later experiment in this session is still active", preview.blockingReason());
+    }
+
     private Fixture fixture(String baseFingerprint,
                             String currentFingerprint,
                             String candidateFingerprint,

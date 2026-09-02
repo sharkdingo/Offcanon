@@ -35,7 +35,7 @@ async function enterWorkspace() {
         </li>
         <li>
           <span class="onboarding-icon canonical"><FolderGit2 :size="18" /></span>
-          <div><strong>{{ isZh ? '打开本机项目' : 'Open a local project' }}</strong><span>{{ isZh ? '选择这台机器上的 Git 仓库，并设置项目验收命令。' : 'Choose a Git repository on this machine and set its acceptance commands.' }}</span></div>
+          <div><strong>{{ isZh ? '打开或新建本机项目' : 'Open or create a local project' }}</strong><span>{{ isZh ? '选择已有 Git 仓库，或创建一个空目录；验收命令可以稍后设置。' : 'Choose an existing Git repository or create an empty directory; acceptance commands can be set later.' }}</span></div>
           <small>02</small>
         </li>
         <li>

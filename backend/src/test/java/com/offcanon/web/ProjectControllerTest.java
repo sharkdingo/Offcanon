@@ -5,6 +5,7 @@ import com.offcanon.application.ProjectApplicationService;
 import com.offcanon.identity.web.IdentityContext;
 import com.offcanon.project.domain.Project;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.validation.Validation;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpStatus;
 
@@ -21,6 +22,19 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 class ProjectControllerTest {
+    @Test
+    void updateRequiresAnExplicitAcceptancePolicyEvenWhenItIsEmpty() {
+        try (var factory = Validation.buildDefaultValidatorFactory()) {
+            var request = new ApiDtos.UpdateProjectRequest("demo", "C:\\code\\demo", null);
+
+            var violations = factory.getValidator().validate(request);
+
+            assertEquals(1, violations.size());
+            assertEquals("verificationCommands",
+                    violations.iterator().next().getPropertyPath().toString());
+        }
+    }
+
     @Test
     void distinguishesNewRegistrationFromReopeningInTheHttpContract() {
         ProjectApplicationService projects = mock(ProjectApplicationService.class);

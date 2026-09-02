@@ -16,8 +16,10 @@ import com.offcanon.port.SessionRunLeasePort;
 import com.offcanon.port.VerificationPort;
 import com.offcanon.port.WorkspacePort;
 import com.offcanon.port.UserSettingsRepository;
+import com.offcanon.port.PromotionLockPort;
 import com.offcanon.project.domain.Project;
 import com.offcanon.shared.domain.DomainException;
+import com.offcanon.shared.domain.ModelEndpointPolicy;
 import com.offcanon.shared.web.NotFoundException;
 import com.offcanon.workspace.domain.Snapshot;
 import com.offcanon.verification.domain.VerificationPurpose;
@@ -60,6 +62,7 @@ public class AgentApplicationService {
     private final UserSettingsRepository userSettings;
     private final EvidenceRepository evidenceRepository;
     private final TaskMemoryApplicationService taskMemory;
+    private final PromotionLockPort promotionLock;
     private final int applicationDefaultMaxSteps;
     private final long applicationDefaultRunTimeoutSeconds;
     private final int applicationDefaultContextLimitChars;
@@ -80,6 +83,7 @@ public class AgentApplicationService {
                                    UserSettingsRepository userSettings,
                                    EvidenceRepository evidenceRepository,
                                    TaskMemoryApplicationService taskMemory,
+                                   PromotionLockPort promotionLock,
                                    @Value("${offcanon.agent.max-steps:20}") int applicationDefaultMaxSteps,
                                    @Value("${offcanon.agent.run-timeout-seconds:600}") long applicationDefaultRunTimeoutSeconds,
                                    @Value("${offcanon.agent.context-limit-chars:80000}") int applicationDefaultContextLimitChars) {
@@ -96,14 +100,56 @@ public class AgentApplicationService {
         this.userSettings = userSettings;
         this.evidenceRepository = evidenceRepository;
         this.taskMemory = taskMemory;
+        this.promotionLock = Objects.requireNonNull(promotionLock, "promotionLock");
         this.applicationDefaultMaxSteps = applicationDefaultMaxSteps;
         this.applicationDefaultRunTimeoutSeconds = applicationDefaultRunTimeoutSeconds;
         this.applicationDefaultContextLimitChars = applicationDefaultContextLimitChars;
     }
 
+    /**
+     * Compatibility constructor for focused unit tests that do not model the
+     * promotion lock. Production wiring uses the constructor above.
+     */
+    public AgentApplicationService(ExperimentRepository experimentRepository,
+                                   ProjectRepository projectRepository,
+                                   SnapshotRepository snapshotRepository,
+                                   SnapshotPort snapshotPort,
+                                   AgentLoopPort agentLoop,
+                                   VerificationPort verification,
+                                   ExecutorService agentExecutor,
+                                   EventSink events,
+                                   SessionRunLeasePort sessionRunLease,
+                                   WorkspacePort workspaces,
+                                   UserSettingsRepository userSettings,
+                                   EvidenceRepository evidenceRepository,
+                                   TaskMemoryApplicationService taskMemory,
+                                   int applicationDefaultMaxSteps,
+                                   long applicationDefaultRunTimeoutSeconds,
+                                   int applicationDefaultContextLimitChars) {
+        this(experimentRepository, projectRepository, snapshotRepository, snapshotPort,
+                agentLoop, verification, agentExecutor, events, sessionRunLease, workspaces,
+                userSettings, evidenceRepository, taskMemory, NOOP_PROMOTION_LOCK,
+                applicationDefaultMaxSteps, applicationDefaultRunTimeoutSeconds,
+                applicationDefaultContextLimitChars);
+    }
+
+    private static final PromotionLockPort NOOP_PROMOTION_LOCK = new PromotionLockPort() {
+        @Override
+        public <T> T withProjectLock(UUID projectId, java.util.function.Supplier<T> action) {
+            return action.get();
+        }
+
+        @Override
+        public void assertHeld(UUID projectId) {
+            // Focused tests using the compatibility constructor do not model
+            // project-level promotion locking.
+        }
+    };
+
     public Experiment start(UUID experimentId) {
         Experiment experiment = get(experimentId);
         if (experiment.status() != ExperimentStatus.READY_TO_RUN) return experiment;
+        requireModelConfiguration(experiment);
         SessionRunLeasePort.Lease lease = sessionRunLease.tryAcquire(experiment.sessionId(), experiment.id())
                 .orElseThrow(() -> new DomainException("SESSION_ALREADY_RUNNING",
                         "A session can run only one experiment at a time"));
@@ -159,8 +205,9 @@ public class AgentApplicationService {
             runs.remove(experimentId, run);
             cancellations.remove(experimentId, cancellation);
             try {
-                settleFailure(experimentId, "AGENT_EXECUTOR_REJECTED: "
+                StateSettlement settlement = settleFailure(experimentId, "AGENT_EXECUTOR_REJECTED: "
                         + (error.getMessage() == null ? "executor unavailable" : error.getMessage()));
+                publishFailureIfChanged(experimentId, settlement, error);
             } catch (RuntimeException settlementFailure) {
                 error.addSuppressed(settlementFailure);
             }
@@ -172,10 +219,7 @@ public class AgentApplicationService {
 
     public Experiment cancel(UUID experimentId) {
         Experiment experiment = get(experimentId);
-        if (experiment.status() != ExperimentStatus.READY_TO_RUN
-                && experiment.status() != ExperimentStatus.RUNNING
-                && experiment.status() != ExperimentStatus.AGENT_COMPLETED
-                && experiment.status() != ExperimentStatus.VERIFYING) {
+        if (!isCancellable(experiment)) {
             return experiment;
         }
         if (experiment.status() == ExperimentStatus.READY_TO_RUN) {
@@ -196,6 +240,140 @@ public class AgentApplicationService {
         revokeCancelledLeaseBestEffort(settlement.experiment());
         publishCancellationIfChanged(experimentId, settlement);
         return settlement.experiment();
+    }
+
+    /**
+     * Re-runs trusted verification for an already sealed result. This is used
+     * when a project was created without an acceptance policy, and also lets a
+     * rejected result be checked again after its commands are corrected.
+     *
+     * The call is deliberately serialized through the session lease. A worker
+     * that is still finishing the original run therefore keeps ownership, and
+     * two concurrent re-verification requests cannot both transition the same
+     * experiment into VERIFYING.
+     */
+    public Experiment reverify(UUID experimentId) {
+        Experiment initial = get(experimentId);
+        if (!canReverify(initial)) {
+            throw new DomainException("EXPERIMENT_NOT_REVERIFIABLE",
+                    "Only an agent-completed or rejected experiment can be verified again");
+        }
+        if (initial.resultSnapshotId() == null || initial.baseSnapshotId() == null) {
+            throw new DomainException("RESULT_SNAPSHOT_MISSING",
+                    "A sealed result is required before verification");
+        }
+        SessionRunLeasePort.Lease lease = sessionRunLease.tryAcquire(initial.sessionId(), initial.id())
+                .orElseThrow(() -> new DomainException("SESSION_ALREADY_RUNNING",
+                        "This session already has an active run"));
+        AtomicBoolean cancellation = new AtomicBoolean(false);
+        if (cancellations.putIfAbsent(initial.id(), cancellation) != null) {
+            releaseLeaseBestEffort(lease);
+            throw new DomainException("EXPERIMENT_ALREADY_RUNNING",
+                    "An experiment verification is already in progress");
+        }
+        try {
+            /*
+             * Project settings are blocked once an experiment is VERIFYING.
+             * Use the same project lock as ProjectApplicationService while
+             * resolving the current policy and persisting that transition so a
+             * settings update cannot slip between the read and VERIFYING save.
+             * The lock is released before running user commands.
+             */
+            ReverificationStart started = promotionLock.withProjectLock(initial.projectId(), () -> {
+                lease.assertHeld();
+                Experiment experiment = get(experimentId);
+                if (!canReverify(experiment)) {
+                    throw new DomainException("EXPERIMENT_NOT_REVERIFIABLE",
+                            "Only an agent-completed or rejected experiment can be verified again");
+                }
+                if (experiment.resultSnapshotId() == null || experiment.baseSnapshotId() == null) {
+                    throw new DomainException("RESULT_SNAPSHOT_MISSING",
+                            "A sealed result is required before verification");
+                }
+                if (experimentRepository.hasRunningExperiment(experiment.sessionId(), experiment.id())) {
+                    throw new DomainException("SESSION_ALREADY_RUNNING",
+                            "A later experiment in this session is still active");
+                }
+                Project currentProject = projectRepository.findById(experiment.projectId())
+                        .orElseThrow(() -> new NotFoundException("Project not found: " + experiment.projectId()));
+                if (currentProject.verificationCommands().isEmpty()) {
+                    throw new DomainException("VERIFICATION_POLICY_MISSING",
+                            "Configure at least one verification command before verifying this result");
+                }
+                publishBestEffort(experiment.id(), "VERIFICATION_CONFIGURATION_RESOLVED", java.util.Map.of(
+                        "verificationCommands", currentProject.verificationCommands(),
+                        "reverification", true));
+                experiment.beginVerification();
+                lease.assertHeld();
+                experimentRepository.save(experiment);
+                publishBestEffort(experiment.id(), "VERIFICATION_STARTED", java.util.Map.of(
+                        "status", experiment.status().name(), "reverification", true));
+                return new ReverificationStart(experiment, currentProject);
+            });
+            Experiment experiment = started.experiment();
+            Project currentProject = started.project();
+
+            Snapshot base = snapshotRepository.findById(experiment.baseSnapshotId())
+                    .orElseThrow(() -> new NotFoundException("Snapshot not found: " + experiment.baseSnapshotId()));
+            Snapshot resultSnapshot = snapshotRepository.findById(experiment.resultSnapshotId())
+                    .orElseThrow(() -> new NotFoundException("Snapshot not found: " + experiment.resultSnapshotId()));
+            lease.assertHeld();
+            var verificationResult = verifySealedResult(currentProject, experiment, base, resultSnapshot);
+            lease.assertHeld();
+            if (cancellation.get()) {
+                StateSettlement settlement = settleCancellation(experimentId);
+                publishCancellationIfChanged(experimentId, settlement);
+                return settlement.experiment();
+            }
+            experiment.markVerified(verificationResult);
+            lease.assertHeld();
+            experimentRepository.save(experiment);
+            recordVerifiedMemory(experiment, resultSnapshot, verificationResult);
+            publishBestEffort(experiment.id(), "VERIFICATION_FINISHED", java.util.Map.of(
+                    "status", experiment.status().name(),
+                    "passed", experiment.status() == ExperimentStatus.VERIFIED,
+                    "reverification", true));
+            return experiment;
+        } catch (DomainException error) {
+            if (cancellation.get() || "AGENT_CANCELLED".equals(error.code())) {
+                StateSettlement settlement = settleCancellation(experimentId);
+                publishCancellationIfChanged(experimentId, settlement);
+                return settlement.experiment();
+            }
+            if ("VERIFICATION_POLICY_MISSING".equals(error.code())
+                    || "EXPERIMENT_NOT_REVERIFIABLE".equals(error.code())
+                    || "RESULT_SNAPSHOT_MISSING".equals(error.code())
+                    || "SESSION_ALREADY_RUNNING".equals(error.code())) {
+                throw error;
+            }
+            StateSettlement settlement = settleFailure(experimentId,
+                    error.code() + ": " + error.getMessage());
+            publishFailureIfChanged(experimentId, settlement, error);
+            return settlement.experiment();
+        } catch (RuntimeException error) {
+            if (cancellation.get()) {
+                StateSettlement settlement = settleCancellation(experimentId);
+                publishCancellationIfChanged(experimentId, settlement);
+                return settlement.experiment();
+            }
+            StateSettlement settlement = settleFailure(experimentId,
+                    error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage());
+            publishFailureIfChanged(experimentId, settlement, error);
+            return settlement.experiment();
+        } finally {
+            cancellations.remove(initial.id(), cancellation);
+            releaseLeaseBestEffort(lease);
+        }
+    }
+
+    private boolean canReverify(Experiment experiment) {
+        if (experiment == null) return false;
+        return experiment.status() == ExperimentStatus.AGENT_COMPLETED
+                || experiment.status() == ExperimentStatus.REJECTED
+                || (experiment.status() == ExperimentStatus.STALE && experiment.verificationPolicyChanged());
+    }
+
+    private record ReverificationStart(Experiment experiment, Project project) {
     }
 
     private void run(UUID experimentId,
@@ -260,34 +438,39 @@ public class AgentApplicationService {
                 publishCancellationIfChanged(experimentId, settleCancellation(experimentId));
                 return;
             }
-            lease.assertHeld();
-            experiment.beginVerification();
-            lease.assertHeld();
-            experimentRepository.save(experiment);
-            lease.assertHeld();
-            publishBestEffort(experimentId, "VERIFICATION_STARTED", java.util.Map.of("status", experiment.status().name()));
-            java.nio.file.Path verificationWorkspace = null;
-            var verificationResult = (com.offcanon.verification.domain.VerificationResult) null;
-            try {
-                verificationWorkspace = workspaces.createVerificationWorkspace(resultSnapshot, experiment);
+            /*
+             * Resolve the policy and enter VERIFYING under the same project
+             * lock used by project settings. A policy update can therefore
+             * either happen before this boundary (and be used below), or see
+             * VERIFYING and be rejected. The lock is released before commands
+             * execute, so changing settings is never held up by a long check.
+             */
+            Project verificationProject = promotionLock.withProjectLock(experiment.projectId(), () -> {
                 lease.assertHeld();
-                verificationResult = verification.verify(project, experiment, resultSnapshot,
-                        verificationWorkspace, VerificationPurpose.EXPERIMENT_RESULT);
-                lease.assertHeld();
-                String verifiedFingerprint = snapshotPort.fingerprintWorkspace(project, verificationWorkspace, snapshot.fingerprint());
-                if (!resultSnapshot.fingerprint().equals(verifiedFingerprint)) {
-                    throw new DomainException("VERIFICATION_MUTATED_SOURCE",
-                            "Trusted verification changed promotion-relevant files");
+                Project currentProject = projectRepository.findById(experiment.projectId())
+                        .orElseThrow(() -> new NotFoundException("Project not found: " + experiment.projectId()));
+                if (currentProject.verificationCommands().isEmpty()) {
+                    // A project may be opened before its acceptance policy is
+                    // known. Keep the sealed result at AGENT_COMPLETED so it
+                    // can be verified later without discarding the snapshot.
+                    publishBestEffort(experimentId, "VERIFICATION_WAITING", java.util.Map.of(
+                            "status", experiment.status().name(),
+                            "reason", "VERIFICATION_POLICY_MISSING"));
+                    return null;
                 }
-            } finally {
-                discardWorkspaceBestEffort(verificationWorkspace);
-            }
-            String sealedFingerprint = snapshotPort.fingerprintWorkspace(project,
-                    resultSnapshot.materializedPath(), snapshot.fingerprint());
+                experiment.beginVerification();
+                lease.assertHeld();
+                experimentRepository.save(experiment);
+                lease.assertHeld();
+                publishBestEffort(experimentId, "VERIFICATION_STARTED", java.util.Map.of(
+                        "status", experiment.status().name()));
+                return currentProject;
+            });
+            if (verificationProject == null) return;
+            project = verificationProject;
             lease.assertHeld();
-            if (!resultSnapshot.fingerprint().equals(sealedFingerprint)) {
-                throw new DomainException("RESULT_SNAPSHOT_MUTATED", "Sealed result snapshot changed after capture");
-            }
+            var verificationResult = verifySealedResult(project, experiment, snapshot, resultSnapshot);
+            lease.assertHeld();
             if (cancellation.get()) {
                 publishCancellationIfChanged(experimentId, settleCancellation(experimentId));
                 return;
@@ -305,10 +488,7 @@ public class AgentApplicationService {
                 return;
             }
             StateSettlement settlement = settleFailure(experimentId, error.code() + ": " + error.getMessage());
-            if (settlement.changed()) {
-                publishBestEffort(experimentId, "EXPERIMENT_FAILED", java.util.Map.of(
-                        "code", error.code(), "message", error.getMessage() == null ? "" : error.getMessage()));
-            }
+            publishFailureIfChanged(experimentId, settlement, error);
         } catch (RuntimeException error) {
             if (cancellation.get()) {
                 publishCancellationIfChanged(experimentId, settleCancellation(experimentId));
@@ -316,9 +496,7 @@ public class AgentApplicationService {
             }
             StateSettlement settlement = settleFailure(experimentId,
                     error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage());
-            if (settlement.changed()) {
-                publishBestEffort(experimentId, "EXPERIMENT_FAILED", java.util.Map.of("message", error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage()));
-            }
+            publishFailureIfChanged(experimentId, settlement, error);
         } catch (Error error) {
             // Keep the lifecycle closed for application-level assertion or
             // linkage failures raised by a worker. JVM-fatal errors must not
@@ -332,17 +510,47 @@ public class AgentApplicationService {
             }
             StateSettlement settlement = settleFailure(experimentId,
                     error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage());
-            if (settlement.changed()) {
-                publishBestEffort(experimentId, "EXPERIMENT_FAILED", java.util.Map.of("message", error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage()));
+            publishFailureIfChanged(experimentId, settlement, error);
+        }
+    }
+
+    /** Runs verification against an immutable result and checks both workspaces remain unchanged. */
+    private com.offcanon.verification.domain.VerificationResult verifySealedResult(Project project,
+                                                                                    Experiment experiment,
+                                                                                    Snapshot baseSnapshot,
+                                                                                    Snapshot resultSnapshot) {
+        java.nio.file.Path verificationWorkspace = null;
+        try {
+            verificationWorkspace = workspaces.createVerificationWorkspace(resultSnapshot, experiment);
+            com.offcanon.verification.domain.VerificationResult result = verification.verify(project, experiment,
+                    resultSnapshot, verificationWorkspace, VerificationPurpose.EXPERIMENT_RESULT);
+            String verifiedFingerprint = snapshotPort.fingerprintWorkspace(project, verificationWorkspace,
+                    baseSnapshot.fingerprint());
+            if (!resultSnapshot.fingerprint().equals(verifiedFingerprint)) {
+                throw new DomainException("VERIFICATION_MUTATED_SOURCE",
+                        "Trusted verification changed promotion-relevant files");
             }
+            String sealedFingerprint = snapshotPort.fingerprintWorkspace(project,
+                    resultSnapshot.materializedPath(), baseSnapshot.fingerprint());
+            if (!resultSnapshot.fingerprint().equals(sealedFingerprint)) {
+                throw new DomainException("RESULT_SNAPSHOT_MUTATED",
+                        "Sealed result snapshot changed after capture");
+            }
+            return result;
+        } finally {
+            discardWorkspaceBestEffort(verificationWorkspace);
         }
     }
 
     private StateSettlement settleCancellation(UUID experimentId) {
         for (int attempt = 1; attempt <= STATE_SETTLEMENT_ATTEMPTS; attempt++) {
             Experiment current = get(experimentId);
-            if (!isCancellable(current.status())) return new StateSettlement(current, false);
-            current.cancel();
+            if (!isCancellable(current)) return new StateSettlement(current, false);
+            if (current.status() == ExperimentStatus.VERIFYING && current.resultSnapshotId() != null) {
+                current.recoverInterruptedVerification("Verification was cancelled; the sealed result can be checked again");
+            } else {
+                current.cancel();
+            }
             try {
                 return new StateSettlement(experimentRepository.save(current), true);
             } catch (DomainException error) {
@@ -355,8 +563,15 @@ public class AgentApplicationService {
     private StateSettlement settleFailure(UUID experimentId, String reason) {
         for (int attempt = 1; attempt <= STATE_SETTLEMENT_ATTEMPTS; attempt++) {
             Experiment current = get(experimentId);
-            if (!canFail(current.status())) return new StateSettlement(current, false);
-            current.fail(reason);
+            if (!canFail(current)) return new StateSettlement(current, false);
+            if (current.status() == ExperimentStatus.VERIFYING && current.resultSnapshotId() != null) {
+                current.recoverInterruptedVerification(reason);
+            } else if (current.status() == ExperimentStatus.AGENT_COMPLETED
+                    && current.resultSnapshotId() != null) {
+                current.retainVerificationWaiting(reason);
+            } else {
+                current.fail(reason);
+            }
             try {
                 return new StateSettlement(experimentRepository.save(current), true);
             } catch (DomainException error) {
@@ -366,17 +581,20 @@ public class AgentApplicationService {
         throw stateContention(experimentId, "fail");
     }
 
-    private boolean isCancellable(ExperimentStatus status) {
-        return status == ExperimentStatus.READY_TO_RUN
-                || status == ExperimentStatus.RUNNING
-                || status == ExperimentStatus.AGENT_COMPLETED
-                || status == ExperimentStatus.VERIFYING;
+    private boolean isCancellable(Experiment experiment) {
+        if (experiment == null) return false;
+        return experiment.status() == ExperimentStatus.READY_TO_RUN
+                || experiment.status() == ExperimentStatus.RUNNING
+                || (experiment.status() == ExperimentStatus.AGENT_COMPLETED
+                    && experiment.resultSnapshotId() == null)
+                || experiment.status() == ExperimentStatus.VERIFYING;
     }
 
-    private boolean canFail(ExperimentStatus status) {
-        return status == ExperimentStatus.RUNNING
-                || status == ExperimentStatus.AGENT_COMPLETED
-                || status == ExperimentStatus.VERIFYING;
+    private boolean canFail(Experiment experiment) {
+        if (experiment == null) return false;
+        return experiment.status() == ExperimentStatus.RUNNING
+                || experiment.status() == ExperimentStatus.VERIFYING
+                || experiment.status() == ExperimentStatus.AGENT_COMPLETED;
     }
 
     private boolean isVersionConflict(DomainException error) {
@@ -392,7 +610,33 @@ public class AgentApplicationService {
         if (settlement.changed() && settlement.experiment().status() == ExperimentStatus.CANCELLED) {
             publishBestEffort(experimentId, "EXPERIMENT_CANCELLED",
                     java.util.Map.of("status", settlement.experiment().status().name()));
+        } else if (settlement.changed() && isSealedVerificationWaiting(settlement.experiment())) {
+            publishBestEffort(experimentId, "VERIFICATION_INTERRUPTED", java.util.Map.of(
+                    "status", settlement.experiment().status().name(),
+                    "reason", "CANCELLED",
+                    "message", settlement.experiment().failureReason()));
         }
+    }
+
+    private void publishFailureIfChanged(UUID experimentId,
+                                         StateSettlement settlement,
+                                         Throwable error) {
+        if (settlement.changed() && settlement.experiment().status() == ExperimentStatus.FAILED) {
+            publishBestEffort(experimentId, "EXPERIMENT_FAILED", java.util.Map.of(
+                    "code", error instanceof DomainException domain ? domain.code() : "INTERNAL_ERROR",
+                    "message", error.getMessage() == null ? "" : error.getMessage()));
+        } else if (settlement.changed() && isSealedVerificationWaiting(settlement.experiment())) {
+            publishBestEffort(experimentId, "VERIFICATION_INTERRUPTED", java.util.Map.of(
+                    "status", settlement.experiment().status().name(),
+                    "reason", "FAILED",
+                    "code", error instanceof DomainException domain ? domain.code() : "INTERNAL_ERROR",
+                    "message", error.getMessage() == null ? "" : error.getMessage()));
+        }
+    }
+
+    private boolean isSealedVerificationWaiting(Experiment experiment) {
+        return experiment.status() == ExperimentStatus.AGENT_COMPLETED
+                && experiment.resultSnapshotId() != null;
     }
 
     private record StateSettlement(Experiment experiment, boolean changed) {}
@@ -582,6 +826,36 @@ public class AgentApplicationService {
         return new AgentRunSettings(requested.maxSteps(), requested.runTimeoutSeconds(),
                 requested.contextLimitChars(), endpoint == null ? "" : endpoint,
                 model == null ? "" : model, requested.modelApiKey());
+    }
+
+    /**
+     * Reject an unusable run before READY_TO_RUN becomes RUNNING. The worker
+     * still resolves the settings again for its immutable audit event, but a
+     * missing model configuration must not consume the prepared experiment.
+     */
+    private void requireModelConfiguration(Experiment experiment) {
+        if (userSettings == null) return;
+        Project project = projectRepository.findById(experiment.projectId())
+                .orElseThrow(() -> new NotFoundException("Project not found: " + experiment.projectId()));
+        Optional<AgentRunSettings> configured = userSettings.findByUserId(project.ownerId())
+                .map(AgentRunSettings::from);
+        AgentRunSettings effective = effectiveRunSettings(configured);
+        if (effective.modelApiKey().isBlank()) {
+            throw new DomainException("MODEL_NOT_CONFIGURED",
+                    "Set a model API key in Settings before starting an agent run");
+        }
+        if (effective.modelEndpoint().isBlank()) {
+            throw new DomainException("MODEL_NOT_CONFIGURED",
+                    "Set a model endpoint in Settings before starting an agent run");
+        }
+        if (!ModelEndpointPolicy.isValid(effective.modelEndpoint())) {
+            throw new DomainException("MODEL_ENDPOINT_INVALID",
+                    "The selected model endpoint is not a valid HTTP(S) base URL");
+        }
+        if (effective.modelName().isBlank()) {
+            throw new DomainException("MODEL_NOT_CONFIGURED",
+                    "Set a model name in Settings before starting an agent run");
+        }
     }
 
     private boolean hasText(Optional<AgentRunSettings> settings, boolean endpoint) {

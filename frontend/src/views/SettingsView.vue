@@ -535,7 +535,7 @@ onBeforeUnmount(() => {
         <span class="settings-avatar" aria-hidden="true">{{ initials }}</span>
       </header>
 
-      <p v-if="error" class="global-alert" role="alert">{{ error }}</p>
+      <p v-if="error" class="global-alert" role="alert"><span>{{ error }}</span></p>
       <p v-if="saved" class="settings-saved" role="status"><Check :size="15" />{{ isZh ? '已保存' : 'Saved' }}</p>
       <p v-else-if="settingsDirty" class="settings-draft-notice" role="status">{{ isZh ? '有未保存的设置草稿' : 'You have unsaved settings' }}</p>
 

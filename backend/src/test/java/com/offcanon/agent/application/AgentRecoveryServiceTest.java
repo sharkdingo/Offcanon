@@ -66,6 +66,56 @@ class AgentRecoveryServiceTest {
     }
 
     @Test
+    void preservesASealedAgentCompletedResultForExplicitVerification() {
+        InMemoryProjectRepository projects = new InMemoryProjectRepository();
+        InMemoryExperimentRepository experiments = new InMemoryExperimentRepository();
+        Project project = projects.save(Project.create(UUID.randomUUID(), "demo", Path.of("/tmp/offcanon-demo"),
+                List.of("test"), Instant.now()));
+        Experiment sealed = ready(experiments, project.id());
+        sealed.start();
+        experiments.save(sealed);
+        sealed.markAgentCompleted("draft");
+        experiments.save(sealed);
+        sealed.sealResult(UUID.randomUUID());
+        experiments.save(sealed);
+
+        AgentRecoveryService recovery = new AgentRecoveryService(projects, experiments,
+                new InMemorySessionRunLease(), new InMemoryEventSink());
+
+        assertEquals(0, recovery.recoverInterruptedRuns());
+        assertEquals(ExperimentStatus.AGENT_COMPLETED,
+                experiments.findById(sealed.id()).orElseThrow().status());
+    }
+
+    @Test
+    void returnsInterruptedVerificationToTheDurableWaitingState() {
+        InMemoryProjectRepository projects = new InMemoryProjectRepository();
+        InMemoryExperimentRepository experiments = new InMemoryExperimentRepository();
+        Project project = projects.save(Project.create(UUID.randomUUID(), "demo", Path.of("/tmp/offcanon-demo"),
+                List.of("test"), Instant.now()));
+        Experiment verifying = ready(experiments, project.id());
+        verifying.start();
+        experiments.save(verifying);
+        verifying.markAgentCompleted("sealed draft");
+        experiments.save(verifying);
+        UUID resultSnapshotId = UUID.randomUUID();
+        verifying.sealResult(resultSnapshotId);
+        experiments.save(verifying);
+        verifying.beginVerification();
+        experiments.save(verifying);
+
+        AgentRecoveryService recovery = new AgentRecoveryService(projects, experiments,
+                new InMemorySessionRunLease(), new InMemoryEventSink());
+
+        assertEquals(1, recovery.recoverInterruptedRuns());
+        Experiment recovered = experiments.findById(verifying.id()).orElseThrow();
+        assertEquals(ExperimentStatus.AGENT_COMPLETED, recovered.status());
+        assertEquals(resultSnapshotId, recovered.resultSnapshotId());
+        assertTrue(recovered.failureReason().contains("run verification again"));
+        assertEquals(0, recovery.recoverInterruptedRuns());
+    }
+
+    @Test
     void activeLeaseDefersRecoveryUntilTheWorkerLeaseIsReleased() {
         InMemoryProjectRepository projects = new InMemoryProjectRepository();
         InMemoryExperimentRepository experiments = new InMemoryExperimentRepository();

@@ -81,6 +81,13 @@ public class SqliteExperimentRepository implements ExperimentRepository {
         return count != null && count > 0;
     }
 
+    @Override
+    public boolean hasBlockingExperimentForProject(UUID projectId) {
+        Integer count = jdbc.queryForObject("SELECT COUNT(*) FROM experiments WHERE project_id=? AND (status IN ('CREATED','SNAPSHOTTING','READY_TO_RUN','RUNNING','VERIFYING','PREPARING_PROMOTION','PROMOTING','RECOVERY_REQUIRED') OR (status='AGENT_COMPLETED' AND result_snapshot_id IS NULL))",
+                Integer.class, projectId.toString());
+        return count != null && count > 0;
+    }
+
     private Experiment map(ResultSet rs, int row) throws SQLException {
         String failure = rs.getString("failure_reason");
         Boolean verified = rs.getObject("verification_passed", Boolean.class);

@@ -54,6 +54,7 @@ class InMemoryEventSinkTest {
         assertEquals(100, retained.size());
         assertEquals(26L, retained.getFirst());
         assertEquals(125L, retained.getLast());
+        assertEquals(125L, sink.latestSequence(experimentId));
         assertEquals(126L, sink.publish(experimentId, "TEST", Map.of()).sequence());
     }
 }

@@ -41,12 +41,37 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   let detailRequest = 0
   let detailExperimentId: string | null = null
   let projectRequest = 0
+  const experimentRefreshRequests = new Map<string, number>()
   let projectsRequest = 0
+  let projectsMutation = 0
   let recoveryRequest = 0
   let stateGeneration = 0
 
   function isCurrent(generation: number) {
     return generation === stateGeneration
+  }
+
+  // Experiment/session rows are append-only. Merge list responses so a late
+  // refresh cannot regress a newer lifecycle version or erase a concurrent create.
+  function mergeExperiments(loaded: Experiment[]) {
+    const merged = new Map<string, Experiment>()
+    for (const experiment of experiments.value) {
+      if (experiment.projectId === selectedProjectId.value) merged.set(experiment.id, experiment)
+    }
+    for (const experiment of loaded) {
+      const current = merged.get(experiment.id)
+      if (!current || experiment.version >= current.version) merged.set(experiment.id, experiment)
+    }
+    return [...merged.values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+  }
+
+  function mergeSessions(loaded: Session[]) {
+    const merged = new Map<string, Session>()
+    for (const session of sessions.value) {
+      if (session.projectId === selectedProjectId.value) merged.set(session.id, session)
+    }
+    for (const session of loaded) merged.set(session.id, session)
+    return [...merged.values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt))
   }
 
   function causeMessage(cause: unknown, fallback: string) {
@@ -79,14 +104,15 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   async function loadProjects() {
     const generation = stateGeneration
     const requestId = ++projectsRequest
+    const mutation = projectsMutation
     loading.value = true
     error.value = null
     try {
       const loadedProjects = await api.projects()
-      if (!isCurrent(generation) || requestId !== projectsRequest) return
+      if (!isCurrent(generation) || requestId !== projectsRequest || mutation !== projectsMutation) return
       projects.value = loadedProjects
     } catch (cause) {
-      if (!isCurrent(generation) || requestId !== projectsRequest) return
+      if (!isCurrent(generation) || requestId !== projectsRequest || mutation !== projectsMutation) return
       error.value = formatError(cause, '无法加载项目。', 'Unable to load projects')
     } finally {
       if (isCurrent(generation) && requestId === projectsRequest) loading.value = false
@@ -119,12 +145,14 @@ export const useWorkspaceStore = defineStore('workspace', () => {
         api.experiments(projectId),
       ])
       if (!isCurrent(generation) || requestId !== projectRequest || selectedProjectId.value !== projectId) return
-      sessions.value = loadedSessions
-      experiments.value = loadedExperiments
-      const requested = loadedExperiments.find((item) => item.id === experimentId)
-      const fallback = requested ?? loadedExperiments.at(-1) ?? null
+      const nextSessions = mergeSessions(loadedSessions)
+      const nextExperiments = mergeExperiments(loadedExperiments)
+      sessions.value = nextSessions
+      experiments.value = nextExperiments
+      const requested = nextExperiments.find((item) => item.id === experimentId)
+      const fallback = requested ?? nextExperiments.at(-1) ?? null
       selectedExperimentId.value = fallback?.id ?? null
-      selectedSessionId.value = fallback?.sessionId ?? loadedSessions.at(-1)?.id ?? null
+      selectedSessionId.value = fallback?.sessionId ?? nextSessions.at(-1)?.id ?? null
       if (selectedExperimentId.value) {
         // Loading the review panels is independent from selecting a project.
         // Do not make a successful project load depend on a diff endpoint.
@@ -248,11 +276,32 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     }
     if (!isCurrent(generation)) return undefined
     const project: Project = registration
+    projectsMutation++
     const existingIndex = projects.value.findIndex((existing) => existing.id === project.id)
     if (existingIndex >= 0) projects.value[existingIndex] = project
     else projects.value.push(project)
     // The project row is already usable. Session/experiment hydration happens
     // asynchronously and should not turn a successful create into an error.
+    void selectProject(project.id)
+    if (!isCurrent(generation)) return undefined
+    return { project, reopened: registration.reopened }
+  }
+
+  async function createLocalProject(body: { name: string; canonicalPath: string; verificationCommands: string[] }) {
+    const generation = stateGeneration
+    let registration: Awaited<ReturnType<typeof api.createLocalProject>>
+    try {
+      registration = await api.createLocalProject(body)
+    } catch (cause) {
+      if (!isCurrent(generation)) return undefined
+      throw cause
+    }
+    if (!isCurrent(generation)) return undefined
+    const project: Project = registration
+    projectsMutation++
+    const existingIndex = projects.value.findIndex((existing) => existing.id === project.id)
+    if (existingIndex >= 0) projects.value[existingIndex] = project
+    else projects.value.push(project)
     void selectProject(project.id)
     if (!isCurrent(generation)) return undefined
     return { project, reopened: registration.reopened }
@@ -264,6 +313,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     if (!projectId) return undefined
     const updated = await api.updateProject(projectId, body)
     if (!isCurrent(generation) || selectedProjectId.value !== projectId) return undefined
+    projectsMutation++
     const index = projects.value.findIndex((project) => project.id === updated.id)
     if (index >= 0) projects.value[index] = updated
     else projects.value.push(updated)
@@ -313,6 +363,31 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       successor = await api.continueExperiment(experimentId, task)
     } catch (cause) {
       if (!isCurrent(generation)) return undefined
+
+      // The API creates the successor before it asks the agent worker to
+      // start.  A model/configuration or executor failure can therefore
+      // return an error after a durable successor has already been written.
+      // Refresh once and select that row so the user can see its terminal
+      // state and retained activity instead of being left on the old turn.
+      if (projectId && selectedProjectId.value === projectId) {
+        try {
+          await reloadSelectedProject()
+          if (isCurrent(generation) && selectedProjectId.value === projectId) {
+            const successorFromRefresh = experiments.value
+              .filter((candidate) => candidate.continuedFromExperimentId === experimentId)
+              .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+              .at(-1)
+            if (successorFromRefresh) {
+              selectedSessionId.value = successorFromRefresh.sessionId
+              selectedExperimentId.value = successorFromRefresh.id
+              void loadExperimentDetails(successorFromRefresh.id)
+            }
+          }
+        } catch {
+          // Preserve the original API error.  A refresh failure should not
+          // mask the actionable start/configuration error returned to the UI.
+        }
+      }
       throw cause
     }
     if (!isCurrent(generation) || selectedProjectId.value !== projectId) return undefined
@@ -352,6 +427,23 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     }
     if (!isCurrent(generation) || selectedProjectId.value !== projectId) return
     replaceExperiment(updated)
+  }
+
+  async function verifyExperiment(experimentId: string) {
+    const generation = stateGeneration
+    const projectId = selectedProjectId.value
+    let verified: Experiment
+    try {
+      verified = await api.verifyExperiment(experimentId)
+    } catch (cause) {
+      if (!isCurrent(generation)) return
+      throw cause
+    }
+    if (!isCurrent(generation) || selectedProjectId.value !== projectId) return
+    replaceExperiment(verified)
+    if (selectedExperimentId.value === experimentId) {
+      void loadExperimentDetails(experimentId)
+    }
   }
 
   async function promoteExperiment(experimentId: string) {
@@ -444,12 +536,14 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       throw cause
     }
     if (!isCurrent(generation) || requestId !== projectRequest || selectedProjectId.value !== projectId) return
-    sessions.value = loadedSessions
-    experiments.value = loadedExperiments
-    if (selectedSessionId.value && !loadedSessions.some((session) => session.id === selectedSessionId.value)) {
+    const nextSessions = mergeSessions(loadedSessions)
+    const nextExperiments = mergeExperiments(loadedExperiments)
+    sessions.value = nextSessions
+    experiments.value = nextExperiments
+    if (selectedSessionId.value && !nextSessions.some((session) => session.id === selectedSessionId.value)) {
       selectedSessionId.value = null
     }
-    if (selectedExperimentId.value && loadedExperiments.some((item) => item.id === selectedExperimentId.value)) {
+    if (selectedExperimentId.value && nextExperiments.some((item) => item.id === selectedExperimentId.value)) {
       void loadExperimentDetails(selectedExperimentId.value)
     } else {
       selectedExperimentId.value = null
@@ -460,12 +554,57 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     void loadPromotionRecovery(projectId, generation)
   }
 
+  /**
+   * Reconcile one lifecycle row. Activity telemetry is best-effort, so the
+   * event stream cannot be the sole trigger for advancing a run in the UI.
+   * Keeping this request separate from `reloadSelectedProject` avoids
+   * reloading sessions and evidence/diff panels on every fallback poll.
+   */
+  async function refreshExperimentState(experimentId = selectedExperimentId.value) {
+    if (!experimentId) return
+    const generation = stateGeneration
+    const source = experiments.value.find((item) => item.id === experimentId)
+    const projectId = source?.projectId
+    // A reconciliation tick can race with project navigation. Avoid issuing
+    // a request for an experiment that is no longer part of the selected
+    // project, and never surface its failure in the new project.
+    if (!source || !projectId || selectedProjectId.value !== projectId) return
+    const requestId = (experimentRefreshRequests.get(experimentId) ?? 0) + 1
+    experimentRefreshRequests.set(experimentId, requestId)
+    let updated: Experiment
+    try {
+      updated = await api.experiment(experimentId)
+    } catch (cause) {
+      if (!isCurrent(generation) || selectedProjectId.value !== projectId
+        || !experiments.value.some((item) => item.id === experimentId)) return
+      throw cause
+    }
+    if (!isCurrent(generation)
+      || requestId !== experimentRefreshRequests.get(experimentId)
+      || selectedProjectId.value !== projectId
+      || updated.projectId !== projectId
+      || !experiments.value.some((item) => item.id === updated.id)) return
+    if (!replaceExperiment(updated)) return true
+    if (selectedExperimentId.value === updated.id) {
+      // A status change can invalidate a review action while the user is
+      // looking at the drawer. Refresh its details only after the row itself
+      // has converged; the normal event-triggered refresh remains responsible
+      // for evidence and diff data.
+      if (updated.status === 'VERIFIED' || updated.status === 'REJECTED'
+        || updated.status === 'PROMOTED' || updated.status === 'RECOVERY_REQUIRED') {
+        void loadExperimentDetails(updated.id)
+      }
+    }
+    return true
+  }
+
   function clearSelection() {
     ++stateGeneration
     ++projectRequest
     ++detailRequest
     ++projectsRequest
     ++recoveryRequest
+    experimentRefreshRequests.clear()
     detailExperimentId = null
     selectedProjectId.value = null
     selectedSessionId.value = null
@@ -494,20 +633,27 @@ export const useWorkspaceStore = defineStore('workspace', () => {
 
   function upsertExperiment(updated: Experiment) {
     const index = experiments.value.findIndex((experiment) => experiment.id === updated.id)
-    if (index >= 0) experiments.value[index] = updated
-    else experiments.value.push(updated)
+    if (index >= 0) {
+      if (experiments.value[index].version > updated.version) return false
+      experiments.value[index] = updated
+    } else {
+      experiments.value.push(updated)
+    }
+    return true
   }
 
   function replaceExperiment(updated: Experiment) {
     const index = experiments.value.findIndex((experiment) => experiment.id === updated.id)
-    if (index >= 0) experiments.value[index] = updated
+    if (index < 0 || experiments.value[index].version > updated.version) return false
+    experiments.value[index] = updated
+    return true
   }
 
   async function refreshSessionsInBackground(projectId: string, generation: number) {
     try {
       const loadedSessions = await api.sessions(projectId)
       if (!isCurrent(generation) || selectedProjectId.value !== projectId) return
-      sessions.value = loadedSessions
+      sessions.value = mergeSessions(loadedSessions)
     } catch (cause) {
       // Keep the created experiment visible; this is a non-blocking hydration
       // failure and will be retried by the next workspace refresh.
@@ -548,17 +694,20 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     selectProject,
     selectExperiment,
     createProject,
+    createLocalProject,
     updateProject,
     createExperiment,
     continueExperiment,
     startExperiment,
     cancelExperiment,
+    verifyExperiment,
     promoteExperiment,
     confirmExperimentStale,
     reconcilePromotion,
     reconcileProjectRecovery,
     selectSession,
     reloadSelectedProject,
+    refreshExperimentState,
     clearSelection,
     clearExperimentSelection,
   }
